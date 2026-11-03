@@ -333,6 +333,68 @@ def _format_state_summary(state_data):
     
     return " | ".join(summary_parts) if summary_parts else "No state data"
 
+
+def _battle_mon_line(mon):
+    hp = f"HP {mon['hp']}/{mon['max_hp']}" if mon['hp'] > 0 else "fainted"
+    status = f", {mon['status']}" if mon.get('status', 'OK') != 'OK' else ""
+    return f"{mon['name'].upper()} Lv{mon['level']} ({'/'.join(mon['types'])}), {hp}{status}"
+
+
+def _effectiveness_label(move):
+    if not move['power']:
+        return "status move"
+    eff = move['effectiveness']
+    if eff == 0:
+        return "no effect"
+    return f"{eff:g}x" + (" STAB" if move['stab'] else "")
+
+
+def format_battle_view(view):
+    """Compact battle section from memory_reader.read_battle_view() (None -> []).
+
+    Seen live: the prompt said only "Opponent detection disabled", and the model mashed
+    A on the slot-1 SCRATCH for 12+ minutes against a Poochyena while EMBER sat in
+    slot 4. Kept to a few lines for the 8B model's prompt budget.
+    """
+    if not view or not view.get('player'):
+        return []
+    lines = []
+    kind = "Trainer" if view['is_trainer'] else "Wild"
+    if view['is_double']:
+        kind += " double"
+    foes = "; ".join(_battle_mon_line(mon) for mon in view['opponents']) or "not sent out yet"
+    lines.append(f"{kind} battle vs {foes}")
+    lines.append(f"You: {_battle_mon_line(view['player'])}")
+
+    moves = view['moves']
+    menu = view['menu']
+    if menu == "action":
+        lines.append(f"Menu open: FIGHT/BAG/POKEMON/RUN, cursor on {view['action_cursor_name']}.")
+    elif menu == "move":
+        on = next((m['name'] for m in moves if m['slot'] == view['move_cursor_slot']), "?")
+        lines.append(f"Menu open: moves, cursor on slot {view['move_cursor_slot']} ({on}).")
+    elif menu == "target":
+        lines.append("Menu open: choose a target (LEFT/RIGHT, then A).")
+    elif menu == "reorder":
+        lines.append("Menu open: move reordering (SELECT was pressed): press B.")
+    else:
+        lines.append("Text or an animation is playing: press A to continue.")
+
+    target = view.get('target')
+    if moves:
+        against = f" vs {'/'.join(target['types'])}" if target else ""
+        lines.append(f"Moves (slot name type power PP effect{against}):")
+        for m in moves:
+            power = m['power'] if m['power'] else "-"
+            lines.append(f"  {m['slot']} {m['name']} {m['type']} {power} PP{m['pp']} {_effectiveness_label(m)}")
+    best = view.get('best_move')
+    if best:
+        lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\").")
+    elif moves:
+        lines.append("No damaging move with PP left: switch Pokémon, use an item, or run.")
+    return lines
+
+
 def _format_state_detailed(state_data, include_debug_info=False, include_npcs=True, include_movement_preview=True, action_history=None):
     """
     Internal function to create detailed multi-line state format for LLM prompts.
@@ -361,8 +423,13 @@ def _format_state_detailed(state_data, include_debug_info=False, include_npcs=Tr
         context_parts.append("=== BATTLE MODE ===")
         context_parts.append("Currently in battle - map and dialogue information hidden")
         
-        # Battle information first
-        if 'battle_info' in game_data and game_data['battle_info']:
+        # Battle information first: the compact live view when memory_reader has one,
+        # else the older long-form fields.
+        view_lines = format_battle_view((game_data.get('battle_info') or {}).get('view'))
+        if view_lines:
+            context_parts.append("\n=== BATTLE STATUS ===")
+            context_parts.extend(view_lines)
+        elif 'battle_info' in game_data and game_data['battle_info']:
             battle = game_data['battle_info']
             context_parts.append("\n=== BATTLE STATUS ===")
             

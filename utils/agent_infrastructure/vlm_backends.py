@@ -51,6 +51,132 @@ def retry_with_exponential_backoff(
     return wrapper
 
 
+# HTTP statuses worth retrying besides 5xx: request timeout and rate limit.
+# Every other 4xx means the request itself is wrong, and resending it unchanged
+# can only fail again.
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
+
+
+def is_transient_api_error(exc: BaseException) -> bool:
+    """Return True for errors that may succeed on retry (timeouts, dropped
+    connections, 408/429, 5xx); False for client errors and programming bugs."""
+    try:
+        import openai
+    except ImportError:  # openai is a hard dependency of the OpenAI backends
+        return False
+    # APITimeoutError is a subclass of APIConnectionError in openai>=1.0.
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        status = getattr(exc, "status_code", None)
+        return status in _TRANSIENT_HTTP_STATUSES or (isinstance(status, int) and status >= 500)
+    return False
+
+
+def retry_transient_errors(
+    max_attempts=3,
+    initial_delay: float = 2.0,
+    exponential_base: float = 2.0,
+    max_total_wait: float = 30.0,
+    is_transient=is_transient_api_error,
+):
+    """Retry decorator with a bounded attempt count and a bounded total sleep.
+
+    Unlike ``retry_with_exponential_backoff`` (retries every exception up to 10x
+    with unbounded waits and replaces the cause with a generic Exception), this
+    fails fast on non-transient errors and re-raises the last real exception.
+    ``max_attempts`` may be an int or a callable taking the bound ``self``, so a
+    backend instance can configure it.
+    """
+
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            attempts = max_attempts(args[0]) if callable(max_attempts) else max_attempts
+            attempts = max(1, int(attempts))
+            delay = initial_delay
+            waited = 0.0
+            for attempt in range(1, attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt >= attempts or not is_transient(e):
+                        raise
+                    sleep_for = min(delay * (1 + 0.25 * random.random()), max(0.0, max_total_wait - waited))
+                    logger.warning(
+                        f"Transient API error ({type(e).__name__}: {str(e)[:200]}); "
+                        f"attempt {attempt}/{attempts} failed, retrying in {sleep_for:.1f}s"
+                    )
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                        waited += sleep_for
+                    delay *= exponential_base
+
+        return wrapper
+
+    return decorator
+
+
+# Gemini-style (protobuf enum name) -> JSON Schema type names.
+_GEMINI_TO_JSON_SCHEMA_TYPE = {
+    "STRING": "string",
+    "INTEGER": "integer",
+    "NUMBER": "number",
+    "BOOLEAN": "boolean",
+    "ARRAY": "array",
+    "OBJECT": "object",
+}
+
+
+def gemini_schema_to_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively convert a Gemini-style schema (``type_: "OBJECT"`` etc., as used
+    by agents/tools/registry.py) into JSON Schema.
+
+    Nested object ``properties``/``required`` and array ``items`` are converted
+    instead of being flattened to strings, so the model sees the real argument
+    shapes (process_memory.entries is an array of objects, run_skill.args is an
+    object, window_range items are integers). A JSON Schema ``type`` key is
+    accepted too.
+    """
+    if not isinstance(schema, dict):
+        return {"type": "string"}
+    raw_type = str(schema.get("type_", schema.get("type", "STRING")))
+    json_type = _GEMINI_TO_JSON_SCHEMA_TYPE.get(raw_type.upper(), "string")
+    out: Dict[str, Any] = {"type": json_type}
+    if schema.get("description"):
+        out["description"] = schema["description"]
+    if "enum" in schema:
+        out["enum"] = list(schema["enum"])
+    if json_type == "array":
+        out["items"] = gemini_schema_to_json_schema(schema.get("items", {"type_": "STRING"}))
+    elif json_type == "object":
+        props = schema.get("properties") or {}
+        out["properties"] = {name: gemini_schema_to_json_schema(p) for name, p in props.items()}
+        required = [r for r in (schema.get("required") or []) if r in out["properties"]]
+        if required:
+            out["required"] = required
+    return out
+
+
+def _int_setting(explicit, env_name: str, default):
+    """Resolve an optional int setting: explicit kwarg, then env var, then default.
+    0 / "none" / "off" disable the setting (returns None)."""
+    raw = explicit if explicit is not None else os.getenv(env_name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    text = str(raw).strip().lower()
+    if text in ("none", "off", "0"):
+        return None
+    return int(float(text))
+
+
+def _float_setting(explicit, env_name: str, default):
+    """Resolve an optional float setting: explicit kwarg, then env var, then default."""
+    raw = explicit if explicit is not None else os.getenv(env_name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return float(raw)
+
+
 class VLMBackend(ABC):
     """Abstract base class for VLM backends"""
 
@@ -70,16 +196,22 @@ class VLMBackend(ABC):
         pass
 
 
-def _openai_tool_call_part(name: str, args: Dict[str, Any]):
-    """Create a Gemini-compatible part object for agent consumption."""
+def _openai_tool_call_part(name: str, args: Dict[str, Any], parse_error: Optional[str] = None):
+    """Create a Gemini-compatible part object for agent consumption.
+
+    ``parse_error`` is set when the model's arguments were not valid JSON; the
+    agent then reports the error back to the model instead of running the tool
+    with empty arguments.
+    """
 
     class FunctionCallPart:
-        def __init__(self, fn_name: str, fn_args: Dict[str, Any]):
+        def __init__(self, fn_name: str, fn_args: Dict[str, Any], fn_parse_error: Optional[str]):
             self.name = fn_name
             self.args = fn_args
+            self.parse_error = fn_parse_error
 
     part = type("Part", (), {})()
-    part.function_call = FunctionCallPart(name, args)
+    part.function_call = FunctionCallPart(name, args, parse_error)
     part.text = ""  # No text; agents join part.text and expect str
     return part
 
@@ -181,11 +313,19 @@ def _openai_responses_adapter(response) -> Any:
         if item_type == "function_call":
             name = getattr(item, "name", None) or (item.get("name") if isinstance(item, dict) else "")
             raw_args = getattr(item, "arguments", None) or (item.get("arguments", "{}") if isinstance(item, dict) else "{}")
+            parse_error = None
             try:
                 args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
                 args = {}
-            parts.append(_openai_tool_call_part(name, args))
+                parse_error = f"arguments were not valid JSON ({e.msg} at char {e.pos}): {str(raw_args)[:300]}"
+            if parse_error is None and not isinstance(args, dict):
+                parse_error = f"arguments must be a JSON object, got {type(args).__name__}: {str(raw_args)[:300]}"
+                args = {}
+            if parse_error:
+                # Previously this silently became {} and the tool ran with no args.
+                logger.warning(f"Malformed tool call from model for '{name}': {parse_error}")
+            parts.append(_openai_tool_call_part(name, args, parse_error))
         elif item_type == "message":
             content_list = getattr(item, "content", None) or (item.get("content", []) if isinstance(item, dict) else [])
             for c in content_list:
@@ -248,7 +388,48 @@ class OpenAIBackend(VLMBackend):
         if not self.api_key:
             raise ValueError("Error: OpenAI API key is missing! Set OPENAI_API_KEY environment variable.")
 
-        self.client = OpenAI(api_key=self.api_key)
+        # A custom OPENAI_BASE_URL means an OpenAI-compatible server such as a
+        # local Ollama. Those get conservative defaults: Ollama's /v1/responses
+        # otherwise lets a generation run up to 10*num_ctx tokens (one observed
+        # call produced 5,957 tokens over 6m50s) and its single slot means a slow
+        # call blocks everything. Hosted OpenAI keeps no output cap, because
+        # reasoning tokens count against max_output_tokens there.
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+        self._is_compatible_server = bool(base_url) and "api.openai.com" not in base_url
+        # Default 1024: successful local steps used p50=496 / p95=685 / max=754
+        # output tokens (llm_logs, n=37 excluding one 3,902-token runaway), so
+        # 1024 leaves ~35% headroom over the largest normal reply.
+        self.max_output_tokens = _int_setting(
+            kwargs.get("max_output_tokens"), "OPENAI_MAX_OUTPUT_TOKENS",
+            1024 if self._is_compatible_server else None,
+        )
+        # Per-request timeout: local Qwen3-VL-8B measured ~250 tok/s prefill and
+        # ~19 tok/s decode, so a 28K-token prompt plus 1024 output tokens is
+        # roughly 170 s worst case; observed p95 was 67 s.
+        self.request_timeout_s = _float_setting(
+            kwargs.get("request_timeout_s"), "OPENAI_REQUEST_TIMEOUT_S",
+            240.0 if self._is_compatible_server else 600.0,
+        )
+        self.max_attempts = max(1, _int_setting(kwargs.get("max_attempts"), "OPENAI_MAX_ATTEMPTS", 3) or 1)
+        # Opt-in sampling overrides. Ollama's /v1/responses uses temperature 1.0
+        # when it is omitted (Qwen3-VL's card recommends 0.7 / top_p 0.8), but
+        # hosted reasoning models reject temperature, so nothing is sent by default.
+        self.temperature = _float_setting(kwargs.get("temperature"), "OPENAI_TEMPERATURE", None)
+        self.top_p = _float_setting(kwargs.get("top_p"), "OPENAI_TOP_P", None)
+        # Upper bound on one _call_responses() including retries and backoff;
+        # PokeAgent sizes its wall-clock guard from this so the guard does not
+        # fire (and stack a second request) while the SDK is still waiting.
+        self.call_deadline_s = self.max_attempts * self.request_timeout_s + self._RETRY_MAX_TOTAL_WAIT_S
+
+        import httpx
+
+        # max_retries=0: retry_transient_errors on _call_responses owns retries;
+        # the SDK default (2 retries, 600 s timeout) multiplied with it.
+        self.client = OpenAI(
+            api_key=self.api_key,
+            timeout=httpx.Timeout(self.request_timeout_s, connect=10.0),
+            max_retries=0,
+        )
         self.errors = (openai.RateLimitError,)
 
         if self.tools:
@@ -259,7 +440,14 @@ class OpenAIBackend(VLMBackend):
             log_parts = [f"OpenAI backend initialized with model: {model_name}"]
         if self.system_instruction:
             log_parts.append(f"system instructions ({len(self.system_instruction)} chars)")
+        log_parts.append(
+            f"max_output_tokens={self.max_output_tokens}, timeout={self.request_timeout_s:.0f}s, "
+            f"attempts={self.max_attempts}, temperature={self.temperature}, top_p={self.top_p}"
+        )
         logger.info(", ".join(log_parts))
+
+    # Total backoff sleep allowed across retries of one call.
+    _RETRY_MAX_TOTAL_WAIT_S = 30.0
 
     def _setup_function_calling(self):
         """Update tools (called when agent dynamically updates tool list)."""
@@ -294,29 +482,16 @@ class OpenAIBackend(VLMBackend):
         return result
 
     def _build_json_schema_properties(self, params: dict) -> tuple:
-        """Build JSON Schema properties from Gemini-style params. Returns (properties, required)."""
-        properties = {}
-        required = params.get("required", [])
-        for prop_name, prop_def in params.get("properties", {}).items():
-            t = prop_def.get("type_", "STRING")
-            if t == "ARRAY":
-                t = "array"
-            elif t == "INTEGER":
-                t = "integer"
-            elif t == "BOOLEAN":
-                t = "boolean"
-            else:
-                t = "string"
-            prop = {"type": t, "description": prop_def.get("description", "")}
-            if t == "array" and "items" in prop_def:
-                items_t = prop_def["items"].get("type_", "STRING") if isinstance(prop_def["items"], dict) else "STRING"
-                prop["items"] = {"type": "string" if items_t == "STRING" else "string"}
-            if "enum" in prop_def:
-                prop["enum"] = prop_def["enum"]
-            properties[prop_name] = prop
-        return properties, required
+        """Build JSON Schema properties from Gemini-style params. Returns (properties, required).
 
-    @retry_with_exponential_backoff
+        Delegates to gemini_schema_to_json_schema so nested objects, arrays of
+        objects and number/integer/boolean types survive (the old flat mapping
+        turned OBJECT into "string" and every array item into "string").
+        """
+        converted = gemini_schema_to_json_schema({**params, "type_": "OBJECT"})
+        return converted.get("properties", {}), converted.get("required", [])
+
+    @retry_transient_errors(max_attempts=lambda self: self.max_attempts, max_total_wait=_RETRY_MAX_TOTAL_WAIT_S)
     def _call_responses(self, instructions: str | None, input_data, tools: list = None):
         """Calls the Responses API (v1/responses) with optional tools.
 
@@ -329,12 +504,32 @@ class OpenAIBackend(VLMBackend):
             kwargs["input"] = input_data
         else:
             kwargs["input"] = input_data if isinstance(input_data, list) else [input_data]
+        if self.max_output_tokens:
+            # Ollama maps this to num_predict. Its responses always report
+            # status "completed", so a hit cap shows up only as
+            # output_tokens == max_output_tokens (logged in get_query).
+            kwargs["max_output_tokens"] = self.max_output_tokens
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
         if self._prompt_cache_key:
-            kwargs["prompt_cache_key"] = self._prompt_cache_key
+            # Pinned openai==1.90.0 has no prompt_cache_key parameter on
+            # responses.create (TypeError); send it as raw body like OpenRouterBackend.
+            kwargs["extra_body"] = {"prompt_cache_key": self._prompt_cache_key}
         return self.client.responses.create(**kwargs)
+
+    def _warn_if_output_capped(self, output_tokens: int) -> None:
+        """Ollama never sets status=incomplete on /v1/responses, so a reply that
+        hit max_output_tokens is only detectable by its token count."""
+        if self.max_output_tokens and output_tokens >= self.max_output_tokens:
+            logger.warning(
+                f"Model output hit max_output_tokens={self.max_output_tokens} "
+                f"(output_tokens={output_tokens}); reply may be truncated"
+            )
 
     def _prepare_image_base64(self, img: Union[Image.Image, np.ndarray]) -> str:
         """Prepare image as base64 string"""
@@ -404,6 +599,7 @@ class OpenAIBackend(VLMBackend):
                     "total_tokens": total,
                     "cached_tokens": cached,
                 }
+                self._warn_if_output_capped(out)
 
             if self.tools:
                 adapter = _openai_responses_adapter(response)
@@ -496,6 +692,7 @@ class OpenAIBackend(VLMBackend):
                     "total_tokens": total,
                     "cached_tokens": cached,
                 }
+                self._warn_if_output_capped(out)
 
             if self.tools:
                 adapter = _openai_responses_adapter(response)

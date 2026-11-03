@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import hashlib
+import struct
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import numpy as np
@@ -15,6 +16,7 @@ from PIL import Image
 import mgba.core
 import mgba.log
 import mgba.image
+import mgba.vfs
 from mgba._pylib import ffi, lib
 
 from .memory_reader import PokemonEmeraldReader
@@ -63,6 +65,43 @@ ORDERED_PROGRESS_MILESTONES: List[str] = [mid for phase in MILESTONE_PHASES for 
 
 # Trigger CLI backups on every canonical milestone so checkpointing aligns with progression.
 COMPARISON_MILESTONES = ORDERED_PROGRESS_MILESTONES
+
+# mGBA savestate extdata (include/mgba/core/serialize.h, 0.10.x). A raw state is
+# followed by headers {u32 tag, i32 size, i64 absolute offset} ending at tag 0, then
+# the blobs. mGBA's own loaders, and load_raw_state (which only reads the first
+# stateSize bytes), accept a state with or without this trailer.
+SAVESTATE_SAVEDATA = 2
+EXTDATA_SAVEDATA = 2
+_EXTDATA_HEADER = struct.Struct("<Iiq")
+
+
+class SaveStateError(RuntimeError):
+    """A savestate could not be written or loaded; the emulator was left unchanged."""
+
+
+def _extract_savedata(data: bytes, state_size: int) -> Optional[bytes]:
+    """Return the flash save embedded after the raw state, or None if there is none.
+
+    Raises SaveStateError for a trailer that is present but damaged, so a cut-off
+    checkpoint is reported instead of silently loading with the wrong save.
+    """
+    pos = state_size
+    if pos >= len(data):
+        return None  # plain raw state, as written before savedata was embedded
+    savedata = None
+    while True:
+        if pos + _EXTDATA_HEADER.size > len(data):
+            raise SaveStateError(f"savestate extdata header truncated at byte {pos} of {len(data)}")
+        tag, size, offset = _EXTDATA_HEADER.unpack_from(data, pos)
+        pos += _EXTDATA_HEADER.size
+        if tag == 0:
+            return savedata
+        if tag == EXTDATA_SAVEDATA:
+            if size <= 0 or offset < state_size or offset + size > len(data):
+                raise SaveStateError(
+                    f"savestate savedata block out of range (offset {offset}, size {size}, file {len(data)} bytes)"
+                )
+            savedata = data[offset:offset + size]
 
 
 class MilestoneTracker:
@@ -617,105 +656,189 @@ class EmeraldEmulator:
             logger.error(f"Failed to get screenshot: {e}")
             return None
 
+    def _state_size(self) -> int:
+        return self.core._core.stateSize(self.core._core)
+
+    def _clone_savedata(self) -> bytes:
+        """Copy of the cartridge flash save, read from mGBA's live save memory.
+
+        savedataClone copies the mapped buffer the game writes into, so the bytes are
+        current even if mGBA's idle sync to the .sav file has not run yet.
+        """
+        out = ffi.new("void **")
+        size = self.core._core.savedataClone(self.core._core, out)
+        if not size:
+            return b""
+        try:
+            return ffi.buffer(out[0], size)[:]
+        finally:
+            lib.free(out[0])  # savedataClone mallocs the copy
+
+    def _restore_savedata(self, savedata: bytes) -> bool:
+        """Overwrite the live flash save (writeback=True copies into the mapped .sav)."""
+        return bool(self.core._core.savedataRestore(self.core._core, ffi.from_buffer(savedata), len(savedata), True))
+
+    @staticmethod
+    def _write_file_atomically(path: str, data: bytes):
+        # A reader (or a crash) must never see a half-written checkpoint: write a
+        # sibling temp file and rename it over the target in one step.
+        tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
     def save_state(self, path: Optional[str] = None) -> Optional[bytes]:
-        """Save current emulator state to file or return as bytes"""
+        """Save current emulator state, flash save included, to file or return as bytes.
+
+        Not thread-safe: a caller sharing the core across threads must hold its
+        emulator lock. Raises SaveStateError if mGBA cannot serialize the state.
+        """
         if not self.core:
             return None
-        
+
+        # A raw state holds no cartridge flash, so restoring one used to bring back the
+        # position but not the in-game save. mCoreSaveStateNamed appends the flash as
+        # extdata, which travels with every copy of the state file.
+        vf = mgba.vfs.VFile.fromEmpty()
         try:
-            # Get the raw state data
-            raw_data = self.core.save_raw_state()
-            
-            # Convert CFFI object to bytes if needed
-            if hasattr(raw_data, 'buffer'):
-                data = bytes(raw_data.buffer)
-            elif hasattr(raw_data, '__len__'):
-                data = bytes(raw_data)
-            else:
-                data = raw_data
-            
-            if path:
-                with open(path, 'wb') as f:
-                    f.write(data)
-                logger.info(f"State saved to {path}")
-                
+            if not lib.mCoreSaveStateNamed(self.core._core, vf.handle, SAVESTATE_SAVEDATA):
+                raise SaveStateError("mGBA failed to serialize the emulator state")
+            vf.seek(0, os.SEEK_SET)
+            data = bytes(vf.read_all())
+        finally:
+            vf.close()
+        if len(data) < self._state_size():
+            raise SaveStateError(f"mGBA produced a short state ({len(data)} of {self._state_size()} bytes)")
+        if _extract_savedata(data, self._state_size()) is None:
+            logger.warning("Cartridge has no save memory yet; state written without a flash save")
+
+        if path:
+            self._write_file_atomically(path, data)
+            logger.info(f"State saved to {path} ({len(data)} bytes, flash save included)")
+
+            try:
                 # Save corresponding milestones for this state
                 milestone_filename = self.milestone_tracker.save_milestones_for_state(path)
                 logger.info(f"Milestones saved to {milestone_filename}")
-                
+
                 # Save the persistent location grids (contains all map data)
                 self._save_persistent_grids_for_state(path)
-            
-            return data
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-            return None
+            except Exception as e:
+                logger.error(f"State saved, but saving its milestones/map data failed: {e}")
+
+        return data
+
+    def _load_core_state(self, state_bytes: bytes, label: str):
+        """Load the CPU state and its embedded flash save, or raise and change nothing."""
+        state_size = self._state_size()
+        if len(state_bytes) < state_size:
+            raise SaveStateError(f"State {label} is truncated: {len(state_bytes)} bytes, need at least {state_size}")
+        savedata = _extract_savedata(state_bytes, state_size)
+        previous = self._clone_savedata()
+
+        if savedata is None:
+            logger.warning(
+                f"State {label} has no embedded flash save (written before saves were checkpointed); "
+                "keeping the current flash, which is blank after a fresh start"
+            )
+        else:
+            # A size mismatch would leave a partial copy in the live save. An empty
+            # `previous` means the save type isn't detected yet: GBASavedataLoad then
+            # writes into the backing .sav, which the game maps once it detects flash.
+            if previous and len(savedata) != len(previous):
+                raise SaveStateError(
+                    f"State {label} carries a {len(savedata)}-byte flash save, cartridge save is {len(previous)} bytes"
+                )
+            # Restored before the CPU state so the game never runs against the old save;
+            # loading the state only touches the flash chip's command/bank registers.
+            if not self._restore_savedata(savedata):
+                self._restore_savedata(previous)
+                raise SaveStateError(f"mGBA could not restore the flash save from {label}")
+
+        # GBADeserialize validates the header (game, version, CPU sanity) before it
+        # changes anything, so on False only the flash needs putting back.
+        if not self.core.load_raw_state(state_bytes):
+            if savedata is not None:
+                self._restore_savedata(previous)
+            raise SaveStateError(f"mGBA rejected state {label} (corrupt, or made for a different game)")
+        logger.info(f"State loaded from {label}" + ("" if savedata is None else " with its flash save"))
 
     def load_state(self, path: Optional[str] = None, state_bytes: Optional[bytes] = None):
-        """Load emulator state from file or memory"""
+        """Load emulator state from file or memory.
+
+        Not thread-safe: a caller sharing the core across threads must hold its
+        emulator lock. Raises SaveStateError, leaving the emulator as it was, if the
+        state is unreadable, truncated, corrupt or rejected by mGBA.
+        """
         if not self.core:
             return
-        
-        try:
-            if path:
+
+        if path:
+            try:
                 with open(path, 'rb') as f:
                     state_bytes = f.read()
-            if state_bytes:
-                # Ensure state_bytes is actually bytes
-                if not isinstance(state_bytes, bytes):
-                    state_bytes = bytes(state_bytes)
-                self.core.load_raw_state(state_bytes)
-                logger.info("State loaded.")
-                
-                # Reset dialog tracking and invalidate map cache when loading new state
-                if self.memory_reader:
-                    self.memory_reader.reset_dialog_tracking()
-                    # Don't clear buffer address on state load to avoid expensive rescans
-                    self.memory_reader.invalidate_map_cache(clear_buffer_address=False)
-                    
-                    # Persistent location maps will be loaded from the state file later
-                    
-                    # Run a frame to ensure memory is properly loaded
-                    self.core.run_frame()
-                    
-                    # Only find map buffer addresses if we don't have them cached
-                    # This avoids expensive memory scanning on every state load
-                    if not self.memory_reader._map_buffer_addr:
-                        if not self.memory_reader._find_map_buffer_addresses():
-                            logger.warning("Could not find map buffer addresses after state load")
-                        else:
-                            logger.info(f"Map buffer found at 0x{self.memory_reader._map_buffer_addr:08X}")
+            except OSError as e:
+                raise SaveStateError(f"Cannot read state {path}: {e}") from e
+        if state_bytes is None:
+            return
+        self._load_core_state(bytes(state_bytes), path or "<bytes>")
+
+        # The game state is in place; what follows refreshes harness-side caches and
+        # sidecar data, which stays best-effort as before.
+        try:
+            # Reset dialog tracking and invalidate map cache when loading new state
+            if self.memory_reader:
+                self.memory_reader.reset_dialog_tracking()
+                # Don't clear buffer address on state load to avoid expensive rescans
+                self.memory_reader.invalidate_map_cache(clear_buffer_address=False)
+
+                # Persistent location maps will be loaded from the state file later
+
+                # Run a frame to ensure memory is properly loaded
+                self.core.run_frame()
+
+                # Only find map buffer addresses if we don't have them cached
+                # This avoids expensive memory scanning on every state load
+                if not self.memory_reader._map_buffer_addr:
+                    if not self.memory_reader._find_map_buffer_addresses():
+                        logger.warning("Could not find map buffer addresses after state load")
                     else:
-                        logger.debug(f"Using cached map buffer at 0x{self.memory_reader._map_buffer_addr:08X}")
-                
-                # Set the current state file for both emulator and memory reader
-                self._current_state_file = path
-                if self.memory_reader:
-                    self.memory_reader._current_state_file = path
-                
-                # Load corresponding milestones for this state
-                if path:
-            # print( Loading state from path: {path}")
-                    # Copy state files to cache first
-                    self._copy_state_files_to_cache(path)
-                    # Load milestones from cache file
-                    cache_milestones_file = os.path.join(self.cache_dir, "milestones_progress.json")
-                    if os.path.exists(cache_milestones_file):
-                        # Update filename and then load
-                        self.milestone_tracker.filename = cache_milestones_file
-                        self.milestone_tracker.load_from_file()
-                        logger.info(f"Milestones loaded from cache file: {cache_milestones_file}")
-                    else:
-                        # Fallback to state-specific file
-                        self.milestone_tracker.load_milestones_for_state(path)
-                        logger.info(f"Milestones loaded for state {path}")
-                    
-                    # Load the persistent location grids (contains all map data)
-            # print( About to call _load_persistent_grids_for_state")
-                    self._load_persistent_grids_for_state(path)
-            # print( Completed _load_persistent_grids_for_state")
+                        logger.info(f"Map buffer found at 0x{self.memory_reader._map_buffer_addr:08X}")
+                else:
+                    logger.debug(f"Using cached map buffer at 0x{self.memory_reader._map_buffer_addr:08X}")
+
+            # Set the current state file for both emulator and memory reader
+            self._current_state_file = path
+            if self.memory_reader:
+                self.memory_reader._current_state_file = path
+
+            # Load corresponding milestones for this state
+            if path:
+                # Copy state files to cache first
+                self._copy_state_files_to_cache(path)
+                # Load milestones from cache file
+                cache_milestones_file = os.path.join(self.cache_dir, "milestones_progress.json")
+                if os.path.exists(cache_milestones_file):
+                    # Update filename and then load
+                    self.milestone_tracker.filename = cache_milestones_file
+                    self.milestone_tracker.load_from_file()
+                    logger.info(f"Milestones loaded from cache file: {cache_milestones_file}")
+                else:
+                    # Fallback to state-specific file
+                    self.milestone_tracker.load_milestones_for_state(path)
+                    logger.info(f"Milestones loaded for state {path}")
+
+                # Load the persistent location grids (contains all map data)
+                self._load_persistent_grids_for_state(path)
         except Exception as e:
-            logger.error(f"Failed to load state: {e}")
+            logger.error(f"State loaded, but restoring its milestones/map data failed: {e}")
 
     def _save_persistent_grids_for_state(self, state_filename: str):
         """Save persistent location grids for a specific state file"""

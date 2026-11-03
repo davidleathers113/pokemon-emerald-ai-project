@@ -1,0 +1,44 @@
+[
+  {
+    "category": "controls",
+    "title": "GBA buttons in Pokemon Emerald",
+    "importance": 5,
+    "content": "A = confirm, talk to someone in front of you, advance dialogue, pick a menu option. B = cancel, go back, close a menu; hold B while walking to run once you have the Running Shoes. START = open the main menu (POKEDEX, POKEMON, BAG, POKENAV, player card, SAVE, OPTION, EXIT). SELECT = use a registered key item; on the naming screen it switches letter pages. D-pad (UP/DOWN/LEFT/RIGHT) = walk one tile per press, or move the cursor in menus. To talk to an NPC or read a sign, face it and press A."
+  },
+  {
+    "category": "controls",
+    "title": "How to type a name on the naming screen",
+    "importance": 5,
+    "content": "The naming screen is a grid of letters, not a keyboard. Move the cursor with the D-pad and press A to add the highlighted letter. B deletes the last letter. SELECT switches between UPPER case, lower case and symbols. When the name is done, press START to jump the cursor to OK, then press A to confirm. Keep names short (max 7 letters). If stuck, a simple valid name is fine: e.g. press A once to add a letter, then START, then A."
+  },
+  {
+    "category": "controls",
+    "title": "Dialogue and yes/no boxes",
+    "importance": 4,
+    "content": "Text boxes advance with A. A small arrow in the corner of a text box means more text follows. YES/NO boxes: move with UP/DOWN, confirm with A; B usually picks NO. If the screen has not changed after several A presses, look for a menu cursor or a choice that needs the D-pad."
+  },
+  {
+    "category": "controls",
+    "title": "Battle menu",
+    "importance": 4,
+    "content": "In battle the menu is FIGHT / BAG / POKEMON / RUN arranged in a 2x2 grid; move with the D-pad, choose with A, back with B. FIGHT shows up to four moves in a 2x2 grid. Wild battles can be fled with RUN; trainer battles cannot. Heal with a Potion from BAG or at a Pokemon Center (talk to the nurse at the counter and answer YES)."
+  },
+  {
+    "category": "story",
+    "title": "Opening of the game (in order)",
+    "importance": 5,
+    "content": "1) Title screen: press START or A, choose NEW GAME. 2) Professor Birch's introduction: advance with A, choose boy or girl, then name the character. 3) You arrive in a moving truck in Littleroot Town; leave it, go into your house, go upstairs and set the clock in your room, then come back down. 4) Visit the neighbour's house next door. 5) Go north out of Littleroot to Route 101, where Professor Birch is being chased by a wild Pokemon; open his bag and pick a starter (Treecko, Torchic or Mudkip) and win the battle. 6) Go to Birch's lab, then travel through Oldale Town to Route 103 to battle the rival, return to the lab and receive the Pokedex."
+  },
+  {
+    "category": "story",
+    "title": "Early-game route after the Pokedex",
+    "importance": 4,
+    "content": "Head west from Oldale Town to Petalburg City and meet the player's father Norman at the gym; help Wally catch a Pokemon. Continue west/north via Route 104 and through Petalburg Woods to Rustboro City, whose gym leader Roxanne uses Rock-type Pokemon (Water and Grass moves work well). Train on the routes and heal at Pokemon Centers along the way. When unsure what to do next, call get_walkthrough with the matching part number (part 1 covers the very beginning)."
+  },
+  {
+    "category": "strategy",
+    "title": "Getting unstuck",
+    "importance": 4,
+    "content": "If the same screen repeats for several steps, the last action is not working: try a different button (B to back out, START to open the menu, a different direction). Walls, ledges and people block movement; walk around them. Doors and stairs are entered by walking into them. Use navigate_to for longer trips on the overworld. Do NOT use SAVE in the START menu: progress is checkpointed automatically, and in-game saving is not needed."
+  }
+]

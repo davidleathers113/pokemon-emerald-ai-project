@@ -26,6 +26,7 @@ import requests
 import uvicorn
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
@@ -68,6 +69,17 @@ _debug_state_counter = 0  # Step index for debug state entries
 _debug_state_log = []  # Accumulates all debug state snapshots (written to debug_states.json)
 current_obs = None
 fps = 80
+# Local addition: game speed. GAME_FPS while nothing is queued (the GBA runs at ~59.7,
+# so 60 looks normal to a human watching); TURBO_FPS while the harness is executing a
+# button sequence, walk or dialogue advance, since a model call (tens of seconds) waits
+# on it. TURBO_FPS=0 means as fast as the CPU allows. Game logic is frame-based, so
+# speed doesn't change what happens in the game; the RTC follows wall time either way.
+GAME_FPS = float(os.environ.get("GAME_FPS", "60"))
+TURBO_FPS = float(os.environ.get("TURBO_FPS", "480"))
+# The viewer frame (PNG for /stream) is encoded at most this often, not per frame:
+# encoding costs ~3x a frame of emulation, which would otherwise eat most of turbo.
+VIEWER_FRAME_INTERVAL_S = 1.0 / 40
+_last_viewer_frame_time = 0.0
 
 
 def _is_simplest_scaffold() -> bool:
@@ -166,6 +178,24 @@ DEFAULT_SPEED = "normal"
 ACTION_HOLD_FRAMES = SPEED_PRESETS["normal"]["hold"]
 ACTION_RELEASE_DELAY = SPEED_PRESETS["normal"]["release"]
 
+### MOVEMENT FEEDBACK (local addition) ###
+# A small model kept pressing UP into trees for nine decisions because nothing told it
+# the presses did nothing. Every press_buttons / navigate_to / go_to_exit call becomes a
+# "sequence"; the game loop compares the player's tile and map around each direction
+# press, drops the rest of the sequence when a press is BLOCKED (or the walk is
+# interrupted by a battle or a text box), and leaves a report the endpoint returns.
+action_queue_lock = threading.Lock()  # guards rebuilding action_queue against appends
+_sequence_counter = 0
+sequence_reports: Dict[int, Dict[str, Any]] = {}
+SEQUENCE_REPORTS_MAX = 64
+_active_action_data = None  # queue entry whose hold/release is running (for bookkeeping)
+_move_check = None  # in-flight checked direction press: button, before snapshot, seq
+_move_check_settle_frames = 0
+_start_wait_frames = 0
+_pending_before_snapshot = None
+# The last BLOCKED press; an identical press from the same tile is refused, not run.
+last_blocked_press: Optional[Dict[str, Any]] = None
+
 # Video recording state
 video_writer = None
 video_recording = False
@@ -199,7 +229,17 @@ _state_cache_ttl = 5.0  # Cache for 5 seconds per location
 # Threading locks for thread safety
 obs_lock = threading.Lock()
 step_lock = threading.Lock()
-memory_lock = threading.Lock()  # New lock for memory operations to prevent race conditions
+# The emulator lock: every call into the mGBA core (stepping, save/load state, memory
+# reads) must hold it. The game loop steps on the main thread while endpoints and the
+# milestone thread run on others, and cffi releases the GIL inside C calls, so an
+# unguarded load_state can rewrite the core in the middle of run_frame. Reentrant so a
+# helper that locks can be called from code that already holds it.
+memory_lock = threading.RLock()
+
+# time.monotonic() of the last emulated frame; /health reports unhealthy when it goes
+# stale (game loop dead or stuck in the core) instead of answering from a live web thread.
+last_frame_monotonic = None
+HEALTH_MAX_FRAME_AGE_S = 10.0
 
 
 # WebSocket connection manager for frame streaming
@@ -305,7 +345,7 @@ def update_frame_cache(screenshot):
     Stores frames in memory for WebSocket clients to consume.
     Performance: Updates every 2 frames = 40 FPS stream rate at 80 game FPS.
     """
-    global frame_cache_counter
+    global frame_cache_counter, _last_viewer_frame_time
 
     if screenshot is None:
         return
@@ -313,9 +353,11 @@ def update_frame_cache(screenshot):
     # Increment counter on every call
     frame_cache_counter += 1
 
-    # Only update every 2 frames (80 FPS / 2 = 40 FPS stream rate)
-    if frame_cache_counter % 2 != 0:
+    # At most 40 viewer frames per second of wall time, whatever the game speed
+    now = time.monotonic()
+    if now - _last_viewer_frame_time < VIEWER_FRAME_INTERVAL_S:
         return
+    _last_viewer_frame_time = now
 
     try:
         # Convert screenshot to base64
@@ -421,6 +463,8 @@ class ActionRequest(BaseModel):
     release_frames: Optional[int] = None  # Optional explicit release duration (overrides speed preset)
     source: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Judge each direction press and stop the call's sequence when one is blocked.
+    check_movement: bool = False
 
 
 class GameStateResponse(BaseModel):
@@ -457,23 +501,24 @@ def periodic_milestone_updater():
                 if env and env.memory_reader:
                     try:
                         # Use lightweight state for milestone updates only
-                        party = env.get_party_pokemon() or []
-                        location = env.get_location()
-                        badges = []
-                        if hasattr(env, 'memory_reader') and env.memory_reader and hasattr(env.memory_reader, 'read_badges'):
-                            try:
-                                badges = env.memory_reader.read_badges() or []
-                            except Exception:
-                                badges = []
-                        basic_state = {
-                            "player": {
-                                "money": env.get_money(),
-                                "party_size": len(env.get_party_pokemon() or []),
-                                "position": env.get_coordinates(),
-                            },
-                            "map": {"location": env.get_location()},
-                        }
-                        env.check_and_update_milestones(basic_state, agent_step_count=agent_step_count)
+                        with memory_lock:
+                            party = env.get_party_pokemon() or []
+                            location = env.get_location()
+                            badges = []
+                            if hasattr(env, 'memory_reader') and env.memory_reader and hasattr(env.memory_reader, 'read_badges'):
+                                try:
+                                    badges = env.memory_reader.read_badges() or []
+                                except Exception:
+                                    badges = []
+                            basic_state = {
+                                "player": {
+                                    "money": env.get_money(),
+                                    "party_size": len(env.get_party_pokemon() or []),
+                                    "position": env.get_coordinates(),
+                                },
+                                "map": {"location": env.get_location()},
+                            }
+                            env.check_and_update_milestones(basic_state, agent_step_count=agent_step_count)
                         last_milestone_update = current_time
                         logger.debug("Lightweight milestone update completed")
                     except Exception as e:
@@ -632,7 +677,7 @@ def handle_input(manual_mode=False):
 
 def step_environment(actions_pressed):
     """Take a step in the environment with optimized locking for better performance"""
-    global current_obs
+    global current_obs, last_frame_monotonic
 
     # Debug: print what actions are being sent to emulator
     # if actions_pressed:
@@ -641,6 +686,7 @@ def step_environment(actions_pressed):
     # Only use memory_lock for the essential emulator step
     with memory_lock:
         env.run_frame_with_buttons(actions_pressed)
+        last_frame_monotonic = time.monotonic()
 
         # Do lightweight area transition detection inside the lock
         if hasattr(env, "memory_reader") and env.memory_reader:
@@ -678,9 +724,7 @@ def step_environment(actions_pressed):
 
                     # Get current player coordinates and map info
                     current_coords = env.memory_reader.read_coordinates()
-                    current_map_bank = env.memory_reader._read_u8(env.memory_reader.addresses.MAP_BANK)
-                    current_map_number = env.memory_reader._read_u8(env.memory_reader.addresses.MAP_NUMBER)
-                    current_map_info = (current_map_bank, current_map_number)
+                    current_map_info = env.memory_reader._read_current_map()
 
                     # Initialize tracking variables if needed
                     if not hasattr(env, "_last_player_coords"):
@@ -759,11 +803,260 @@ def reset_game():
     global env, step_count
 
     print("Resetting game and milestones...")
-    with step_lock:
+    with step_lock, memory_lock:
         env.initialize()
         env.milestone_tracker.reset_all()  # Reset all milestones
         step_count = 0
     print("Game and milestone reset complete")
+
+
+DIRECTION_BUTTONS = ("UP", "DOWN", "LEFT", "RIGHT")
+
+
+def _register_sequence(buttons: List[str], check_movement: bool, source: Optional[str]) -> int:
+    """Create the report the game loop fills in while this call's buttons run."""
+    global _sequence_counter
+    with action_queue_lock:
+        _sequence_counter += 1
+        seq_id = _sequence_counter
+        sequence_reports[seq_id] = {
+            "seq_id": seq_id,
+            "buttons": list(buttons),
+            "total": len(buttons),
+            "check_movement": bool(check_movement),
+            "source": source,
+            "executed": 0,
+            "skipped": 0,
+            "blocked": None,
+            "interrupted": None,
+            "last_direction": None,
+            "done": not buttons,
+        }
+        while len(sequence_reports) > SEQUENCE_REPORTS_MAX:
+            sequence_reports.pop(min(sequence_reports))
+    return seq_id
+
+
+def _report_for(action_data) -> Optional[Dict[str, Any]]:
+    if isinstance(action_data, dict) and action_data.get("seq_id") is not None:
+        return sequence_reports.get(action_data["seq_id"])
+    return None
+
+
+def _is_checked_direction(action_data) -> bool:
+    return (
+        game_type == "emerald"
+        and isinstance(action_data, dict)
+        and bool(action_data.get("check_movement"))
+        and action_data.get("button") in DIRECTION_BUTTONS
+    )
+
+
+def _field_snapshot():
+    """Overworld snapshot (server.field_control.FieldSnapshot), or None if unreadable."""
+    if env is None or getattr(env, "memory_reader", None) is None:
+        return None
+    try:
+        from server.field_control import read_field_snapshot
+
+        with memory_lock:
+            return read_field_snapshot(env.memory_reader)
+    except Exception as e:
+        logger.debug(f"Field snapshot failed: {e}")
+        return None
+
+
+def _refuse_during_battle(tool: str) -> Optional[Dict[str, Any]]:
+    """An error result for a walking tool called mid-battle, else None.
+
+    Seen live: between two of a trainer's Pokémon the model decided the battle was
+    over (the prompt said BATTLE MODE) and called navigate_to and go_to_exit. Their
+    direction presses only moved the battle menu cursor, and each reported "did not
+    leave the map", which says nothing about why.
+    """
+    try:
+        with memory_lock:
+            busy = env.memory_reader.is_in_battle()
+    except Exception:
+        return None  # can't tell: let the walk run and report what happened
+    if not busy:
+        return None
+    message = (
+        f"{tool} can't walk now: a battle is still going on (game memory says so), so "
+        "direction presses would only move the battle menu cursor. Finish the battle "
+        "with use_move (the battle section names the best move) or press_buttons, then walk."
+    )
+    return {"success": False, "error": message, "summary": message}
+
+
+def _location_name() -> str:
+    try:
+        with memory_lock:
+            return env.memory_reader.read_location()
+    except Exception:
+        return "this map"
+
+
+def _wait_for_player_to_stand() -> bool:
+    """True while the next checked direction press should wait for a step to finish.
+
+    Starting a press while the player is still mid-step (or mid ledge jump) both loses
+    the press (it ends before the jump does) and makes its outcome unjudgeable.
+    """
+    global _start_wait_frames, _pending_before_snapshot
+    head = action_queue[0] if action_queue else None
+    if not _is_checked_direction(head):
+        _start_wait_frames = 0
+        return False
+    from server.field_control import SETTLE_MAX_FRAMES
+
+    snap = _field_snapshot()
+    if snap is not None and snap.in_transition and _start_wait_frames < SETTLE_MAX_FRAMES:
+        _start_wait_frames += 1
+        return True
+    _start_wait_frames = 0
+    _pending_before_snapshot = snap
+    return False
+
+
+def _begin_action(action_data) -> None:
+    global _active_action_data, _move_check, _pending_before_snapshot
+    _active_action_data = action_data
+    report = _report_for(action_data)
+    if report is not None:
+        report["executed"] += 1
+    if _is_checked_direction(action_data):
+        _move_check = {
+            "button": action_data["button"],
+            "before": _pending_before_snapshot or _field_snapshot(),
+            "seq_id": action_data.get("seq_id"),
+            "previous": report.get("last_direction") if report else None,
+            "released": False,
+        }
+    _pending_before_snapshot = None
+
+
+def _on_action_released() -> None:
+    """The current action's hold and release frames are over."""
+    global _active_action_data, _move_check_settle_frames
+    if _move_check is not None and not _move_check["released"]:
+        # Judged by _settle_move_check once the player stands still again.
+        _move_check["released"] = True
+        _move_check_settle_frames = 0
+        return
+    data, _active_action_data = _active_action_data, None
+    _finish_action(data)
+
+
+def _settle_move_check() -> None:
+    """Called once per frame after a checked direction press; judges it when the step ends."""
+    global _move_check, _move_check_settle_frames, _active_action_data
+    from server.field_control import SETTLE_MAX_FRAMES
+
+    after = _field_snapshot()
+    if after is not None and after.in_transition and _move_check_settle_frames < SETTLE_MAX_FRAMES:
+        _move_check_settle_frames += 1
+        return
+    check, _move_check = _move_check, None
+    data, _active_action_data = _active_action_data, None
+    try:
+        _judge_move(check, after)
+    except Exception as e:
+        logger.warning(f"Movement check failed: {e}")
+    _finish_action(data)
+
+
+def _drop_rest_of_sequence(seq_id: int) -> int:
+    """Remove this sequence's still-queued presses; returns how many were dropped."""
+    global action_queue
+    with action_queue_lock:
+        kept = [a for a in action_queue if not (isinstance(a, dict) and a.get("seq_id") == seq_id)]
+        dropped = len(action_queue) - len(kept)
+        action_queue[:] = kept
+    # Skipped presses never happened: take them out of the recent-actions list the
+    # state text is built from (it also expects an end_pos on every completed press).
+    recent_button_presses[:] = [
+        entry for entry in recent_button_presses
+        if not (entry.get("seq_id") == seq_id and not entry.get("completed"))
+    ]
+    return dropped
+
+
+def _judge_move(check: Dict[str, Any], after) -> None:
+    global last_blocked_press
+    from server.field_control import (
+        BLOCKED,
+        blocked_target,
+        interruption_cause,
+        judge_direction_press,
+        npc_at,
+    )
+
+    button, before, seq_id = check["button"], check["before"], check["seq_id"]
+    report = sequence_reports.get(seq_id)
+    if report is not None:
+        report["last_direction"] = button
+    if before is None or after is None:
+        return
+    verdict = judge_direction_press(button, before, after, check["previous"])
+    if verdict is None:
+        return
+    skipped = _drop_rest_of_sequence(seq_id)
+    total = report["total"] if report else skipped + 1
+    location = _location_name()
+    if verdict == BLOCKED:
+        tx, ty = blocked_target(button, before)
+        with memory_lock:
+            occupied = npc_at(env.memory_reader, tx, ty)
+        what = "is occupied by someone" if occupied else "is not walkable"
+        message = (
+            f"BLOCKED moving {button} at ({before.x},{before.y}) on {location}: ({tx},{ty}) {what}. "
+            f"{skipped} of {total} presses skipped."
+        )
+        if not occupied:
+            try:
+                from server.game_tools import exit_hint
+
+                hint = exit_hint(location, button)
+            except Exception:
+                hint = ""
+            if hint:
+                message += f" {hint}"
+        # People walk away, so only a blocking tile makes the same press pointless.
+        last_blocked_press = None if occupied else {
+            "button": button,
+            "x": before.x,
+            "y": before.y,
+            "map_id": before.map_id,
+            "message": message,
+        }
+        if report is not None:
+            report["blocked"] = message
+            report["skipped"] = skipped
+        logger.info(f"🧱 {message}")
+    elif not skipped:
+        # The interruption came with the last press: nothing was skipped, but say why
+        # the walk ended where it did (e.g. a wild battle started on the last step).
+        if report is not None:
+            report["note"] = interruption_cause(after)
+    else:
+        message = (
+            f"STOPPED at ({after.x},{after.y}) on {location}: {interruption_cause(after)}. "
+            f"{skipped} of {total} presses skipped."
+        )
+        if report is not None:
+            report["interrupted"] = message
+            report["skipped"] = skipped
+        logger.warning(f"⏹️ {message} (before={before}, after={after})")
+
+
+def _finish_action(action_data) -> None:
+    report = _report_for(action_data)
+    if report is None:
+        return
+    seq_id = report["seq_id"]
+    if not any(isinstance(a, dict) and a.get("seq_id") == seq_id for a in list(action_queue)):
+        report["done"] = True
 
 
 def game_loop(manual_mode=False):
@@ -771,6 +1064,7 @@ def game_loop(manual_mode=False):
     global running, step_count
 
     print("Starting headless game loop...")
+    next_frame_deadline = time.monotonic()
 
     while running:
         # Handle input
@@ -830,13 +1124,25 @@ def game_loop(manual_mode=False):
                     release_frames_remaining = current_action_release_delay
                     action_completed = True  # Mark action as completed
                     print(f"✅ Action completed: step_count will increment")
+                    if release_frames_remaining == 0:
+                        _on_action_released()
             elif release_frames_remaining > 0:
                 # Release delay (no button pressed)
                 actions_pressed = []
                 release_frames_remaining -= 1
+                if release_frames_remaining == 0:
+                    _on_action_released()
+            elif _move_check is not None and _move_check["released"]:
+                # Judge the last direction press once the player has finished the step.
+                actions_pressed = []
+                _settle_move_check()
+            elif action_queue and _wait_for_player_to_stand():
+                # Let a step or ledge jump finish before the next checked direction press.
+                actions_pressed = []
             elif action_queue:
                 # Start a new action from the queue
-                current_action_data = action_queue.pop(0)
+                with action_queue_lock:
+                    current_action_data = action_queue.pop(0)
 
                 # Handle both old format (string) and new format (dict) for backward compatibility
                 if isinstance(current_action_data, str):
@@ -855,15 +1161,24 @@ def game_loop(manual_mode=False):
                         timing = timing.copy()
                         timing["release"] = current_action_data["release_frames"]
 
+                _begin_action(current_action_data)
+
                 # Special handling for WAIT action
                 if current_action == "WAIT":
-                    action_frames_remaining = 0  # Don't actually hold any button
-                    current_action_release_delay = timing["release"]  # Wait duration is in release
+                    # A pure delay: run it as release frames. (It used to leave
+                    # current_action == "WAIT" set forever, so /queue_status never
+                    # reported the queue empty after a trailing WAIT.)
+                    current_action = None
+                    action_frames_remaining = 0
+                    current_action_release_delay = timing["release"]
+                    release_frames_remaining = timing["release"]
+                    if release_frames_remaining == 0:
+                        _on_action_released()
+                    actions_pressed = []
                 else:
                     action_frames_remaining = timing["hold"]
                     current_action_release_delay = timing["release"]
-
-                actions_pressed = [] if current_action == "WAIT" else [current_action]
+                    actions_pressed = [current_action]
                 queue_len = len(action_queue)
 
                 # Get current FPS for estimation
@@ -898,14 +1213,24 @@ def game_loop(manual_mode=False):
         if current_time - last_fps_log >= 5.0:  # Log every 5 seconds
             actual_fps = frame_count_since_log / (current_time - last_fps_log)
             queue_len = len(action_queue)
-            print(f"📊 Server FPS: {actual_fps:.1f} (target: {fps}), Queue: {queue_len} actions")
+            print(f"📊 Server FPS: {actual_fps:.1f} (target: {GAME_FPS:.0f} idle / {TURBO_FPS:.0f} busy), Queue: {queue_len} actions")
             last_fps_log = current_time
             frame_count_since_log = 0
 
-        # Use dynamic FPS - 2x speed during dialog
-        current_fps = env.get_current_fps(fps) if env else fps
-        # Simple sleep - more reliable than complex timing
-        time.sleep(1.0 / current_fps)
+        # Turbo while the harness is executing presses (queue, held button, release
+        # delay, or a direction press waiting to settle); normal speed while idle.
+        busy = bool(action_queue) or current_action is not None or release_frames_remaining > 0 or _move_check is not None
+        target_fps = TURBO_FPS if busy else GAME_FPS
+        if target_fps <= 0:
+            next_frame_deadline = time.monotonic()
+            continue
+        # Deadline pacing: sleep only the time left in this frame's slot, so per-frame
+        # work doesn't add on top of the sleep (that held 80 fps to ~54). If we fall
+        # far behind (e.g. a slow state read), restart the schedule rather than burst.
+        now = time.monotonic()
+        next_frame_deadline = max(next_frame_deadline + 1.0 / target_fps, now - 0.1)
+        if next_frame_deadline > now:
+            time.sleep(next_frame_deadline - now)
 
 
 def run_fastapi_server(port):
@@ -946,8 +1271,56 @@ async def get_config():
 
 @app.get("/health")
 async def get_health():
-    """Health check endpoint for server monitoring"""
-    return {"status": "healthy", "timestamp": time.time()}
+    """Health check: healthy only while the game loop is emulating frames.
+
+    Deliberately takes no lock: it must answer, and report the stall, even while
+    something holds the emulator.
+    """
+    now = time.time()
+    if env is None:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "reason": "emulator not initialized", "timestamp": now})
+    if last_frame_monotonic is None:
+        return JSONResponse(status_code=503, content={"status": "starting", "reason": "no frame emulated yet", "timestamp": now})
+    frame_age = time.monotonic() - last_frame_monotonic
+    if frame_age > HEALTH_MAX_FRAME_AGE_S:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "reason": f"no frame emulated for {frame_age:.1f}s (game loop dead or stuck)",
+                "last_frame_age_s": round(frame_age, 3),
+                "timestamp": now,
+            },
+        )
+    return {"status": "healthy", "last_frame_age_s": round(frame_age, 3), "timestamp": now}
+
+
+# Local addition: lets a human pause the autonomous agent (agents/PokeAgent.py waits
+# while this flag file exists) and play through /action, then hand control back.
+AGENT_PAUSE_FLAG = os.path.join(".pokeagent_cache", "AGENT_PAUSED")
+
+
+@app.get("/play")
+async def get_play():
+    """Serve the human controller page (server/play.html)."""
+    with open("server/play.html", "r") as f:
+        return HTMLResponse(content=f.read())
+
+
+@app.get("/agent_pause")
+async def get_agent_pause():
+    return {"paused": os.path.exists(AGENT_PAUSE_FLAG)}
+
+
+@app.post("/agent_pause")
+async def set_agent_pause(request: dict):
+    if request.get("paused"):
+        os.makedirs(os.path.dirname(AGENT_PAUSE_FLAG), exist_ok=True)
+        with open(AGENT_PAUSE_FLAG, "w") as f:
+            f.write(str(time.time()))
+    elif os.path.exists(AGENT_PAUSE_FLAG):
+        os.remove(AGENT_PAUSE_FLAG)
+    return {"paused": os.path.exists(AGENT_PAUSE_FLAG)}
 
 
 @app.get("/status")
@@ -1020,7 +1393,8 @@ async def get_latest_frame():
     # If current_obs is None (e.g., after server restart), try to get a fresh screenshot
     if obs_copy is None and env:
         try:
-            screenshot = env.get_screenshot()
+            with memory_lock:
+                screenshot = env.get_screenshot()
             if screenshot:
                 obs_copy = np.array(screenshot)
                 # Update current_obs for future requests
@@ -1118,15 +1492,21 @@ async def take_action(request: ActionRequest):
             print(f"📡 Server received actions: {request.buttons}{speed_info}{frame_info}")
             print(f"📋 Action queue before extend: {action_queue}")
 
+            seq_id = _register_sequence(request.buttons, request.check_movement, request.source)
+
             # Create action data with timing info
-            for button in request.buttons:
-                action_data = {
-                    "button": button,
-                    "speed": speed,
-                    "hold_frames": hold_frames,
-                    "release_frames": release_frames,
-                }
-                action_queue.append(action_data)
+            with action_queue_lock:
+                for idx, button in enumerate(request.buttons):
+                    action_data = {
+                        "button": button,
+                        "speed": speed,
+                        "hold_frames": hold_frames,
+                        "release_frames": release_frames,
+                        "seq_id": seq_id,
+                        "seq_index": idx,
+                        "check_movement": request.check_movement,
+                    }
+                    action_queue.append(action_data)
 
             print(f"📋 Action queue after extend: {len(action_queue)} actions")
 
@@ -1137,7 +1517,8 @@ async def take_action(request: ActionRequest):
             # For large queues, skip position tracking to maintain FPS
             if len(action_queue) < 20:
                 # Get current player position (use cached state - 100ms cache in emulator)
-                current_state = env.get_comprehensive_state()  # Already cached internally
+                with memory_lock:
+                    current_state = env.get_comprehensive_state()  # Already cached internally
                 player_data = current_state.get("player", {})
                 position = player_data.get("position", {})
                 location = player_data.get("location", "Unknown")
@@ -1160,6 +1541,7 @@ async def take_action(request: ActionRequest):
                     "completed": False,
                     "sequence_index": idx,
                     "sequence_length": sequence_length,
+                    "seq_id": seq_id,
                 }
 
                 if source:
@@ -1241,7 +1623,8 @@ async def take_action(request: ActionRequest):
                 # This prevents FPS drops during batch action processing
                 if len(action_queue) < 30:
                     # Get current game state for logging
-                    game_state = env.get_comprehensive_state()
+                    with memory_lock:
+                        game_state = env.get_comprehensive_state()
                     action_taken = request.buttons[0] if request.buttons else "NONE"  # Log first action
 
                     # Create simple state hash
@@ -1260,7 +1643,8 @@ async def take_action(request: ActionRequest):
                     if env and hasattr(env, "milestone_tracker"):
                         try:
                             # Force an immediate milestone check before logging
-                            env.check_and_update_milestones(game_state, agent_step_count=agent_step_count)
+                            with memory_lock:
+                                env.check_and_update_milestones(game_state, agent_step_count=agent_step_count)
                         except Exception as e:
                             logger.debug(f"Error during immediate milestone check: {e}")
 
@@ -1291,6 +1675,7 @@ async def take_action(request: ActionRequest):
             "actions_queued": actions_added,
             "queue_length": len(action_queue),  # action_queue access is atomic for lists
             "message": f"Added {actions_added} actions to queue",
+            "sequence_id": seq_id if request.buttons else None,
         }
 
     except Exception as e:
@@ -1309,6 +1694,7 @@ async def get_queue_status():
         and current_action is None
         and action_frames_remaining == 0
         and release_frames_remaining == 0
+        and _move_check is None  # last direction press still being judged
     )
 
     return {
@@ -1386,7 +1772,8 @@ async def get_comprehensive_state():
     try:
         # Use the emulator's built-in caching (100ms cache)
         # This avoids expensive operations on rapid requests
-        state = env.get_comprehensive_state()
+        with memory_lock:
+            state = env.get_comprehensive_state()
 
         # Ensure game state is consistent with cached dialog state
         # Use the same cached dialog state as the status endpoint
@@ -1605,7 +1992,9 @@ async def get_comprehensive_state():
                 from utils.data_persistence.run_data_manager import get_cache_path
                 cache_file = str(get_cache_path("map_stitcher_data.json"))
                 if os.path.exists(cache_file):
-                    with open(cache_file, "r") as f:
+                    # load_state/save_state rewrite this file in place while holding
+                    # the emulator lock; reading under it avoids a half-written file.
+                    with memory_lock, open(cache_file, "r") as f:
                         map_data = json.load(f)
                         if "location_connections" in map_data and map_data["location_connections"]:
                             location_connections = map_data["location_connections"]
@@ -1749,7 +2138,8 @@ async def get_whole_map():
     # Red: use RedEmulator.get_whole_map() directly (returns compatible dict)
     if game_type == "red":
         try:
-            result = env.get_whole_map()
+            with memory_lock:
+                result = env.get_whole_map()
             if not result or not result.get("grid"):
                 raise HTTPException(status_code=400, detail="No valid location loaded")
             return result
@@ -1762,7 +2152,8 @@ async def get_whole_map():
     # Emerald: use porymap ground truth
     try:
         # Get current location
-        state = env.get_comprehensive_state()
+        with memory_lock:
+            state = env.get_comprehensive_state()
         location_name = state.get("player", {}).get("location", "Unknown")
         player_pos = state.get("player", {}).get("position", {})
         px, py = player_pos.get("x", 0), player_pos.get("y", 0)
@@ -1883,29 +2274,31 @@ async def debug_memory():
             return {"error": "Memory reader not initialized"}
 
         # Test basic memory access
-        diagnostics = env.memory_reader.test_memory_access()
+        with memory_lock:
+            diagnostics = env.memory_reader.test_memory_access()
 
         # Try to read some basic data
         try:
-            party_size = env.memory_reader.read_party_size()
-            coordinates = env.memory_reader.read_coordinates()
-            money = env.memory_reader.read_money()
+            with memory_lock:
+                party_size = env.memory_reader.read_party_size()
+                coordinates = env.memory_reader.read_coordinates()
+                money = env.memory_reader.read_money()
 
-            # Add new debugging info
-            is_in_battle = env.memory_reader.is_in_battle()
-            game_state = env.memory_reader.get_game_state()
-            player_name = env.memory_reader.read_player_name()
+                # Add new debugging info
+                is_in_battle = env.memory_reader.is_in_battle()
+                game_state = env.memory_reader.get_game_state()
+                player_name = env.memory_reader.read_player_name()
 
-            # Add battle detection debugging
-            try:
-                battle_addr = env.memory_reader.IN_BATTLE_BIT_ADDR
-                battle_raw_value = env.memory_reader._read_u8(battle_addr)
-                battle_mask = env.memory_reader.IN_BATTLE_BITMASK
-                battle_result = (battle_raw_value & battle_mask) != 0
-            except Exception as e:
-                battle_raw_value = None
-                battle_mask = None
-                battle_result = None
+                # Add battle detection debugging
+                try:
+                    battle_addr = env.memory_reader.IN_BATTLE_BIT_ADDR
+                    battle_raw_value = env.memory_reader._read_u8(battle_addr)
+                    battle_mask = env.memory_reader.IN_BATTLE_BITMASK
+                    battle_result = (battle_raw_value & battle_mask) != 0
+                except Exception as e:
+                    battle_raw_value = None
+                    battle_mask = None
+                    battle_result = None
 
             diagnostics.update(
                 {
@@ -1943,7 +2336,8 @@ async def debug_memory_comprehensive():
 
     try:
         # Use the comprehensive memory testing method
-        test_results = env.test_memory_reading()
+        with memory_lock:
+            test_results = env.test_memory_reading()
         return test_results
 
     except Exception as e:
@@ -1962,7 +2356,8 @@ async def debug_memory_dump(start: int = 0x02000000, length: int = 0x1000):
             return {"error": "Memory reader not initialized"}
 
         # Read raw memory bytes
-        memory_bytes = env.memory_reader._read_bytes(start, length)
+        with memory_lock:
+            memory_bytes = env.memory_reader._read_bytes(start, length)
 
         # Convert to hex string for easy viewing
         hex_data = memory_bytes.hex()
@@ -2319,7 +2714,8 @@ async def get_termination_condition(condition_type: str = "gym_badge_count", thr
     try:
         if condition_type == "gym_badge_count":
             # Read badges directly from ROM memory (ground truth)
-            badges = env.memory_reader.read_badges()
+            with memory_lock:
+                badges = env.memory_reader.read_badges()
             badge_count = len(badges) if badges else 0
             
             return {
@@ -2509,6 +2905,217 @@ async def get_llm_logs():
 
 
 # Helper function to update objectives cache file (for fast reads by stream.html)
+def _load_objectives_sequence():
+    """Load the configured objective sequence, restoring this run's saved progress first.
+
+    The single loader for every lazy-load path. /mcp/complete_direct_objective used to
+    load a fresh sequence at the start index without looking at objectives.json, so a
+    completion call that arrived before the first state request reset a resumed run's
+    objectives to the beginning and saved that over the real progress.
+    """
+    from utils.data_persistence.run_data_manager import get_run_data_manager, get_cache_path
+
+    run_manager = get_run_data_manager()
+    objectives_run_dir = str(run_manager.get_scratch_space_dir()) if run_manager else None
+
+    restored_from_file = False
+    try:
+        cache_objectives_path = str(get_cache_path("objectives.json"))
+        if os.path.exists(cache_objectives_path):
+            with open(cache_objectives_path, "r", encoding="utf-8") as f:
+                direct_objectives_manager.restore_from_state(json.load(f))
+            restored_from_file = True
+            logger.info(f"✅ Restored objectives from {cache_objectives_path}")
+    except Exception as e:
+        logger.warning(f"Failed to restore objectives from cache, falling back to sequence load: {e}")
+
+    if not restored_from_file:
+        if direct_objectives_sequence == "autonomous_objective_creation":
+            direct_objectives_manager.load_autonomous_objective_creation_sequence(
+                direct_objectives_start_index, run_dir=objectives_run_dir
+            )
+        elif direct_objectives_sequence == "categorized_full_game":
+            direct_objectives_manager.load_categorized_full_game_sequence(
+                start_story_index=direct_objectives_start_index,
+                start_battling_index=direct_objectives_battling_start_index,
+                run_dir=objectives_run_dir,
+            )
+        else:
+            logger.warning(f"Unknown direct objectives sequence: {direct_objectives_sequence}")
+
+        # Persist the freshly-loaded state
+        direct_objectives_manager.auto_save()
+
+    # Update objectives cache after loading
+    _update_objectives_cache()
+
+
+# Completion conditions the game itself records as an event flag (pret/pokeemerald
+# include/constants/flags.h; SYSTEM_FLAGS = 0x860), with what to call the thing.
+_SYSTEM_FLAGS = 0x860
+_CONDITION_FLAGS = {
+    "pokedex_received": (_SYSTEM_FLAGS + 0x1, "the POKéDEX"),  # FLAG_SYS_POKEDEX_GET
+    "pokenav_received": (_SYSTEM_FLAGS + 0x2, "the POKéNAV"),  # FLAG_SYS_POKENAV_GET
+    "running_shoes_received": (_SYSTEM_FLAGS + 0x60, "the RUNNING SHOES"),  # FLAG_SYS_B_DASH
+    "stone_badge_obtained": (_SYSTEM_FLAGS + 0x7, "the STONE BADGE"),  # FLAG_BADGE01_GET ...
+    "knuckle_badge_obtained": (_SYSTEM_FLAGS + 0x8, "the KNUCKLE BADGE"),
+    "dynamo_badge_obtained": (_SYSTEM_FLAGS + 0x9, "the DYNAMO BADGE"),
+    "heat_badge_obtained": (_SYSTEM_FLAGS + 0xA, "the HEAT BADGE"),
+    "balance_badge_obtained": (_SYSTEM_FLAGS + 0xB, "the BALANCE BADGE"),
+    "feather_badge_obtained": (_SYSTEM_FLAGS + 0xC, "the FEATHER BADGE"),
+    "mind_badge_obtained": (_SYSTEM_FLAGS + 0xD, "the MIND BADGE"),
+    "rain_badge_obtained": (_SYSTEM_FLAGS + 0xE, "the RAIN BADGE"),
+}
+
+# Objectives about being given an item: met when the bag holds it (names as the bag reader
+# spells them, pokemon_env/emerald_utils.py). TMs and HMs are one-time gifts here, and
+# either bike counts for Rydel's.
+_CONDITION_ITEMS = {
+    "pokeballs_received": (("Poke Ball",), "POKé BALLS"),
+    "great_ball_received": (("Great Ball",), "a GREAT BALL"),
+    "devon_goods_obtained": (("Devon Goods",), "the DEVON GOODS"),
+    "itemfinder_received": (("Itemfinder",), "the ITEMFINDER"),
+    "bicycle_received": (("Mach Bike", "Acro Bike"), "a BIKE"),
+    "meteorite_obtained": (("Meteorite",), "the METEORITE"),
+    "go_goggles_received": (("Go-Goggles",), "the GO-GOGGLES"),
+    "devon_scope_received": (("Devon Scope",), "the DEVON SCOPE"),
+    "magma_emblem_received": (("Magma Emblem",), "the MAGMA EMBLEM"),
+    **{
+        f"{tm.lower()}_received": ((tm,), tm)
+        for tm in ("TM39", "TM08", "TM34", "TM50", "TM42", "TM40", "TM04", "TM03",
+                   "HM05", "HM06", "HM03", "HM02", "HM08", "HM07")
+    },
+}
+
+# Story battles against one trainer: the game sets TRAINER_FLAGS_START + the trainer's id
+# when that trainer is beaten (pret/pokeemerald include/constants/opponents.h, flags.h).
+# A rival battle has one id per rival and starter; "any" is met when one of them is set.
+_TRAINER_FLAGS_START = 0x500
+_RIVAL_103 = (520, 523, 526, 529, 532, 535)
+_RIVAL_110 = (521, 524, 527, 530, 533, 536)
+_RIVAL_119 = (522, 525, 528, 531, 534, 537)
+_CONDITION_TRAINERS = {
+    "rival_battle_1_won": ("any", _RIVAL_103, "your rival on Route 103"),
+    "aqua_grunt_woods_defeated": ("any", (10,), "the Team Aqua Grunt in Petalburg Woods"),
+    "aqua_grunt_tunnel_defeated": ("any", (16,), "the Team Aqua Grunt in Rusturf Tunnel"),
+    "rival_battle_2_won": ("any", _RIVAL_110, "your rival on Route 110"),
+    "wally_mauville_defeated": ("any", (656,), "Wally in Mauville"),
+    "maxie_chimney_defeated": ("any", (602,), "Maxie on Mt. Chimney"),
+    "shelly_defeated": ("any", (32,), "Shelly in the Weather Institute"),
+    "rival_battle_3_won": ("any", _RIVAL_119, "your rival on Route 119"),
+    "matt_hideout_defeated": ("any", (30,), "Matt in the Aqua Hideout"),
+    "maxie_tabitha_defeated": ("all", (734, 514), "Maxie and Tabitha in the Space Center"),
+    "archie_defeated_seafloor": ("any", (34,), "Archie in the Seafloor Cavern"),
+    "wally_victory_road_defeated": ("any", (519, 657, 658, 659, 660), "Wally in Victory Road"),
+    "sidney_defeated": ("any", (261,), "Sidney"),
+    "phoebe_defeated": ("any", (262,), "Phoebe"),
+    "glacia_defeated": ("any", (263,), "Glacia"),
+    "drake_defeated": ("any", (264,), "Drake"),
+    "champion_wallace_defeated": ("any", (335,), "Wallace"),
+}
+
+
+def _note_way_to_story_target(guidance: Dict[str, Any]) -> None:
+    """Put the way to the story objective's target map at the front of its navigation hint.
+
+    Only the story objective, to keep the prompt short; see game_tools.way_to_place.
+    """
+    story = guidance.get("story")
+    if env is None or not isinstance(story, dict) or not story.get("target_location"):
+        return
+    if str(story.get("completion_condition", "")).find("ALREADY TRUE") != -1:
+        return  # done already: the call to make is the hint
+    from server import game_tools
+
+    snap = _field_snapshot()
+    way = game_tools.way_to_place(
+        _location_name(), (snap.x, snap.y) if snap is not None else None, story["target_location"]
+    )
+    if way:
+        story["navigation_hint"] = f"{way} {story.get('navigation_hint') or ''}".strip()
+
+
+def _note_conditions_met_in_memory(guidance: Dict[str, Any]) -> None:
+    """Say so on an objective whose completion condition the game has already recorded.
+
+    Objectives complete only when the agent calls complete_direct_objective, and the
+    agent judges that from the screen. Seen live: Birch handed over the POKéDEX inside a
+    cutscene that auto-advance read through, the model never saw it happen, and it
+    kept pressing A at May to "receive the Pokedex". The flag is ground truth, so the
+    objective line now says it is done and gives the exact call; the agent still makes
+    the call, so nothing completes behind its back.
+
+    Getting somewhere is checked the same way: the map name is ground truth. Seen live:
+    standing on Route 104 with "Travel west to Route 104 South" as the objective, the
+    model read "South" as a direction and set off for Route 105 (all sea).
+    """
+    if env is None or getattr(env, "memory_reader", None) is None:
+        return
+    from server import game_tools
+
+    entries = [guidance.get("story"), guidance.get("dynamics"), *(guidance.get("battling_group") or [])]
+    place = None
+    bag = None  # item names, read once and only when an item condition needs it
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        condition = str(entry.get("completion_condition") or "")
+        known = _CONDITION_FLAGS.get(condition)
+        if known:
+            flag, thing = known
+            with memory_lock:
+                done = env.memory_reader._is_event_flag_set(flag)
+            if done:
+                entry["completion_condition"] = (
+                    f"{condition}: ALREADY TRUE in game memory (you have {thing}). Call "
+                    f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                )
+            continue
+        trainers = _CONDITION_TRAINERS.get(condition)
+        if trainers:
+            # Seen live: the Petalburg Woods Grunt battle ended inside dialogue the
+            # model didn't follow; with "Battle Team Aqua Grunt" still open it went
+            # back to the walkthrough's first chapter and wandered off to "save Birch".
+            mode, ids, who = trainers
+            with memory_lock:
+                beaten = [env.memory_reader._is_event_flag_set(_TRAINER_FLAGS_START + i) for i in ids]
+            if all(beaten) if mode == "all" else any(beaten):
+                entry["completion_condition"] = (
+                    f"{condition}: ALREADY TRUE in game memory (you have beaten {who}). Call "
+                    f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                )
+            continue
+        items = _CONDITION_ITEMS.get(condition)
+        if items:
+            # Seen live: "Receive Great Ball from Devon Researcher" stayed open with the
+            # Great Ball already in the bag (handed over in auto-advanced dialogue).
+            names, thing = items
+            if bag is None:
+                with memory_lock:
+                    pockets = env.memory_reader.read_full_inventory() or {}
+                bag = {i.get("name") for pocket in pockets.values() for i in (pocket or []) if i.get("quantity")}
+            if bag & set(names):
+                entry["completion_condition"] = (
+                    f"{condition}: ALREADY TRUE in game memory (your bag has {thing}). Call "
+                    f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                )
+            continue
+        # Only conditions that are about being somewhere: "gym_puzzle_solved" also
+        # names a place, but standing in the gym doesn't solve it.
+        about_place = condition.endswith(("_reached", "_entered")) or condition.startswith(("returned_", "in_"))
+        if entry.get("action_type") != "navigate" or not about_place or not entry.get("target_location"):
+            continue
+        if place is None:
+            snap = _field_snapshot()
+            place = (_location_name(), (snap.x, snap.y) if snap is not None else None)
+        if game_tools.arrived_at(place[0], place[1], entry["target_location"]):
+            entry["completion_condition"] = (
+                f"{condition}: ALREADY TRUE (you are on {place[0]}, which is "
+                f"{entry['target_location']}). Call "
+                f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+            )
+
+
 def _update_objectives_cache():
     """Write current objectives state to fast-access cache file"""
     try:
@@ -2636,7 +3243,8 @@ async def get_milestones():
 
     try:
         # Get milestones directly from emulator
-        result = env.get_milestones(agent_step_count=agent_step_count)
+        with memory_lock:
+            result = env.get_milestones(agent_step_count=agent_step_count)
 
         # Read objectives from cached file (fast, no manager access needed)
         objectives_data = {
@@ -2882,43 +3490,7 @@ async def mcp_get_game_state():
 
                 if needs_loading and os.environ.get("POKEAGENT_CLI_MODE") != "1":
                     # CLI agents do not use objectives; skip when POKEAGENT_CLI_MODE
-                    from utils.data_persistence.run_data_manager import get_run_data_manager, get_cache_path
-
-                    run_manager = get_run_data_manager()
-                    objectives_run_dir = str(run_manager.get_scratch_space_dir()) if run_manager else None
-
-                    # Try restoring from persisted objectives.json first
-                    _restored_from_file = False
-                    try:
-                        cache_objectives_path = str(get_cache_path("objectives.json"))
-                        if os.path.exists(cache_objectives_path):
-                            direct_objectives_manager.restore_from_state(
-                                json.load(open(cache_objectives_path, "r", encoding="utf-8"))
-                            )
-                            _restored_from_file = True
-                            logger.info(f"✅ Restored objectives from {cache_objectives_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to restore objectives from cache, falling back to sequence load: {e}")
-
-                    if not _restored_from_file:
-                        if direct_objectives_sequence == "autonomous_objective_creation":
-                            direct_objectives_manager.load_autonomous_objective_creation_sequence(
-                                direct_objectives_start_index, run_dir=objectives_run_dir
-                            )
-                        elif direct_objectives_sequence == "categorized_full_game":
-                            direct_objectives_manager.load_categorized_full_game_sequence(
-                                start_story_index=direct_objectives_start_index,
-                                start_battling_index=direct_objectives_battling_start_index,
-                                run_dir=objectives_run_dir,
-                            )
-                        else:
-                            logger.warning(f"Unknown direct objectives sequence: {direct_objectives_sequence}")
-
-                        # Persist the freshly-loaded state
-                        direct_objectives_manager.auto_save()
-
-                    # Update objectives cache after loading
-                    _update_objectives_cache()
+                    _load_objectives_sequence()
 
             # Get current objective guidance
             if direct_objectives_manager.is_sequence_active():
@@ -2936,6 +3508,14 @@ async def mcp_get_game_state():
 
                     categorized_guidance = direct_objectives_manager.get_categorized_objective_guidance(game_state)
                     if categorized_guidance:
+                        try:
+                            _note_conditions_met_in_memory(categorized_guidance)
+                        except Exception as e:  # a hint must never break the state response
+                            logger.warning(f"objective memory check failed: {e}")
+                        try:
+                            _note_way_to_story_target(categorized_guidance)
+                        except Exception as e:
+                            logger.warning(f"objective route hint failed: {e}")
                         result["categorized_objectives"] = categorized_guidance
 
                     # Add categorized status
@@ -3113,6 +3693,355 @@ async def mcp_get_map_data():
         return {"success": False, "error": str(e)}
 
 
+def _sequence_timeout(n_buttons: int) -> float:
+    """Generous upper bound for n presses (hold + release + a ledge-jump settle each)."""
+    per_press = SPEED_PRESETS["slow"]["hold"] + SPEED_PRESETS["slow"]["release"] + 48
+    return min(80.0, 5.0 + 1.5 * n_buttons * per_press / max(1, fps))
+
+
+async def _await_sequence(seq_id: Optional[int], timeout_s: float) -> Optional[Dict[str, Any]]:
+    """Wait until the game loop has run (or dropped) every press of a sequence."""
+    if seq_id is None:
+        return None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        report = sequence_reports.get(seq_id)
+        if report is None or report.get("done"):
+            return report
+        await asyncio.sleep(0.05)
+    return sequence_reports.get(seq_id)
+
+
+def _position_text(snap, location: Optional[str] = None) -> str:
+    if snap is None:
+        return "position unknown"
+    text = f"({snap.x},{snap.y}) on {location or _location_name()}"
+    if snap.facing:
+        text += f", facing {snap.facing}"
+    return text
+
+
+def _screen_note() -> str:
+    """Say so when a text box, choice or event is still on screen after the presses.
+
+    Overnight the model spent five minutes on Route 103 pressing B and calling
+    navigate_to under the rival's last text box: every result read "Pressed 1 button;
+    now at (9,3)", so it kept believing it was still in a battle. Quoting the open box
+    lets it act on what is actually on screen.
+    """
+    if env is None or game_type != "emerald":
+        return ""
+    from server.field_control import DIALOGUE_BUSY, DIALOGUE_CHOICE, DIALOGUE_PLAIN, dialogue_status, read_field_message
+
+    snap = _field_snapshot()
+    if snap is None:
+        return ""
+    status = dialogue_status(snap)
+    if status not in (DIALOGUE_PLAIN, DIALOGUE_CHOICE, DIALOGUE_BUSY):
+        return ""
+    try:
+        with memory_lock:
+            text = read_field_message(env.memory_reader)
+    except Exception as e:  # extra information only; never break the press result
+        logger.debug(f"Reading the field message failed: {e}")
+        text = ""
+    quoted = f' "{text[-160:]}"' if text else ""
+    if status == DIALOGUE_PLAIN:
+        return f" A text box is still open{quoted}: press A to continue."
+    if status == DIALOGUE_CHOICE:
+        return f" A choice or menu is open{quoted}: move the cursor with UP/DOWN and press A, or B to cancel."
+    return " An event is running and has control of the player: press_buttons(['WAIT']) and look again."
+
+
+def _sequence_summary(report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """One-line outcome of a sequence for the tool result (and the agent's history)."""
+    now = _position_text(_field_snapshot())
+    screen = _screen_note()
+    if report is None:
+        return {"summary": f"Now at {now}.{screen}"}
+    if report.get("blocked"):
+        return {"status": "BLOCKED", "summary": report["blocked"], "now": now}
+    if report.get("interrupted"):
+        return {"status": "STOPPED", "summary": report["interrupted"] + screen, "now": now}
+    if not report.get("done"):
+        return {"status": "RUNNING", "summary": f"Still pressing ({report['executed']} of {report['total']} done); now at {now}."}
+    plural = "" if report["executed"] == 1 else "s"
+    note = f" Then {report['note']}." if report.get("note") else ""
+    return {"status": "DONE", "summary": f"Pressed {report['executed']} button{plural}; now at {now}.{note}{screen}"}
+
+
+_idle_presses: Tuple[Any, int] = (None, 0)  # (map, tile, facing) of the last no-op A press, run length
+
+
+def _nothing_happened_note(buttons: List[str], before) -> str:
+    """'Nothing happened' for A presses in the free overworld that opened nothing.
+
+    In the live test the model pressed A ten times in a row at a Pokemon Center
+    entrance, six tiles from the nurse; every result just said "Pressed 1 button".
+    """
+    global _idle_presses
+    if before is None or "A" not in buttons or any(b not in ("A", "B") for b in buttons):
+        return ""
+    after = _field_snapshot()
+    if after is None or not (before.field_free and after.field_free):
+        _idle_presses = (None, 0)
+        return ""
+    if after.position != before.position or after.facing != before.facing or not after.facing:
+        _idle_presses = (None, 0)
+        return ""
+    from server.field_control import DIRECTION_DELTAS
+
+    # Seen live: a battle ended, but the model kept copying its own "Currently in battle
+    # with Poochyena" reasoning from short-term memory and pressed A on an empty patch
+    # of grass for 13 minutes. "Nothing happened" alone didn't break the belief, so
+    # the note states what game memory says the screen is, and counts the repeats.
+    spot = (after.map_id, after.position, after.facing)
+    count = _idle_presses[1] + 1 if _idle_presses[0] == spot else 1
+    _idle_presses = (spot, count)
+    dx, dy = DIRECTION_DELTAS[after.facing]
+    note = (
+        f"Nothing happened: there is no one and nothing to use at ({after.x + dx},{after.y + dy}) "
+        f"in front of you. Game memory says you are walking on the map: no battle is going on "
+        f"and no text box or menu is open. To talk to someone, stand on a tile next to them and "
+        f"face them, then press A."
+    )
+    if count > 1:
+        note += (
+            f" A has now done nothing here {count} times in a row: stop pressing A and walk "
+            f"(navigate_to or go_to_exit) toward your objective."
+        )
+    return note
+
+
+def _refuse_repeat_of_blocked_press(buttons: List[str]) -> Optional[Dict[str, Any]]:
+    """Refuse a call that starts with the very press that was just blocked from this tile."""
+    global last_blocked_press
+    blocked = last_blocked_press
+    if not blocked or not buttons:
+        return None
+    snap = _field_snapshot()
+    if snap is None:
+        return None
+    if (snap.x, snap.y, snap.map_id) != (blocked["x"], blocked["y"], blocked["map_id"]):
+        last_blocked_press = None  # moved on: the old block no longer applies
+        return None
+    if buttons[0] != blocked["button"] or not snap.field_free:
+        return None
+    message = (
+        f"Not pressed: {blocked['button']} from ({snap.x},{snap.y}) was already BLOCKED there, so it "
+        f"would do nothing again. To leave this map use go_to_exit (see EXITS); to reach a tile on this "
+        f"map use navigate_to(x, y) with a walkable tile; or press a different direction."
+    )
+    try:
+        from server.game_tools import exit_hint
+
+        hint = exit_hint(_location_name(), blocked["button"])
+    except Exception:
+        hint = ""
+    if hint:
+        message += f" {hint}"
+    logger.info(f"🚫 {message}")
+    return {"success": False, "error": message, "status": "REFUSED", "summary": message, "buttons_queued": []}
+
+
+async def _await_map_change(old_map_id, timeout_s: float):
+    """Wait for the map to change and the warp fade to finish; returns the last snapshot."""
+    deadline = time.monotonic() + timeout_s
+    snap = _field_snapshot()
+    changed_at = None
+    while time.monotonic() < deadline:
+        snap = _field_snapshot()
+        if snap is not None and snap.map_id != old_map_id:
+            changed_at = changed_at or time.monotonic()
+            # Hand back control only once the player can walk again (fade-in done),
+            # or after a short grace period if something (e.g. a cutscene) holds it.
+            if snap.field_free or time.monotonic() - changed_at > 3.0:
+                return snap
+        await asyncio.sleep(0.1)
+    return snap
+
+
+async def _settle_after_sequence(before, report: Optional[Dict[str, Any]]) -> None:
+    """If a press started a warp (door, stairs, exit mat), wait for the new map before
+    reporting, so the result names where the player actually is.
+
+    A warp partway through a walk interrupts it (the remaining presses are skipped) and
+    is then reported like one. Seen live: walking onto the Oldale Mart's exit mat said
+    "STOPPED at (3,7) on OLDALE TOWN MART: an event is running" while the player was
+    already outside; the model waited, then walked back in, over and over.
+    """
+    if before is None or not report or not (report.get("note") or report.get("interrupted")):
+        return
+    snap = _field_snapshot()
+    if snap is None or snap.in_battle or snap.message_box or snap.waiting_for_button:
+        return
+    if snap.controls_locked or not snap.overworld:
+        snap = await _await_map_change(before.map_id, 3.0)
+        if snap is not None and snap.map_id != before.map_id:
+            report["note"] = "you went through a door/warp to another map"
+            if report.pop("interrupted", None):
+                report["done"] = True  # the skipped presses were meant for the old map
+
+
+@app.post("/mcp/go_to_exit")
+async def mcp_go_to_exit(request: dict):
+    """MCP Tool: walk to one of the current map's exits (EXITS list) and through it."""
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "go_to_exit is only implemented for Emerald"}
+    try:
+        from server import game_tools
+        from server.field_control import end_of_path, warp_push_directions
+
+        exit_query = str(request.get("exit") or request.get("destination") or "").strip()
+        if not exit_query:
+            return {"success": False, "error": "exit is required, e.g. 'north' or 'OLDALE TOWN'"}
+        refused = _refuse_during_battle("go_to_exit")
+        if refused:
+            return refused
+
+        def _plan():
+            with memory_lock:
+                return game_tools.plan_exit_route(env, exit_query)
+
+        plan = await run_in_threadpool(_plan)
+        if not plan.get("success"):
+            plan.setdefault("summary", plan.get("error", "go_to_exit failed"))
+            return plan
+
+        before = _field_snapshot()
+        from_text = _position_text(before)
+        buttons = list(plan["buttons"])
+        if plan["kind"] == "edge":
+            buttons.append(plan["final_button"])
+        report = None
+        if buttons:
+            queued = await take_action(
+                ActionRequest(buttons=buttons, source="go_to_exit", metadata={"exit": plan["label"]}, check_movement=True)
+            )
+            report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+        snap = await _await_map_change(before.map_id, 4.0 if plan["kind"] == "warp" else 1.5)
+
+        # Arrow warps (house mats, cave mouths) fire when the player walks off them.
+        pushes_tried = []
+        if (
+            plan["kind"] == "warp"
+            and snap is not None
+            and snap.map_id == before.map_id
+            and not (report and (report.get("blocked") or report.get("interrupted")))
+        ):
+            grid = plan["grid"]
+            ox, oy = plan.get("coord_offset") or (0, 0)
+            local = (snap.x - ox, snap.y - oy)
+            if local == tuple(plan["target"]):
+                last_move = buttons[-1] if buttons else None
+                for push in warp_push_directions(grid, plan.get("raw_tiles"), local[0], local[1], last_move)[:2]:
+                    pushes_tried.append(push)
+                    await take_action(ActionRequest(buttons=[push], source="go_to_exit"))
+                    snap = await _await_map_change(before.map_id, 4.0)
+                    if snap is not None and snap.map_id != before.map_id:
+                        break
+
+        location = _location_name()
+        now = _position_text(snap, location)
+        response = {"exit": plan["label"], "from": from_text, "now": now, "path_length": len(plan["buttons"])}
+        if snap is not None and snap.map_id != before.map_id:
+            response["success"] = True
+            response["summary"] = f"Arrived: now at {now} (took exit: {plan['label']})."
+            return response
+        response["success"] = False
+        if report and (report.get("blocked") or report.get("interrupted")):
+            reason = report.get("blocked") or report.get("interrupted")
+        elif pushes_tried:
+            reason = f"reached the warp tile but it did not fire (tried {', '.join(pushes_tried)})"
+        else:
+            reason = "the walk ended without leaving the map"
+        response["error"] = f"Did not leave the map ({plan['label']}): {reason}"
+        response["summary"] = f"{response['error']} Now at {now}."
+        return response
+    except Exception as e:
+        logger.error(f"Error in go_to_exit: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+AUTO_DIALOGUE_MAX_PRESSES = 15
+
+
+@app.post("/mcp/auto_advance_dialogue")
+async def mcp_auto_advance_dialogue(request: dict = None):
+    """Harness step (not a model tool): press A through a plain text box.
+
+    Stops at a YES/NO or any menu, when the box closes, when the game leaves the
+    overworld, or after max_presses. Returns the text it advanced through.
+    """
+    if env is None or game_type != "emerald":
+        return {"success": False, "presses": 0, "error": "only available for Emerald"}
+    from server.field_control import (
+        DIALOGUE_BUSY,
+        DIALOGUE_CHOICE,
+        DIALOGUE_PLAIN,
+        auto_advance_dialogue,
+        dialogue_status,
+        read_field_message,
+    )
+
+    request = request or {}
+    max_presses = int(request.get("max_presses", AUTO_DIALOGUE_MAX_PRESSES))
+    loop = asyncio.get_running_loop()
+
+    def status():
+        snap = _field_snapshot()
+        return dialogue_status(snap) if snap is not None else "other"
+
+    first = status()
+    if first == DIALOGUE_CHOICE:
+        # A YES/NO the model just answered can take a few frames to close.
+        await asyncio.sleep(0.3)
+        first = status()
+    # PLAIN: read it. BUSY: an event is running (e.g. healing after YES) and its next
+    # box is worth waiting a few seconds for. Anything else is the model's to handle.
+    if first not in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
+        snap = _field_snapshot()
+        if snap is not None and (snap.message_box or snap.extra_windows or snap.controls_locked):
+            # Something is on screen but not judged plain dialogue: record why, so a
+            # box the model then gets stuck under (Route 103, rival) can be diagnosed.
+            logger.info(
+                f"auto-advance declined: status={first} message_box={snap.message_box} "
+                f"extra_windows={snap.extra_windows} controls_locked={snap.controls_locked} "
+                f"waiting_for_button={snap.waiting_for_button} overworld={snap.overworld} in_battle={snap.in_battle}"
+            )
+        return {"success": True, "presses": 0, "texts": [], "final_status": first}
+
+    def read_text():
+        with memory_lock:
+            return read_field_message(env.memory_reader)
+
+    def press_a():
+        queued = asyncio.run_coroutine_threadsafe(
+            take_action(ActionRequest(buttons=["A"], speed="fast", source="auto_dialogue")), loop
+        ).result(timeout=10)
+        asyncio.run_coroutine_threadsafe(
+            _await_sequence(queued.get("sequence_id"), 10.0), loop
+        ).result(timeout=15)
+
+    def settle():
+        # >= 12 frames at any game speed: long enough for a YES/NO box to appear.
+        time.sleep(max(12.0 / max(1, fps), 0.15))
+
+    result = await run_in_threadpool(
+        auto_advance_dialogue, status, read_text, press_a, settle, max_presses
+    )
+    return {
+        "success": True,
+        "presses": result.presses,
+        "texts": result.texts,
+        "final_status": result.final_status,
+        "capped": result.capped,
+        "summary": result.summary(),
+    }
+
+
 @app.post("/mcp/press_buttons")
 async def mcp_press_buttons(request: dict):
     """MCP Tool: Press GBA buttons"""
@@ -3192,17 +4121,32 @@ async def mcp_press_buttons(request: dict):
         # Filter out WAIT buttons (they're just for agent decision-making, not actual button presses)
         actual_buttons = [b for b in normalized_buttons if b != "WAIT"]
 
-        # If only WAIT was requested, treat it as a no-op but still complete successfully
+        # If only WAIT was requested, treat it as a no-op but still complete successfully.
+        # (The reasoning is not echoed back: the agent already has it in the call's args,
+        # and the echo tripled it in the replayed short-term memory.)
         if not actual_buttons:
             logger.info(f"🎮 Agent chose to WAIT (no buttons pressed) - {reasoning}")
-            return {"success": True, "buttons_queued": [], "reasoning": reasoning, "action": "WAIT"}
+            return {"success": True, "buttons_queued": [], "action": "WAIT", "summary": "Waited (no buttons pressed)."}
+
+        refusal = _refuse_repeat_of_blocked_press(actual_buttons)
+        if refusal is not None:
+            return refusal
 
         # Call the existing take_action function to ensure metrics tracking
-        action_request = ActionRequest(buttons=actual_buttons, source=source, metadata=metadata_dict)
-        await take_action(action_request)
-        
+        action_request = ActionRequest(
+            buttons=actual_buttons, source=source, metadata=metadata_dict, check_movement=True
+        )
+        before = _field_snapshot()
+        queued = await take_action(action_request)
+        report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(actual_buttons)))
+        await _settle_after_sequence(before, report)
+
         logger.info(f"🎮 Queued buttons via MCP: {actual_buttons} - {reasoning}")
-        response_dict = {"success": True, "buttons_queued": actual_buttons, "reasoning": reasoning}
+        response_dict = {"success": True, "buttons_queued": actual_buttons}
+        response_dict.update(_sequence_summary(report))
+        nothing = _nothing_happened_note(actual_buttons, before)
+        if nothing:
+            response_dict["summary"] += f" {nothing}"
 
         # Include warning if any buttons were invalid
         if invalid_buttons:
@@ -3211,6 +4155,1096 @@ async def mcp_press_buttons(request: dict):
         return response_dict
     except Exception as e:
         logger.error(f"Error pressing buttons: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# How long use_move waits for a battle menu to open after its presses, in game frames
+# (the action -> move menu swap takes about 10).
+BATTLE_MENU_WAIT_FRAMES = 90
+
+
+def _read_battle_view() -> Optional[Dict[str, Any]]:
+    with memory_lock:
+        return env.memory_reader.read_battle_view()
+
+
+def _game_frame() -> int:
+    with memory_lock:
+        reader = env.memory_reader
+        return reader._read_u32(reader.addresses.MAIN_FRAME_COUNTER)
+
+
+def _grid_presses(start: int, goal: int, occupied: Optional[List[bool]] = None) -> List[str]:
+    """Fewest D-pad presses between two cells of a battle menu's 2x2 grid.
+
+    Cells are 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. The move menu
+    won't move onto an empty move slot, so when one of the two L-shaped paths passes
+    through an empty slot the other is used.
+    """
+    horizontal = [] if (start & 1) == (goal & 1) else ["RIGHT" if goal & 1 else "LEFT"]
+    vertical = [] if (start >> 1) == (goal >> 1) else ["DOWN" if goal >> 1 else "UP"]
+    if horizontal and vertical and occupied is not None:
+        corner_after_horizontal = (start & 2) | (goal & 1)
+        if not occupied[corner_after_horizontal]:
+            return vertical + horizontal
+    return horizontal + vertical
+
+
+async def _await_battle_menu(menus: Tuple[str, ...], frames: int) -> Optional[Dict[str, Any]]:
+    """Poll the battle view until its menu is one of `menus` or `frames` game frames pass."""
+    start = _game_frame()
+    deadline = time.monotonic() + 10.0  # guard in case the game loop is paused
+    view = _read_battle_view()
+    while view is not None and view["menu"] not in menus:
+        if _game_frame() - start >= frames or time.monotonic() > deadline:
+            break
+        await asyncio.sleep(0.02)
+        view = _read_battle_view()
+    return view
+
+
+async def _press_battle_buttons(buttons: List[str], move: str) -> None:
+    if not buttons:
+        return
+    queued = await take_action(ActionRequest(buttons=buttons, source="use_move", metadata={"move": move}))
+    await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+
+
+def _move_key(text: str) -> str:
+    """'Focus-Energy', 'focus_energy' and 'FOCUS ENERGY' all name the same move."""
+    return "".join(ch for ch in str(text).upper() if ch.isalnum())
+
+
+def _effect_text(move: Dict[str, Any], target: Optional[Dict[str, Any]]) -> str:
+    if not move["power"]:
+        return "status move"
+    against = f" vs {'/'.join(target['types'])}" if target else ""
+    if move["effectiveness"] == 0:
+        return f"no effect{against}"
+    return f"{move['effectiveness']:g}x{against}"
+
+
+@app.post("/mcp/use_move")
+async def mcp_use_move(request: dict):
+    """MCP Tool: pick a move in a battle by name or slot; the harness moves the cursors.
+
+    Seen live: every battle opens with the move cursor on slot 1, and the model mashed
+    A, so a Lv11 Torchic used SCRATCH (slot 1) on a Lv5 Poochyena for 12+ minutes while
+    the super-effective EMBER sat in slot 4. Steering the 2x2 menus by D-pad is exactly
+    what an 8B model gets wrong, so this tool does it and confirms the cursor first.
+    The turn itself is left to play out; dialogue auto-advance handles its text.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "use_move is only implemented for Emerald"}
+    try:
+        wanted = request.get("move")
+        if wanted is None or str(wanted).strip() == "":
+            return {"success": False, "error": "move is required: a move name such as 'EMBER' or a slot number 1-4"}
+        view = _read_battle_view()
+        if view is None:
+            message = "No battle is going on (game memory says so): use_move only works in a battle."
+            return {"success": False, "error": message, "summary": message}
+
+        moves = view["moves"]
+        listing = ", ".join(f"{m['name']} (slot {m['slot']}, PP {m['pp']})" for m in moves)
+        key = _move_key(wanted)
+        if key.isdigit():
+            move = next((m for m in moves if m["slot"] == int(key)), None)
+        else:
+            move = next((m for m in moves if _move_key(m["name"]) == key), None)
+        if move is None:
+            message = f"{wanted} is not one of your moves. Your moves: {listing}."
+            return {"success": False, "error": message, "summary": message}
+        if move["pp"] == 0:
+            message = f"{move['name']} has no PP left. Your moves: {listing}."
+            return {"success": False, "error": message, "summary": message}
+
+        menu = view["menu"]
+        if menu == "busy":
+            message = "Text or an animation is playing; press A to continue, then use_move again."
+            return {"success": False, "error": message, "summary": message}
+        if menu == "target":
+            message = "A target menu is open: choose the target with LEFT/RIGHT and press A."
+            return {"success": False, "error": message, "summary": message}
+        if menu == "reorder":
+            message = "The move-reorder mode is on (SELECT was pressed): press B, then use_move again."
+            return {"success": False, "error": message, "summary": message}
+
+        before_player, target = view["player"], view["target"]
+        if menu == "action":
+            await _press_battle_buttons(_grid_presses(view["action_cursor"], 0) + ["A"], move["name"])
+            view = await _await_battle_menu(("move",), BATTLE_MENU_WAIT_FRAMES)
+            if view is None or view["menu"] != "move":
+                message = "Pressed A on FIGHT but the move menu did not open; look at the screen and try again."
+                return {"success": False, "error": message, "summary": message}
+
+        occupied = [any(m["slot"] == slot for m in view["moves"]) for slot in (1, 2, 3, 4)]
+        presses = _grid_presses(view["move_cursor_slot"] - 1, move["slot"] - 1, occupied)
+        await _press_battle_buttons(presses, move["name"])
+        view = _read_battle_view()
+        if view is None or view["menu"] != "move" or view["move_cursor_slot"] != move["slot"]:
+            where = f"slot {view['move_cursor_slot']}" if view else "outside the battle"
+            message = f"Could not put the cursor on {move['name']} (it is on {where}); nothing was used."
+            return {"success": False, "error": message, "summary": message}
+
+        await _press_battle_buttons(["A"], move["name"])
+        view = await _await_battle_menu(("busy", "target", "action"), 30)
+        if view is not None and view["menu"] == "move":
+            message = f"Pressed A on {move['name']} but the move menu is still open."
+            return {"success": False, "error": message, "summary": message}
+
+        logger.info(f"⚔️ use_move: {move['name']} (slot {move['slot']}) - {request.get('reasoning', '')}")
+        summary = f"Used {move['name']} ({move['type']}, {_effect_text(move, target)})."
+        if before_player:
+            summary += f" {before_player['name']} HP {before_player['hp']}/{before_player['max_hp']}"
+        if target:
+            summary += f"; opponent {target['name'].upper()} HP {target['hp']}/{target['max_hp']} before the hit."
+        else:
+            summary += "."
+        if view is not None and view["menu"] == "target":
+            summary += " Now choose the target with LEFT/RIGHT and press A."
+        return {"success": True, "move": move["name"], "slot": move["slot"], "summary": summary}
+    except Exception as e:
+        logger.error(f"Error in use_move: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Closed-loop macros: heal_at_pokecenter, run_from_battle, throw_ball,
+# switch_pokemon, buy_item.
+#
+# A model decision takes ~30 s and is where mistakes happen (a cursor one row off,
+# A pressed into a YES/NO, B out of a menu half-way). Each macro does one whole chore
+# in a single call: before every press it reads from memory which menu and cursor the
+# game shows (server/menu_state.py), and it stops with a plain-language reason as soon
+# as the screen is not what it expects. Frame budgets only guard against waiting
+# forever; the state decides when to press.
+# ---------------------------------------------------------------------------
+
+MACRO_MENU_FRAMES = 240     # a menu opening or closing with its fade (~30 frames seen)
+MACRO_TEXT_FRAMES = 900     # a message printing at slow text speed before its menu
+MACRO_BATTLE_FRAMES = 4800  # a battle turn's text and animations (~400 frames seen)
+MACRO_MAX_BATTLE_PRESSES = 40
+
+
+def _mem(fn, *args):
+    """Call fn(memory_reader, *args) under the memory lock."""
+    with memory_lock:
+        return fn(env.memory_reader, *args)
+
+
+def _refusal(message: str, **extra) -> Dict[str, Any]:
+    result = {"success": False, "error": message, "summary": message}
+    result.update(extra)
+    return result
+
+
+async def _macro_press(buttons: List[str], source: str) -> None:
+    if not buttons:
+        return
+    queued = await take_action(ActionRequest(buttons=list(buttons), source=source))
+    await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+
+
+async def _await_game(check, frames: int):
+    """Poll check() until it returns something truthy or `frames` game frames pass."""
+    start = _game_frame()
+    deadline = time.monotonic() + max(10.0, frames / 20)  # guard in case the loop is paused
+    value = check()
+    while not value:
+        if _game_frame() - start >= frames or time.monotonic() > deadline:
+            break
+        await asyncio.sleep(0.02)
+        value = check()
+    return value
+
+
+def _quote(texts: List[str], limit: int = 4) -> str:
+    shown = [t for t in texts if t][-limit:]
+    return " / ".join(f'"{t}"' for t in shown)
+
+
+def _party_lines() -> List[Dict[str, Any]]:
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon()
+    return [
+        {
+            "name": p.species_name.upper() if not p.is_egg else "EGG",
+            "hp": p.current_hp,
+            "max_hp": p.max_hp,
+            "status": int(getattr(p.status, "value", p.status) or 0),
+            "egg": bool(p.is_egg),
+        }
+        for p in party
+    ]
+
+
+def _hp_text(party: List[Dict[str, Any]]) -> str:
+    return ", ".join(f"{m['name']} {m['hp']}/{m['max_hp']}" for m in party) or "no Pokémon"
+
+
+def _player_can_walk() -> bool:
+    snap = _field_snapshot()
+    return snap is not None and snap.field_free
+
+
+def read_field_text(reader) -> str:
+    from server.field_control import read_field_message
+
+    return read_field_message(reader)
+
+
+# -- battles ---------------------------------------------------------------
+
+
+async def _play_out_battle(source: str, frames: int = MACRO_BATTLE_FRAMES) -> Dict[str, Any]:
+    """Press through battle text until the player picks an action again or the battle
+    is over and the player stands on the map.
+
+    A is pressed only while a text box shows its down arrow; the nickname question is
+    answered NO with B (B always means NO there) and the caught Pokémon's Pokédex page
+    is closed with B. Any other question ("Use next POKéMON?", learning a move) ends
+    the macro: those are the model's decisions.
+    """
+    from server import menu_state as ms
+
+    texts: List[str] = []
+    notes: List[str] = []
+    presses = 0
+    start = _game_frame()
+    deadline = time.monotonic() + max(30.0, frames / 20)
+    flow = _mem(ms.read_battle_flow)
+    while True:
+        if flow.text and (not texts or texts[-1] != flow.text):
+            texts.append(flow.text)
+        end = None
+        if flow.in_battle and flow.in_battle_screen and flow.choosing_action:
+            end = "action"
+        elif not flow.in_battle:
+            snap = _field_snapshot()
+            if snap is not None and snap.overworld and not _mem(ms.fade_active):
+                # Back on the map: give the fade-in a moment to hand control back.
+                await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+                end = "over"
+        elif flow.nickname_prompt:
+            await _macro_press(["B"], source)
+            notes.append("answered NO to giving it a nickname")
+            presses += 1
+        elif flow.dex_page:
+            await _macro_press(["B"], source)
+            presses += 1
+        elif flow.yes_no_prompt:
+            end = "question"
+        elif flow.learn_move_prompt:
+            end = "learn_move"
+        elif not flow.in_battle_screen and any(
+            _mem(ms.callback2_is, cb) for cb in (ms.CB2_UPDATE_PARTY_MENU, ms.CB2_BAG_MENU_RUN)
+        ):
+            end = "menu"  # the game opened the party menu itself (a fainted Pokémon must be replaced)
+        elif flow.text_waiting and flow.in_battle_screen:
+            await _macro_press(["A"], source)
+            presses += 1
+        if end is None and (
+            _game_frame() - start > frames or time.monotonic() > deadline or presses > MACRO_MAX_BATTLE_PRESSES
+        ):
+            end = "timeout"
+        if end is not None:
+            return {"end": end, "flow": flow, "texts": texts, "notes": notes}
+        await asyncio.sleep(0.03)
+        flow = _mem(ms.read_battle_flow)
+
+
+def _battle_end_text(played: Dict[str, Any]) -> str:
+    """What a played-out battle ended on, for summaries of the cases a macro can't finish."""
+    end, flow = played["end"], played["flow"]
+    said = _quote(played["texts"])
+    if end == "question":
+        return f"The battle asks a YES/NO question ({said}): answer it yourself with press_buttons."
+    if end == "learn_move":
+        return f"Your Pokémon wants to learn a new move ({said}): decide with press_buttons."
+    if end == "menu":
+        return "The game opened the party menu (a fainted Pokémon must be replaced): pick one with press_buttons."
+    if end == "timeout":
+        return f"The battle did not reach a menu in time; the screen last said {said or 'nothing readable'}."
+    return said
+
+
+async def _ready_for_battle_action(tool: str, source: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Get to the FIGHT/BAG/POKEMON/RUN menu: (battle view, None) or (None, refusal).
+
+    Battle text that only waits for A (e.g. "Wild SHROOMISH appeared!") is pressed
+    through first; the move menu is closed with B.
+    """
+    view = _read_battle_view()
+    if view is None:
+        return None, _refusal(f"No battle is going on (game memory says so): {tool} only works in a battle.")
+    if view["menu"] == "busy":
+        played = await _play_out_battle(source)
+        if played["end"] == "over":
+            return None, _refusal(
+                f"The battle ended before {tool} could act ({_quote(played['texts'])}); you are back on the map."
+            )
+        if played["end"] != "action":
+            return None, _refusal(f"{tool} did nothing: {_battle_end_text(played)}")
+        view = _read_battle_view()
+    if view is not None and view["menu"] == "move":
+        await _macro_press(["B"], source)
+        view = await _await_battle_menu(("action",), BATTLE_MENU_WAIT_FRAMES)
+    if view is None or view["menu"] != "action":
+        where = view["menu"] if view else "outside a battle"
+        if where == "target":
+            return None, _refusal(f"A target menu is open (double battle): press B first, then {tool} again.")
+        if where == "reorder":
+            return None, _refusal(f"The move-reorder mode is on: press B, then {tool} again.")
+        return None, _refusal(f"Could not reach the FIGHT/BAG/POKEMON/RUN menu (game memory says: {where}); nothing was chosen.")
+    return view, None
+
+
+async def _choose_battle_action(action: int, source: str) -> Optional[str]:
+    """Put the action cursor on `action`, confirm it from memory, press A. Error text or None."""
+    names = ("FIGHT", "BAG", "POKEMON", "RUN")
+    view = _read_battle_view()
+    await _macro_press(_grid_presses(view["action_cursor"], action), source)
+    view = _read_battle_view()
+    if view is None or view["menu"] != "action" or view["action_cursor"] != action:
+        where = view["action_cursor_name"] if view else "outside the battle"
+        return f"Could not put the cursor on {names[action]} (it is on {where}); nothing was chosen."
+    await _macro_press(["A"], source)
+    return None
+
+
+async def _back_to_battle_menu(source: str) -> bool:
+    """Leave the bag or party menu with B (never choosing anything) until the battle
+    menu shows again."""
+    from server import menu_state as ms
+
+    for _ in range(4):
+        flow = _mem(ms.read_battle_flow)
+        if flow.in_battle_screen and flow.choosing_action:
+            return True
+        if _mem(ms.text_waiting_for_button):
+            await _macro_press(["B"], source)  # dismiss a message inside the menu
+        elif not flow.in_battle_screen:
+            await _macro_press(["B"], source)
+        await _await_game(
+            lambda: (lambda f: f.in_battle_screen and f.choosing_action)(_mem(ms.read_battle_flow)),
+            MACRO_MENU_FRAMES,
+        )
+    flow = _mem(ms.read_battle_flow)
+    return flow.in_battle_screen and flow.choosing_action
+
+
+def _battle_type_flags() -> int:
+    with memory_lock:
+        reader = env.memory_reader
+        return reader._read_u32(reader.addresses.BATTLE_TYPE_FLAGS)
+
+
+@app.post("/mcp/run_from_battle")
+async def mcp_run_from_battle(request: dict = None):
+    """MCP Tool: flee a wild battle (RUN), confirmed from gBattleOutcome."""
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "run_from_battle is only implemented for Emerald"}
+    try:
+        from pokemon_env.memory_reader import BATTLE_TYPE_FIRST_BATTLE
+        from server import menu_state as ms
+
+        source = "run_from_battle"
+        view = _read_battle_view()
+        if view is not None and view["is_trainer"]:
+            return _refusal(
+                "You can't run from a trainer battle: the game won't allow it. Fight with use_move "
+                "(the battle section names the best move) or switch with switch_pokemon."
+            )
+        if view is not None and _battle_type_flags() & BATTLE_TYPE_FIRST_BATTLE:
+            return _refusal("You can't run from this battle (the first battle, with Prof. Birch's Pokémon): use use_move.")
+        view, refusal = await _ready_for_battle_action("run_from_battle", source)
+        if refusal:
+            return refusal
+        opponent = view["target"]["name"].upper() if view.get("target") else "the wild Pokémon"
+        error = await _choose_battle_action(ms.ACTION_RUN, source)
+        if error:
+            return _refusal(error)
+        played = await _play_out_battle(source)
+        flow = played["flow"]
+        said = _quote(played["texts"])
+        logger.info(f"🏃 run_from_battle: {played['end']} outcome={flow.outcome} {said}")
+        if played["end"] == "over" and flow.outcome == ms.B_OUTCOME_RAN:
+            now = _position_text(_field_snapshot())
+            return {"success": True, "status": "ESCAPED", "summary": f"Got away safely from wild {opponent}. Now at {now}."}
+        if played["end"] == "over":
+            return {
+                "success": False,
+                "status": "BATTLE_OVER",
+                "summary": f"The battle ended ({ms.outcome_name(flow.outcome)}): {said}.",
+            }
+        if played["end"] == "action":
+            view = _read_battle_view()
+            player = view["player"] if view else None
+            hp = f" {player['name']} HP {player['hp']}/{player['max_hp']}." if player else ""
+            message = (
+                f"Couldn't get away: the battle against wild {opponent} continues ({said}).{hp} "
+                "Choose again: run_from_battle, use_move or switch_pokemon."
+            )
+            return _refusal(message, status="STILL_IN_BATTLE")
+        return _refusal(f"Chose RUN, then: {_battle_end_text(played)}", status="STOPPED")
+    except Exception as e:
+        logger.error(f"Error in run_from_battle: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+def _ball_listing(balls: List[Dict[str, Any]]) -> str:
+    return ", ".join(f"{b['name']} x{b['quantity']}" for b in balls) or "none"
+
+
+@app.post("/mcp/throw_ball")
+async def mcp_throw_ball(request: dict = None):
+    """MCP Tool: throw a Poké Ball in a wild battle and report caught / broke free."""
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "throw_ball is only implemented for Emerald"}
+    try:
+        from pokemon_env.memory_reader import BATTLE_TYPE_FIRST_BATTLE, BATTLE_TYPE_SAFARI
+        from server import menu_state as ms
+
+        source = "throw_ball"
+        request = request or {}
+        wanted = str(request.get("ball") or "Poke Ball").strip()
+        view = _read_battle_view()
+        if view is None:
+            return _refusal("No battle is going on (game memory says so): throw_ball only works in a wild battle.")
+        if view["is_trainer"]:
+            return _refusal("You can't catch a trainer's Pokémon: throw_ball only works in a wild battle.")
+        flags = _battle_type_flags()
+        if flags & BATTLE_TYPE_FIRST_BATTLE:
+            return _refusal("This battle (Prof. Birch's first battle) can't be caught in: use use_move.")
+        if flags & BATTLE_TYPE_SAFARI:
+            return _refusal("The Safari Zone has its own BALL menu: use press_buttons there.")
+        alive = [m for m in view["opponents"] if m["hp"] > 0]
+        if len(alive) > 1:
+            return _refusal("There are two wild Pokémon: the game won't let you throw a ball until one is left.")
+
+        with memory_lock:
+            balls = env.memory_reader.read_full_inventory().get("poke_balls", [])
+        key = ms.name_key(wanted)
+        ball = next((b for b in balls if ms.name_key(b["name"]) == key), None)
+        if ball is None:
+            # "great" or "GREAT BALL": accept a unique prefix of a ball you have.
+            prefixed = [b for b in balls if ms.name_key(b["name"]).startswith(key)] if key else []
+            ball = prefixed[0] if len(prefixed) == 1 else None
+        if ball is None:
+            return _refusal(f"You have no {wanted}. Poké Balls in your bag: {_ball_listing(balls)}.")
+        count_before = ball["quantity"]
+        party_before = _mem(lambda r: r._read_u8(ms.G_PLAYER_PARTY_COUNT))
+        target = view["target"]
+        opponent = f"{target['name'].upper()} (Lv{target['level']}, HP {target['hp']}/{target['max_hp']})" if target else "the wild Pokémon"
+
+        view, refusal = await _ready_for_battle_action("throw_ball", source)
+        if refusal:
+            return refusal
+        error = await _choose_battle_action(ms.ACTION_BAG, source)
+        if error:
+            return _refusal(error)
+
+        def bag_ready():
+            return (
+                _mem(ms.callback2_is, ms.CB2_BAG_MENU_RUN)
+                and _mem(ms.task_running, ms.TASK_BAG_INPUT)
+                and not _mem(ms.fade_active)
+            )
+
+        async def give_up(message: str) -> Dict[str, Any]:
+            back = await _back_to_battle_menu(source)
+            tail = " Back at the battle menu; nothing was used." if back else " Could not get back to the battle menu: look at the screen."
+            return _refusal(message + tail)
+
+        if not await _await_game(bag_ready, MACRO_MENU_FRAMES):
+            return await give_up("Chose BAG but the bag did not open.")
+        pocket = _mem(ms.bag_pocket)
+        for press in ms.pocket_presses(pocket, ms.BALLS_POCKET):
+            await _macro_press([press], source)
+            await _await_game(bag_ready, MACRO_MENU_FRAMES)
+        if _mem(ms.bag_pocket) != ms.BALLS_POCKET or not bag_ready():
+            return await give_up("Could not switch the bag to the POKé BALLS pocket.")
+        listed = _mem(ms.bag_pocket_item_ids, ms.BALLS_POCKET)
+        if ball["item_id"] not in listed:
+            return await give_up(f"{ball['name']} is not listed in the POKé BALLS pocket.")
+        goal = listed.index(ball["item_id"])
+        await _macro_press(ms.list_presses(_mem(ms.bag_cursor_index, ms.BALLS_POCKET), goal), source)
+        index = _mem(ms.bag_cursor_index, ms.BALLS_POCKET)
+        if index != goal:
+            return await give_up(f"Could not put the bag cursor on {ball['name']} (row {index + 1}, wanted row {goal + 1}).")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: _mem(ms.task_running, *ms.TASK_BAG_CONTEXT), MACRO_MENU_FRAMES):
+            return await give_up(f"Pressed A on {ball['name']} but its USE/CANCEL menu did not open.")
+        chosen = _mem(lambda r: r._read_u16(ms.G_SPECIAL_VAR_ITEM_ID))
+        cursor = _mem(ms.read_menu_cursor)
+        if chosen != ball["item_id"] or cursor.cursor != 0 or cursor.max_cursor != 1:
+            return await give_up(f"The bag's menu is not USE on {ball['name']} (item {chosen}, cursor {cursor.cursor}).")
+        await _macro_press(["A"], source)  # USE
+
+        # The bag closes and the battle screen comes back with the throw.
+        if not await _await_game(lambda: _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN), MACRO_MENU_FRAMES * 2):
+            said = _mem(read_field_text)
+            return await give_up(f"Chose USE on {ball['name']} but the bag stayed open{f' ({said})' if said else ''}.")
+        played = await _play_out_battle(source)
+        flow = played["flow"]
+        with memory_lock:
+            balls_after = env.memory_reader.read_full_inventory().get("poke_balls", [])
+        count_after = next((b["quantity"] for b in balls_after if b["item_id"] == ball["item_id"]), 0)
+        used = f"Threw a {ball['name']} at {opponent}; {ball['name']} {count_before} -> {count_after} left."
+        said = _quote(played["texts"])
+        logger.info(f"🎯 throw_ball: {played['end']} outcome={flow.outcome} {said}")
+        result = {"ball": ball["name"], "balls_before": count_before, "balls_after": count_after}
+        if flow.outcome == ms.B_OUTCOME_CAUGHT:
+            party_after = _mem(lambda r: r._read_u8(ms.G_PLAYER_PARTY_COUNT))
+            where = "joined your party" if party_after > party_before else "was sent to the PC (your party is full)"
+            notes = f" ({'; '.join(played['notes'])})" if played["notes"] else ""
+            summary = f"Caught it! {used} It {where}{notes}."
+            if played["end"] == "over":
+                summary += f" The battle is over; now at {_position_text(_field_snapshot())}."
+            else:
+                summary += f" {_battle_end_text(played)}"
+            result.update({"success": True, "status": "CAUGHT", "caught": True, "summary": summary})
+            return result
+        if played["end"] == "action":
+            view = _read_battle_view()
+            foe = view["target"] if view else None
+            foe_hp = f" Opponent {foe['name'].upper()} HP {foe['hp']}/{foe['max_hp']}." if foe else ""
+            summary = f"It broke free: not caught. {used} The battle continues ({said}).{foe_hp}"
+            result.update({"success": True, "status": "BROKE_FREE", "caught": False, "summary": summary})
+            return result
+        summary = f"{used} Then: {_battle_end_text(played) if played['end'] != 'over' else said + ' The battle is over.'}"
+        result.update({"success": played["end"] == "over", "status": "STOPPED", "caught": False, "summary": summary})
+        if not result["success"]:
+            result["error"] = summary
+        return result
+    except Exception as e:
+        logger.error(f"Error in throw_ball: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/mcp/switch_pokemon")
+async def mcp_switch_pokemon(request: dict = None):
+    """MCP Tool: in a battle, send out another party Pokémon (POKEMON -> pick -> SHIFT)."""
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "switch_pokemon is only implemented for Emerald"}
+    try:
+        from pokemon_env.memory_reader import BATTLE_TYPE_SAFARI
+        from server import menu_state as ms
+
+        source = "switch_pokemon"
+        request = request or {}
+        wanted = request.get("pokemon", request.get("name_or_slot"))
+        if wanted is None or str(wanted).strip() == "":
+            return _refusal("pokemon is required: a party Pokémon's name (e.g. 'SHROOMISH') or its party slot 1-6.")
+        view = _read_battle_view()
+        if view is None:
+            return _refusal(
+                "No battle is going on (game memory says so): switch_pokemon only works in a battle "
+                "(reordering the party outside battles is not supported)."
+            )
+        if _battle_type_flags() & BATTLE_TYPE_SAFARI:
+            return _refusal("You can't switch Pokémon in the Safari Zone.")
+        party = _party_lines()
+        personalities = _mem(ms.party_personalities)
+        active = _mem(ms.active_battler_personality)
+        listing = ", ".join(f"{i + 1}. {m['name']} HP {m['hp']}/{m['max_hp']}" for i, m in enumerate(party))
+        key = ms.name_key(wanted)
+        if key.isdigit():
+            matches = [int(key) - 1] if 1 <= int(key) <= len(party) else []
+        else:
+            with memory_lock:
+                nicknames = [ms.name_key(p.nickname or "") for p in env.memory_reader.read_party_pokemon()]
+            matches = [i for i, m in enumerate(party) if ms.name_key(m["name"]) == key or nicknames[i] == key]
+        if not matches:
+            return _refusal(f"{wanted} is not in your party. Your party: {listing}.")
+        # Two of the same species: prefer one that can actually come in.
+        index = next(
+            (i for i in matches if personalities[i] != active and party[i]["hp"] > 0 and not party[i]["egg"]),
+            matches[0],
+        )
+        mon = party[index]
+        if mon["egg"]:
+            return _refusal(f"Slot {index + 1} is an Egg: it can't battle. Your party: {listing}.")
+        if personalities[index] == active:
+            return _refusal(f"{mon['name']} is already in battle. Your party: {listing}.")
+        if mon["hp"] == 0:
+            return _refusal(f"{mon['name']} has fainted (HP 0/{mon['max_hp']}) and can't battle. Your party: {listing}.")
+        outgoing = view["player"]["name"].upper() if view.get("player") else "your Pokémon"
+
+        view, refusal = await _ready_for_battle_action("switch_pokemon", source)
+        if refusal:
+            return refusal
+        error = await _choose_battle_action(ms.ACTION_POKEMON, source)
+        if error:
+            return _refusal(error)
+
+        def party_menu_ready():
+            return (
+                _mem(ms.callback2_is, ms.CB2_UPDATE_PARTY_MENU)
+                and _mem(ms.task_running, ms.TASK_PARTY_CHOOSE)
+                and not _mem(ms.fade_active)
+            )
+
+        async def give_up(message: str) -> Dict[str, Any]:
+            back = await _back_to_battle_menu(source)
+            tail = " Back at the battle menu; nobody was switched." if back else " Could not get back to the battle menu: look at the screen."
+            return _refusal(message + tail)
+
+        if not await _await_game(party_menu_ready, MACRO_MENU_FRAMES):
+            return await give_up("Chose POKEMON but the party menu did not open.")
+        # The menu draws gPlayerParty[slot]; find the slot by personality, which is
+        # unique, rather than trusting the order the model saw.
+        shown = _mem(ms.party_personalities)
+        if personalities[index] not in shown:
+            return await give_up(f"{mon['name']} is not listed in the party menu.")
+        slot = shown.index(personalities[index])
+        await _macro_press(ms.list_presses(_mem(ms.party_menu_slot), slot), source)
+        if _mem(ms.party_menu_slot) != slot:
+            return await give_up(f"Could not put the party cursor on {mon['name']} (it is on slot {_mem(ms.party_menu_slot) + 1}).")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_PARTY_SELECTION), MACRO_MENU_FRAMES):
+            said = _mem(read_field_text)
+            return await give_up(f"Pressed A on {mon['name']} but no SHIFT menu opened{f' ({said})' if said else ''}.")
+        actions = _mem(ms.party_menu_actions)
+        if ms.MENU_SHIFT not in actions:
+            return await give_up(f"{mon['name']}'s menu has no SHIFT option.")
+        await _macro_press(ms.list_presses(_mem(ms.read_menu_cursor).cursor, actions.index(ms.MENU_SHIFT)), source)
+        cursor = _mem(ms.read_menu_cursor)
+        if cursor.cursor >= len(actions) or actions[cursor.cursor] != ms.MENU_SHIFT:
+            return await give_up(f"Could not put the cursor on SHIFT (it is on entry {cursor.cursor + 1}).")
+        await _macro_press(["A"], source)  # SHIFT
+
+        if not await _await_game(lambda: _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN), MACRO_MENU_FRAMES * 2):
+            # Still in the party menu: the game refused (e.g. a trapping move) and says why.
+            said = _mem(read_field_text)
+            return await give_up(f"Chose SHIFT but the game kept the party menu open{f': {said}' if said else ''}.")
+        played = await _play_out_battle(source)
+        now_in = _mem(ms.active_battler_personality)
+        said = _quote(played["texts"])
+        logger.info(f"🔁 switch_pokemon: {played['end']} {said}")
+        if now_in != personalities[index]:
+            return _refusal(f"Chose SHIFT to {mon['name']}, but it is not the Pokémon in battle now. {said}", status="STOPPED")
+        view = _read_battle_view()
+        player = view["player"] if view else None
+        hp = f" (HP {player['hp']}/{player['max_hp']})" if player else ""
+        summary = f"Switched: {outgoing} came back and {mon['name']}{hp} is in battle now."
+        if played["end"] == "action":
+            summary += f" {said}. Your turn: use_move, throw_ball, run_from_battle or switch_pokemon."
+        elif played["end"] == "over":
+            summary += f" {said}. The battle is over."
+        else:
+            summary += f" {_battle_end_text(played)}"
+        return {"success": True, "status": "SWITCHED", "pokemon": mon["name"], "summary": summary}
+    except Exception as e:
+        logger.error(f"Error in switch_pokemon: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+# -- people behind counters (nurse, clerk) ---------------------------------
+
+
+def _counter_tile_between(x: int, y: int) -> Optional[bool]:
+    """Is (x, y) a counter tile? None if it can't be read (out of the visible area)."""
+    from pokemon_env.enums import MetatileBehavior
+
+    with memory_lock:
+        reader = env.memory_reader
+        px, py = reader.read_coordinates()
+        grid = reader.read_map_around_player(radius=7)
+    row, col = y - py + 7, x - px + 7
+    if not grid or not (0 <= row < len(grid)) or not (0 <= col < len(grid[row])):
+        return None
+    return grid[row][col][1] == MetatileBehavior.COUNTER
+
+
+async def _walk_up_to(graphics_id: int, who: str, source: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Walk to the tile facing the nearest person with this sprite and face them.
+
+    Returns (CounterPerson, None) or (None, why not).
+    """
+    from server import menu_state as ms
+    from server.field_control import DIRECTION_DELTAS
+
+    snap = _field_snapshot()
+    people = _mem(ms.find_objects_by_graphics, graphics_id)
+    if not people or snap is None:
+        return None, f"no {who} is on this map"
+    x, y, facing = min(people, key=lambda p: abs(p[0] - snap.x) + abs(p[1] - snap.y))
+    dx, dy = DIRECTION_DELTAS[facing]
+    counter = _counter_tile_between(x + dx, y + dy)
+    # Unreadable (None) is treated as a counter: nurses and clerks all stand behind one.
+    spot = ms.talk_spot(x, y, facing, counter is not False)
+    if (snap.x, snap.y) != spot.stand:
+        walk = await mcp_navigate_to(
+            {"x": spot.stand[0], "y": spot.stand[1], "variance": "none", "reason": f"{source}: talk to the {who}", "consider_npcs": True}
+        )
+        snap = _field_snapshot()
+        if snap is None or (snap.x, snap.y) != spot.stand:
+            return None, (
+                f"could not walk to ({spot.stand[0]},{spot.stand[1]}), the tile facing the {who} at ({x},{y}): "
+                f"{walk.get('summary') or walk.get('error')}"
+            )
+    if snap.facing != spot.face:
+        # The counter (or the person) blocks that way, so this press only turns the player.
+        await _macro_press([spot.face], source)
+        snap = _field_snapshot()
+        if snap is None or snap.facing != spot.face or (snap.x, snap.y) != spot.stand:
+            return None, f"could not face the {who} from ({spot.stand[0]},{spot.stand[1]})"
+    return spot, None
+
+
+def _field_status() -> str:
+    from server.field_control import dialogue_status
+
+    snap = _field_snapshot()
+    return dialogue_status(snap) if snap is not None else "other"
+
+
+async def _read_dialogue(max_presses: int = 12) -> Dict[str, Any]:
+    """Press A through plain text (never into a YES/NO or menu): the auto-advance step."""
+    return await mcp_auto_advance_dialogue({"max_presses": max_presses})
+
+
+async def _talk_until(ready, rounds: int = 4) -> Tuple[bool, List[str]]:
+    """After talking to someone, read through their plain text until ready() (their
+    YES/NO or menu task is running). Returns (ready, texts read).
+
+    Seen in a test run under load: the auto-advance stopped right as the question
+    finished printing, a few frames before the YES/NO task started, so a single
+    status check after it called a normal greeting a failure.
+    """
+    from server.field_control import DIALOGUE_BUSY, DIALOGUE_NONE, DIALOGUE_PLAIN
+
+    texts: List[str] = []
+    for _ in range(rounds):
+        if await _await_game(ready, 60):
+            return True, texts
+        status = _field_status()
+        if status in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
+            read = await _read_dialogue()
+            texts.extend(t for t in read.get("texts", []) if t not in texts)
+        elif status == DIALOGUE_NONE:
+            break  # the conversation ended without the menu
+    if await _await_game(ready, MACRO_MENU_FRAMES):
+        return True, texts
+    said = _mem(read_field_text)
+    if said and said not in texts:
+        texts.append(said)
+    return False, texts
+
+
+async def _close_dialogue(source: str) -> bool:
+    """Advance the last plain text until the player can walk again."""
+    from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+
+    for _ in range(3):
+        if _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
+            await _read_dialogue()
+        if await _await_game(_player_can_walk, MACRO_MENU_FRAMES):
+            return True
+    return False
+
+
+def _exit_hint(query: str) -> str:
+    """'go_to_exit("POKEMON CENTER")' if this map has such an exit, else ''."""
+    try:
+        from server import game_tools
+
+        with memory_lock:
+            plan = game_tools.plan_exit_route(env, query)
+        if plan.get("success"):
+            return f'go_to_exit("{query}")'
+    except Exception as e:  # a hint must never fail the call
+        logger.debug(f"exit hint for {query} failed: {e}")
+    return ""
+
+
+def _field_refusal(tool: str) -> Optional[Dict[str, Any]]:
+    """Refuse a field macro during a battle or while a text box or menu is open."""
+    from server.field_control import DIALOGUE_NONE
+
+    refused = _refuse_during_battle(tool)
+    if refused:
+        return refused
+    status = _field_status()
+    if status != DIALOGUE_NONE:
+        return _refusal(f"{tool} needs you walking on the map, but{_screen_note() or ' another screen is open.'}")
+    return None
+
+
+@app.post("/mcp/heal_at_pokecenter")
+async def mcp_heal_at_pokecenter(request: dict = None):
+    """MCP Tool: inside a Pokémon Center, talk to the nurse, answer YES, and confirm
+    from memory that the whole party is healed."""
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "heal_at_pokecenter is only implemented for Emerald"}
+    try:
+        from server import menu_state as ms
+
+        source = "heal_at_pokecenter"
+        refused = _field_refusal(source)
+        if refused:
+            return refused
+        location = _location_name()
+        if not _mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE):
+            if "POKEMON CENTER" in location:
+                return _refusal(f"There is no nurse on {location}: the nurse is on the 1F (ground floor). Take the stairs down.")
+            hint = _exit_hint("POKEMON CENTER")
+            where = f" This map has one: {hint}, then heal_at_pokecenter." if hint else " Go to a town with a POKEMON CENTER first."
+            return _refusal(f"You are not inside a Pokémon Center ({location}).{where}")
+
+        before = _party_lines()
+        spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_NURSE, "nurse", source)
+        if why:
+            return _refusal(f"Did not heal: {why}.")
+        await _macro_press(["A"], source)
+        asked, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+        if not asked:
+            await _close_dialogue(source)
+            said = _quote(texts)
+            return _refusal(
+                f"Talked to the nurse but no YES/NO came up ({said or 'nothing was said'}); nothing was healed.{_screen_note()}"
+            )
+        cursor = _mem(ms.read_menu_cursor)
+        if cursor.max_cursor == 1 and cursor.cursor == 1:
+            await _macro_press(["UP"], source)
+            cursor = _mem(ms.read_menu_cursor)
+        if cursor.max_cursor != 1 or cursor.cursor != 0:
+            return _refusal(f"The nurse's YES/NO cursor is not on YES (cursor {cursor.cursor}); answer it yourself.")
+        question = _quote(texts[-1:])
+        await _macro_press(["A"], source)  # YES
+        after_yes = await _read_dialogue()
+        closed = await _close_dialogue(source)
+        after = _party_lines()
+        healed = all(m["egg"] or (m["hp"] == m["max_hp"] and m["status"] == 0) for m in after)
+        said = _quote(after_yes.get("texts", []), 3)
+        logger.info(f"🏥 heal_at_pokecenter: healed={healed} {said}")
+        summary = f"Answered YES to the nurse ({question}). HP before: {_hp_text(before)}; after: {_hp_text(after)}."
+        if healed:
+            summary = "Healed: every party Pokémon has full HP and no status problem. " + summary
+        else:
+            summary = "NOT healed (game memory shows HP or status not restored). " + summary
+        if closed:
+            summary += f" You can walk again at {_position_text(_field_snapshot())}."
+        else:
+            summary += f"{_screen_note()}"
+        result = {"success": healed, "status": "HEALED" if healed else "NOT_HEALED", "summary": summary, "before": before, "after": after}
+        if not healed:
+            result["error"] = summary
+        return result
+    except Exception as e:
+        logger.error(f"Error in heal_at_pokecenter: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+def _shop_stage() -> str:
+    from server import menu_state as ms
+
+    if _mem(ms.callback2_is, ms.CB2_BUY_MENU):
+        steps = (
+            (ms.TASK_BUY_HOW_MANY, "quantity"),
+            (ms.TASK_YES_NO_CALLBACK, "yes/no"),
+            (ms.TASK_AFTER_PURCHASE, "thanks"),
+            (ms.TASK_BUY_MENU, "list"),
+        )
+        return "buy screen: " + next((name for task, name in steps if _mem(ms.task_running, task)), "busy")
+    if _mem(ms.task_running, ms.TASK_SHOP_MENU):
+        return "shop menu"
+    return _field_status()
+
+
+async def _leave_shop(source: str) -> bool:
+    """Back out of the shop and close the goodbye text; True once the player can walk.
+
+    On the buy screen B backs out of every step (quantity, YES/NO = NO, the list) and
+    never buys; on BUY/SELL/SEE YA! B means SEE YA!.
+    """
+    from server.field_control import DIALOGUE_BUSY, DIALOGUE_NONE, DIALOGUE_PLAIN
+
+    for _ in range(8):
+        stage = _shop_stage()
+        if stage == DIALOGUE_NONE:
+            return True
+        if stage in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
+            await _read_dialogue()
+        else:
+            await _macro_press(["B"], source)
+        await _await_game(lambda: _shop_stage() != stage, MACRO_TEXT_FRAMES)
+    return _shop_stage() == DIALOGUE_NONE
+
+
+@app.post("/mcp/buy_item")
+async def mcp_buy_item(request: dict = None):
+    """MCP Tool: in a Poké Mart, buy `count` of an item from the clerk; confirmed from
+    money and bag in memory."""
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "buy_item is only implemented for Emerald"}
+    try:
+        from pokemon_env.emerald_utils import _item_id_to_name
+        from server import menu_state as ms
+
+        source = "buy_item"
+        request = request or {}
+        wanted = str(request.get("item") or "").strip()
+        if not wanted:
+            return _refusal("item is required, e.g. buy_item('POTION', 3) or buy_item('POKE BALL', 5).")
+        try:
+            count = int(request.get("count", 1))
+        except (TypeError, ValueError):
+            return _refusal(f"count must be a number from 1 to 99, not {request.get('count')!r}.")
+        if not 1 <= count <= 99:
+            return _refusal(f"count must be from 1 to 99, not {count}.")
+        refused = _field_refusal(source)
+        if refused:
+            return refused
+        location = _location_name()
+        if not _mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_MART_EMPLOYEE):
+            hint = _exit_hint("MART")
+            where = f" This map has one: {hint}, then buy_item." if hint else " Go to a town with a POKEMON MART first."
+            return _refusal(f"There is no shop clerk here ({location}).{where}")
+
+        def bag_counts() -> Dict[int, int]:
+            with memory_lock:
+                inventory = env.memory_reader.read_full_inventory()
+            counts: Dict[int, int] = {}
+            for pocket in inventory.values():
+                for entry in pocket:
+                    counts[entry["item_id"]] = counts.get(entry["item_id"], 0) + entry["quantity"]
+            return counts
+
+        money_before = _mem(lambda r: r.read_money())
+        spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_MART_EMPLOYEE, "clerk", source)
+        if why:
+            return _refusal(f"Bought nothing: {why}.")
+        await _macro_press(["A"], source)
+        opened, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_SHOP_MENU))
+        if not opened:
+            said = _quote(texts) or "nothing was said"
+            left = await _leave_shop(source)
+            return _refusal(f"Talked to the clerk but the BUY/SELL menu did not open ({said}).{'' if left else _screen_note()}")
+
+        stock = _mem(ms.mart_stock)
+        names = {item_id: _item_id_to_name(item_id) for item_id in stock}
+        listing = ", ".join(f"{names[i]} ${_mem(ms.item_price, i)}" for i in stock)
+        key = ms.name_key(wanted)
+        item_id = next((i for i in stock if ms.name_key(names[i]) == key), None)
+        if item_id is None:
+            await _leave_shop(source)
+            return _refusal(f"This shop doesn't sell {wanted}. It sells: {listing}.", stock=[names[i] for i in stock])
+        name, price = names[item_id], _mem(ms.item_price, item_id)
+        if price * count > money_before:
+            await _leave_shop(source)
+            return _refusal(
+                f"{count} {name} cost ${price * count} (${price} each) but you have ${money_before}: "
+                f"you can afford {money_before // price}. Nothing was bought."
+            )
+        bag_before = bag_counts()
+        owned_before = bag_before.get(item_id, 0)
+
+        async def give_up(message: str) -> Dict[str, Any]:
+            left = await _leave_shop(source)
+            money = _mem(lambda r: r.read_money())
+            tail = "" if left else " Could not close the shop: look at the screen."
+            return _refusal(f"{message} Money ${money_before} -> ${money}.{tail}")
+
+        cursor = _mem(ms.read_menu_cursor)
+        await _macro_press(ms.list_presses(cursor.cursor, 0), source)
+        if _mem(ms.read_menu_cursor).cursor != 0:
+            return await give_up("Could not put the shop menu cursor on BUY.")
+        await _macro_press(["A"], source)  # BUY
+        if not await _await_game(
+            lambda: _mem(ms.callback2_is, ms.CB2_BUY_MENU) and _mem(ms.task_running, ms.TASK_BUY_MENU) and not _mem(ms.fade_active),
+            MACRO_MENU_FRAMES,
+        ):
+            return await give_up("Chose BUY but the item list did not open.")
+        goal = stock.index(item_id)
+        await _macro_press(ms.list_presses(_mem(ms.shop_list_index), goal), source)
+        if _mem(ms.shop_list_index) != goal:
+            return await give_up(f"Could not put the list cursor on {name}.")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: _mem(ms.find_task, ms.TASK_BUY_HOW_MANY) is not None, MACRO_TEXT_FRAMES):
+            return await give_up(f"Chose {name} but the quantity box did not open.")
+        task = _mem(ms.find_task, ms.TASK_BUY_HOW_MANY)
+        if _mem(ms.task_data, task, ms.BUY_TASK_ITEM) != item_id:
+            return await give_up(f"The quantity box is not for {name}.")
+        most = _mem(ms.shop_max_quantity) or 0
+        if count > most:
+            return await give_up(f"You can buy at most {most} {name} (money or bag space); asked for {count}.")
+        await _macro_press(ms.quantity_presses(_mem(ms.task_data, task, ms.BUY_TASK_COUNT), count), source)
+        shown = _mem(ms.task_data, task, ms.BUY_TASK_COUNT)
+        if shown != count:
+            return await give_up(f"Could not set the quantity to {count} (it shows {shown}).")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_YES_NO_CALLBACK), MACRO_TEXT_FRAMES):
+            return await give_up("The purchase YES/NO did not come up.")
+        cursor = _mem(ms.read_menu_cursor)
+        if cursor.max_cursor != 1 or cursor.cursor != 0:
+            return await give_up(f"The purchase YES/NO cursor is not on YES (cursor {cursor.cursor}).")
+        await _macro_press(["A"], source)  # YES: the money is taken now
+
+        # "Here you go!" (and a Premier Ball bonus message) wait for A, then the list returns.
+        def back_at_list():
+            return _mem(ms.task_running, ms.TASK_BUY_MENU)
+
+        for _ in range(4):
+            if await _await_game(
+                lambda: back_at_list() or _mem(ms.task_running, ms.TASK_AFTER_PURCHASE) or _mem(ms.text_waiting_for_button),
+                MACRO_TEXT_FRAMES,
+            ) and not back_at_list():
+                await _macro_press(["A"], source)
+            if back_at_list():
+                break
+        money_after = _mem(lambda r: r.read_money())
+        bag_after = bag_counts()
+        owned_after = bag_after.get(item_id, 0)
+        left = await _leave_shop(source)
+        bought = owned_after - owned_before
+        paid = money_before - money_after
+        ok = bought == count and paid == price * count
+        logger.info(f"🛒 buy_item: {name} x{count} paid={paid} bought={bought}")
+        summary = (
+            f"Bought {bought} {name} for ${paid}: money ${money_before} -> ${money_after}, "
+            f"{name} in bag {owned_before} -> {owned_after}."
+        )
+        # Ten or more POKé BALLs come with a free PREMIER BALL.
+        extras = [
+            f"{_item_id_to_name(i)} x{n - bag_before.get(i, 0)}"
+            for i, n in bag_after.items()
+            if i != item_id and n > bag_before.get(i, 0)
+        ]
+        if extras:
+            summary += f" Also received for free: {', '.join(extras)}."
+        if not ok:
+            summary = f"Purchase NOT confirmed by memory (wanted {count} for ${price * count}). " + summary
+        summary += f" You can walk again at {_position_text(_field_snapshot())}." if left else _screen_note()
+        result = {
+            "success": ok,
+            "status": "BOUGHT" if ok else "NOT_CONFIRMED",
+            "summary": summary,
+            "item": name,
+            "money_before": money_before,
+            "money_after": money_after,
+            "bag_before": owned_before,
+            "bag_after": owned_after,
+        }
+        if not ok:
+            result["error"] = summary
+        return result
+    except Exception as e:
+        logger.error(f"Error in buy_item: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
@@ -3261,26 +5295,7 @@ async def mcp_complete_direct_objective(request: dict):
 
             if needs_loading and os.environ.get("POKEAGENT_CLI_MODE") != "1":
                 # CLI agents do not use objectives; skip when POKEAGENT_CLI_MODE
-                from utils.data_persistence.run_data_manager import get_run_data_manager
-
-                run_manager = get_run_data_manager()
-                objectives_run_dir = str(run_manager.get_scratch_space_dir()) if run_manager else None
-
-                if direct_objectives_sequence == "autonomous_objective_creation":
-                    direct_objectives_manager.load_autonomous_objective_creation_sequence(
-                        direct_objectives_start_index, run_dir=objectives_run_dir
-                    )
-                elif direct_objectives_sequence == "categorized_full_game":
-                    direct_objectives_manager.load_categorized_full_game_sequence(
-                        start_story_index=direct_objectives_start_index,
-                        start_battling_index=direct_objectives_battling_start_index,
-                        run_dir=objectives_run_dir,
-                    )
-                else:
-                    logger.warning(f"Unknown direct objectives sequence: {direct_objectives_sequence}")
-
-                # Update objectives cache after loading
-                _update_objectives_cache()
+                _load_objectives_sequence()
 
         # Check if sequence is active
         if not direct_objectives_manager.is_sequence_active():
@@ -3288,6 +5303,30 @@ async def mcp_complete_direct_objective(request: dict):
 
         # Extract category parameter if provided
         category = request.get("category")
+        objective_id = str(request.get("objective_id") or "").strip()
+
+        # Local addition: complete by objective ID. A small model reliably copies the ID
+        # shown in OBJECTIVES but picks the wrong category (it healed at a Pokémon Center,
+        # then completed three *battling* objectives instead of the story one, and kept
+        # healing because the story objective never advanced). The ID names exactly one
+        # current objective, so the category is derived from it, not trusted.
+        if objective_id and direct_objectives_manager.mode == "categorized":
+            current_ids = {}
+            for cat in ("story", "battling", "dynamics"):
+                obj = direct_objectives_manager._get_current_objective_for_category(cat)
+                if obj is not None:
+                    current_ids[cat] = obj.id
+            matches = [cat for cat, oid in current_ids.items() if oid == objective_id]
+            if not matches:
+                listing = ", ".join(f"{cat}: {oid}" for cat, oid in current_ids.items()) or "none"
+                return {
+                    "success": False,
+                    "error": f"'{objective_id}' is not a current objective. Current objectives are {listing}. "
+                    "Only complete the objective whose goal you have actually achieved.",
+                }
+            if category and category != matches[0]:
+                logger.warning(f"complete_direct_objective: '{objective_id}' is a {matches[0]} objective, not {category}")
+            category = matches[0]
 
         # Check if we're in categorized mode
         if direct_objectives_manager.mode == "categorized":
@@ -3558,6 +5597,9 @@ async def mcp_navigate_to(request: dict):
 
         if x is None or y is None:
             return {"success": False, "error": "x and y coordinates required"}
+        refused = _refuse_during_battle("navigate_to")
+        if refused:
+            return refused
 
         # Convert to int in case they come as floats from JSON
         try:
@@ -3569,26 +5611,73 @@ async def mcp_navigate_to(request: dict):
         # Calculate path and get buttons
         result = game_tools.navigate_to_direct(env, x, y, reason=reason, variance=variance)
 
+        def exit_hint() -> str:
+            try:
+                snap = _field_snapshot()
+                position = (snap.x, snap.y) if snap is not None else None
+                return game_tools.exit_hint_for_text(_location_name(), reason, position)
+            except Exception as e:  # a hint must never fail the walk
+                logger.warning(f"navigate_to: exit hint failed: {e}")
+                return ""
+
         if not result.get("success"):
+            hint = exit_hint()
+            if hint:
+                result["error"] = f"{result.get('error', 'navigate_to failed')} {hint}"
             return result
 
         # Queue buttons via take_action to ensure metrics tracking
         buttons = result.get("buttons", [])
+        report = None
+        before = None
         if buttons:
             variance_value = result.get("variance")
             if variance_value is None:
                 variance_value = variance or "none"
-            action_request = ActionRequest(buttons=buttons, source="navigate_to", metadata={"variance": variance_value})
-            await take_action(action_request)
+            action_request = ActionRequest(
+                buttons=buttons,
+                source="navigate_to",
+                metadata={"variance": variance_value},
+                check_movement=True,
+            )
+            before = _field_snapshot()
+            queued = await take_action(action_request)
+            report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+            await _settle_after_sequence(before, report)
 
-        return {
+        response = {
             "success": True,
             "target": result.get("target"),
             "path_length": result.get("path_length"),
             "buttons_queued": len(buttons),
-            "reason": reason,
             "variance": result.get("variance", variance or "none"),
         }
+        if result.get("note"):
+            response["note"] = result["note"]
+        response.update(_sequence_summary(report))
+        ran_clean = report is None or (
+            report.get("done") and not report.get("blocked") and not report.get("interrupted")
+        )
+        # Judge arrival by where the player stands, not by the plan: variance paths
+        # were seen ending a tile short of the target.
+        snap = _field_snapshot()
+        ox, oy = result.get("coord_offset") or (0, 0)
+        at_target = snap is not None and (snap.x - ox, snap.y - oy) == (x, y)
+        if before is not None and snap is not None and snap.map_id != before.map_id:
+            # Target was a door (or the path crossed one): arriving on another map is
+            # the outcome, not "did not reach" (the live model read that as failure and
+            # walked back in and out of a shop).
+            response["summary"] = f"Went through a door/warp: now at {_position_text(snap)}."
+        else:
+            if at_target:
+                response["summary"] = f"Reached ({x},{y}). " + response["summary"]
+            elif ran_clean:
+                reason_text = f" {result['note']}." if result.get("note") else ""
+                response["summary"] = f"Did not reach ({x},{y}).{reason_text} " + response["summary"]
+            hint = exit_hint()
+            if hint:
+                response["summary"] += f" {hint}"
+        return response
     except Exception as e:
         logger.error(f"Error in navigate_to: {e}")
         return {"success": False, "error": str(e)}
@@ -4339,6 +6428,20 @@ def _require_state_api_key(request: Request) -> Optional[JSONResponse]:
     return None
 
 
+# Saving/loading a state waits for the emulator lock and does file I/O for tens to
+# hundreds of ms. Run inline in an async endpoint, that would freeze the event loop
+# (every other request, /health included), so the endpoints below hand these to
+# run_in_threadpool, the same threadpool FastAPI uses for plain `def` endpoints.
+def _locked_save_state(path: str):
+    with memory_lock:
+        env.save_state(path)
+
+
+def _locked_load_state(path: str):
+    with memory_lock:
+        env.load_state(path)
+
+
 @app.post("/save_state")
 async def save_state_endpoint(request: Request):
     """Save the current emulator state to a file"""
@@ -4353,7 +6456,7 @@ async def save_state_endpoint(request: Request):
         default_filepath = str(get_cache_path("manual_save.state"))
         filepath = body.get("filepath", default_filepath)
         if env:
-            env.save_state(filepath)
+            await run_in_threadpool(_locked_save_state, filepath)
             logger.info(f"💾 State saved to: {filepath}")
             return {"status": "success", "message": f"State saved to {filepath}"}
         else:
@@ -4379,7 +6482,7 @@ async def load_state_endpoint(request: Request):
         if env:
             if not os.path.exists(filepath):
                 return JSONResponse(status_code=404, content={"error": f"State file not found: {filepath}"})
-            env.load_state(filepath)
+            await run_in_threadpool(_locked_load_state, filepath)
             logger.info(f"📂 State loaded from: {filepath}")
             return {"status": "success", "message": f"State loaded from {filepath}"}
         else:
@@ -4399,13 +6502,9 @@ async def save_checkpoint(request_data: dict = None):
         # Save emulator state
         checkpoint_state = str(get_cache_path("checkpoint.state"))
         if env:
-            env.save_state(checkpoint_state)
+            # save_state also writes this state's milestones and map data
+            await run_in_threadpool(_locked_save_state, checkpoint_state)
             logger.info(f"💾 Server: Saved checkpoint state at step {step_count}")
-
-            # Save milestones
-            if env.milestone_tracker:
-                milestone_file = env.milestone_tracker.save_milestones_for_state(checkpoint_state)
-                logger.info(f"💾 Server: Saved checkpoint milestones")
 
             return {
                 "status": "checkpoint_saved",
@@ -4417,11 +6516,13 @@ async def save_checkpoint(request_data: dict = None):
                 }
             }
         else:
-            return {"status": "error", "message": "No emulator available"}
+            return JSONResponse(status_code=503, content={"status": "error", "message": "No emulator available"})
 
     except Exception as e:
+        # A non-2xx status, so every caller (agent, /play page, play-local.sh stop) sees
+        # the failure instead of reporting a checkpoint that was never written.
         logger.error(f"Failed to save checkpoint: {e}")
-        return {"status": "error", "message": str(e)}
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
 @app.post("/sync_llm_metrics")
@@ -4598,16 +6699,20 @@ async def load_checkpoint():
             return {"status": "no_checkpoint", "message": f"No {checkpoint_state} file found"}
         
         if env:
-            env.load_state(checkpoint_state)
-            logger.info(f"📂 Server: Loaded checkpoint state")
+            def load_state_and_milestones():
+                with memory_lock:
+                    env.load_state(checkpoint_state)
+                    logger.info(f"📂 Server: Loaded checkpoint state")
 
-            # Load milestones if available
-            if env.milestone_tracker:
-                try:
-                    env.milestone_tracker.load_milestones_for_state(checkpoint_state)
-                    logger.info(f"📂 Server: Loaded checkpoint milestones")
-                except:
-                    logger.warning(f"Could not load checkpoint milestones")
+                    # Load milestones if available
+                    if env.milestone_tracker:
+                        try:
+                            env.milestone_tracker.load_milestones_for_state(checkpoint_state)
+                            logger.info(f"📂 Server: Loaded checkpoint milestones")
+                        except:
+                            logger.warning(f"Could not load checkpoint milestones")
+
+            await run_in_threadpool(load_state_and_milestones)
 
             return {
                 "status": "checkpoint_loaded",
@@ -4630,6 +6735,12 @@ def main():
     import argparse
 
     global running, state_update_running, state_update_thread, latest_metrics, agent_step_count
+
+    # A new server process means a new session: a pause left over from the last one
+    # would keep the agent idle with no sign why, however the run was started.
+    if os.path.exists(AGENT_PAUSE_FLAG):
+        os.remove(AGENT_PAUSE_FLAG)
+        print("▶️  Cleared a leftover agent pause from the previous session")
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
@@ -4841,8 +6952,12 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not mark initial milestone: {e}")
         except Exception as e:
-            print(f"Failed to load state from {args.load_state}: {e}")
-            print("Continuing with fresh game state...")
+            # Carrying on from the title screen would let the agent play a different game
+            # than the one asked for and overwrite checkpoint.state with it. Exit non-zero
+            # so the run stops visibly and the checkpoint stays as it is.
+            print(f"❌ Failed to load state from {args.load_state}: {e}")
+            print("❌ Refusing to start from a fresh game instead; exiting.")
+            sys.exit(1)
 
     # Start lightweight milestone updater thread
     state_update_running = True
@@ -4984,8 +7099,9 @@ def init_for_multiprocess():
                     print(f"✅ State loading complete for {load_state}")
 
                 except Exception as e:
+                    # Same reasoning as main(): never silently swap in a fresh game.
                     print(f"❌ Failed to load state from {load_state}: {e}")
-                    print("   Continuing with fresh game state...")
+                    raise
 
             # Start lightweight milestone updater thread
             global state_update_running, state_update_thread

@@ -536,8 +536,7 @@ class MapStitcher:
         if memory_reader is not None:
             try:
                 current_location = memory_reader.read_location()
-                current_map_bank = memory_reader._read_u8(memory_reader.addresses.MAP_BANK)
-                current_map_number = memory_reader._read_u8(memory_reader.addresses.MAP_NUMBER)
+                current_map_bank, current_map_number = memory_reader._read_current_map()
                 current_map_id = (current_map_bank << 8) | current_map_number
                 
                 # Update current map if it's unknown

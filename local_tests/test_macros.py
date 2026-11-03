@@ -1,0 +1,381 @@
+"""Closed-loop macros: heal_at_pokecenter, run_from_battle, throw_ball, switch_pokemon,
+buy_item. Each test checks the outcome from game memory, not from the macro's own
+report, and each macro has at least one refusal case.
+
+Same in-process server harness as test_movement_feedback.py (real game loop thread,
+real savestates).
+
+Fixtures:
+  test_rustboro_pokecenter.state   RUSTBORO CITY POKEMON CENTER 1F (7,4), Torchic 35/35, $2784
+  test_rustboro_mart.state         RUSTBORO CITY MART entrance (3,7), $2784; made from the
+                                   Pokémon Center fixture with go_to_exit("RUSTBORO CITY"),
+                                   go_to_exit("MART")
+  test_wild_shroomish_intro.state  Petalburg Woods, wild Shroomish Lv6, "Wild SHROOMISH
+                                   appeared!" waiting for A; made from
+                                   test_after_woods_grunt.state by stepping in the tall grass
+  test_wild_shroomish.state        the same battle at FIGHT/BAG/POKEMON/RUN; Torchic Lv11
+                                   18/33, 5 Poké Balls + 1 Great Ball
+  test_wild_two_party.state        Petalburg Woods, wild Silcoon, action menu; party Torchic +
+                                   Shroomish. The Shroomish was caught from
+                                   test_wild_shroomish.state after setting its HP to 1 and
+                                   putting it to sleep in RAM (a guaranteed catch), then the
+                                   player stepped in the grass again
+  test_battle_wurmple.state        TRAINER battle (Bug Catcher Lyle), move menu open
+  test_movement_route101.state     ROUTE 101, outdoors
+
+RAM writes (documented where used): party HP/status before healing, battle speeds to
+force a failed escape, the wild Pokémon's HP and sleep for a guaranteed catch, and a
+party member's HP 0 for the fainted refusal.
+
+  docker run --rm --entrypoint /opt/venv/bin/python -v ~/continual-harness:/app -w /app \
+      emerald-harness:local local_tests/test_macros.py
+"""
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_movement_feedback import ROUTE101, server
+
+HERE = Path(__file__).resolve().parent
+POKECENTER = HERE / "test_rustboro_pokecenter.state"
+MART = HERE / "test_rustboro_mart.state"
+WILD_INTRO = HERE / "test_wild_shroomish_intro.state"
+WILD = HERE / "test_wild_shroomish.state"
+WILD_TWO = HERE / "test_wild_two_party.state"
+TRAINER = HERE / "test_battle_wurmple.state"
+
+# pret pokeemerald symbols (US): gPlayerParty (100-byte mons; +0x50 status, +0x56 HP),
+# gPlayerPartyCount, gBattleMons (0x58 bytes; +6 speed, +0x28 HP, +0x48 personality,
+# +0x4C status1), gBattleOutcome, gMain.inBattle.
+PARTY = 0x020244EC
+PARTY_COUNT = 0x020244E9
+BATTLE_MONS = 0x02024084
+BATTLE_OUTCOME = 0x0202433A
+
+
+def _reader(s):
+    return s.srv.env.memory_reader
+
+
+def _write(s, size, address, value):
+    with s.srv.memory_lock:
+        memory = s.srv.env.core.memory
+        {8: memory.u8, 16: memory.u16, 32: memory.u32}[size][address] = value
+        # The reader caches memory blocks until the next frame; drop them so the
+        # very next read (by the test or the macro) sees the write.
+        _reader(s)._invalidate_mem_cache()
+
+
+def _read(s, fn):
+    with s.srv.memory_lock:
+        return fn(_reader(s))
+
+
+def _party(s):
+    return _read(s, lambda r: r.read_party_pokemon())
+
+
+def _in_battle(s):
+    return _read(s, lambda r: r.is_in_battle())
+
+
+def _balls(s):
+    return {b["name"]: b["quantity"] for b in _read(s, lambda r: r.read_full_inventory())["poke_balls"]}
+
+
+def _wait(predicate, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.1)
+    return predicate()
+
+
+# -- heal_at_pokecenter -------------------------------------------------------
+
+
+def test_heal_restores_hp_and_status():
+    s = server()
+    s.load(POKECENTER)
+    # RAM: Torchic down to 10/35 and poisoned, so the heal has something to restore.
+    _write(s, 16, PARTY + 0x56, 10)
+    _write(s, 32, PARTY + 0x50, 0x08)
+    before = _party(s)[0]
+    assert (before.current_hp, int(before.status.value)) == (10, 8), before
+    # Step away first so the macro has to walk back to the counter.
+    s.call("mcp_press_buttons", {"buttons": ["DOWN", "DOWN", "LEFT"], "reasoning": "test"})
+    r = s.call("mcp_heal_at_pokecenter", {})
+    print("   ", r)
+    assert r["success"] is True and r["status"] == "HEALED", r
+    after = _party(s)[0]
+    assert after.current_hp == after.max_hp == 35, after
+    assert int(after.status.value) == 0, after
+    assert "TORCHIC 10/35" in r["summary"] and "TORCHIC 35/35" in r["summary"], r["summary"]
+    snap = s.snapshot()
+    assert (snap.x, snap.y, snap.facing) == (7, 4, "UP"), snap
+    assert s.srv._player_can_walk(), "the player should be free to walk after healing"
+
+
+def test_heal_refuses_outside_a_pokemon_center():
+    s = server()
+    s.load(ROUTE101)
+    r = s.call("mcp_heal_at_pokecenter", {})
+    print("   ", r)
+    assert r["success"] is False and "not inside a Pokémon Center (ROUTE 101)" in r["error"], r
+
+
+def test_heal_outdoors_names_the_door():
+    s = server()
+    s.load(POKECENTER)
+    assert s.call("mcp_go_to_exit", {"exit": "RUSTBORO CITY", "reasoning": "test"})["success"]
+    r = s.call("mcp_heal_at_pokecenter", {})
+    print("   ", r)
+    assert r["success"] is False and 'go_to_exit("POKEMON CENTER")' in r["error"], r
+
+
+# -- run_from_battle ----------------------------------------------------------
+
+
+def test_run_escapes_a_wild_battle():
+    s = server()
+    s.load(WILD)
+    assert _in_battle(s)
+    r = s.call("mcp_run_from_battle", {})
+    print("   ", r)
+    assert r["success"] is True and r["status"] == "ESCAPED", r
+    assert "Got away safely from wild SHROOMISH" in r["summary"], r
+    assert not _in_battle(s)
+    assert _read(s, lambda r: r._read_u8(BATTLE_OUTCOME)) == 4  # B_OUTCOME_RAN
+    assert s.srv._player_can_walk()
+
+
+def test_run_presses_through_the_intro_text_first():
+    """'Wild SHROOMISH appeared!' waits for A; the macro reads that and presses it."""
+    s = server()
+    s.load(WILD_INTRO)
+    assert _read(s, lambda r: r.read_battle_view())["menu"] == "busy"
+    r = s.call("mcp_run_from_battle", {})
+    print("   ", r)
+    assert r["success"] is True and not _in_battle(s), r
+
+
+def test_run_that_fails_says_the_battle_continues():
+    s = server()
+    s.load(WILD)
+    # RAM: Torchic speed 1, Shroomish speed 500, so the escape check can't pass.
+    _write(s, 16, BATTLE_MONS + 6, 1)
+    _write(s, 16, BATTLE_MONS + 0x58 + 6, 500)
+    r = s.call("mcp_run_from_battle", {})
+    print("   ", r)
+    assert r["success"] is False and r["status"] == "STILL_IN_BATTLE", r
+    assert "Couldn't get away" in r["summary"] and "continues" in r["summary"], r
+    assert _in_battle(s)
+    assert _read(s, lambda r: r.read_battle_view())["menu"] == "action"
+
+
+def test_run_refuses_a_trainer_battle():
+    s = server()
+    s.load(TRAINER)
+    r = s.call("mcp_run_from_battle", {})
+    print("   ", r)
+    assert r["success"] is False and "can't run from a trainer battle" in r["error"], r
+    view = _read(s, lambda r: r.read_battle_view())
+    assert view["menu"] == "move" and view["move_cursor_slot"] == 4, view  # nothing pressed
+
+
+# -- throw_ball ---------------------------------------------------------------
+
+
+def test_throw_ball_uses_one_ball_and_reports_the_result():
+    s = server()
+    s.load(WILD)
+    r = s.call("mcp_throw_ball", {"ball": "Poke Ball"})
+    print("   ", r)
+    assert r["success"] is True, r
+    assert _balls(s)["Poke Ball"] == 4, _balls(s)
+    assert (r["balls_before"], r["balls_after"]) == (5, 4), r
+    if r["caught"]:
+        assert not _in_battle(s) and len(_party(s)) == 2, r
+    else:
+        assert r["status"] == "BROKE_FREE" and _in_battle(s), r
+        assert _read(s, lambda r: r.read_battle_view())["menu"] == "action"
+        assert len(_party(s)) == 1
+
+
+def test_throw_great_ball_catch_declines_the_nickname():
+    s = server()
+    s.load(WILD)
+    # RAM: wild Shroomish at 1 HP and asleep makes the catch certain (catch rate 255).
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x28, 1)
+    _write(s, 32, BATTLE_MONS + 0x58 + 0x4C, 3)
+    r = s.call("mcp_throw_ball", {"ball": "great"})
+    print("   ", r)
+    assert r["success"] is True and r["caught"] is True and r["status"] == "CAUGHT", r
+    assert "nickname" in r["summary"] and "joined your party" in r["summary"], r
+    assert not _in_battle(s)
+    assert _read(s, lambda r: r._read_u8(BATTLE_OUTCOME)) == 7  # B_OUTCOME_CAUGHT
+    party = _party(s)
+    assert [p.species_name for p in party] == ["Torchic", "Shroomish"], party
+    assert party[1].nickname == "SHROOMISH", party[1]  # NO to the nickname question
+    assert "Great Ball" not in _balls(s), _balls(s)
+
+
+def test_throw_ball_refuses_a_ball_you_dont_have():
+    s = server()
+    s.load(WILD)
+    r = s.call("mcp_throw_ball", {"ball": "Ultra Ball"})
+    print("   ", r)
+    assert r["success"] is False and "Poke Ball x5" in r["error"] and "Great Ball x1" in r["error"], r
+    assert _read(s, lambda r: r.read_battle_view())["menu"] == "action"
+
+
+def test_throw_ball_refuses_a_trainer_battle():
+    s = server()
+    s.load(TRAINER)
+    r = s.call("mcp_throw_ball", {})
+    print("   ", r)
+    assert r["success"] is False and "trainer" in r["error"], r
+    assert _balls(s)["Poke Ball"] == 5
+
+
+# -- switch_pokemon -----------------------------------------------------------
+
+
+def _active_personality(s):
+    return _read(s, lambda r: r._read_u32(BATTLE_MONS + 0x48))
+
+
+def _party_personality(s, index):
+    return _read(s, lambda r: r._read_u32(PARTY + 100 * index))
+
+
+def test_switch_sends_out_the_named_pokemon():
+    s = server()
+    s.load(WILD_TWO)
+    assert _active_personality(s) == _party_personality(s, 0)  # Torchic leads
+    r = s.call("mcp_switch_pokemon", {"pokemon": "Shroomish"})
+    print("   ", r)
+    assert r["success"] is True and r["status"] == "SWITCHED", r
+    assert _active_personality(s) == _party_personality(s, 1), "Shroomish should be in battle"
+    assert _read(s, lambda r: r._read_u16(BATTLE_MONS)) == 306  # SPECIES_SHROOMISH
+    assert "TORCHIC came back and SHROOMISH" in r["summary"], r
+
+
+def test_switch_by_slot_number():
+    s = server()
+    s.load(WILD_TWO)
+    r = s.call("mcp_switch_pokemon", {"pokemon": 2})
+    assert r["success"] is True, r
+    assert _active_personality(s) == _party_personality(s, 1)
+
+
+def test_switch_refuses_the_active_pokemon():
+    s = server()
+    s.load(WILD_TWO)
+    r = s.call("mcp_switch_pokemon", {"pokemon": "TORCHIC"})
+    print("   ", r)
+    assert r["success"] is False and "already in battle" in r["error"], r
+    assert _read(s, lambda r: r.read_battle_view())["menu"] == "action"
+
+
+def test_switch_refuses_a_fainted_pokemon():
+    s = server()
+    s.load(WILD_TWO)
+    _write(s, 16, PARTY + 100 + 0x56, 0)  # RAM: Shroomish fainted
+    r = s.call("mcp_switch_pokemon", {"pokemon": "Shroomish"})
+    print("   ", r)
+    assert r["success"] is False and "has fainted" in r["error"], r
+    assert _active_personality(s) == _party_personality(s, 0)
+
+
+# -- buy_item -----------------------------------------------------------------
+
+
+def _money(s):
+    return _read(s, lambda r: r.read_money())
+
+
+def _bag_count(s, name):
+    inventory = _read(s, lambda r: r.read_full_inventory())
+    return sum(e["quantity"] for pocket in inventory.values() for e in pocket if e["name"] == name)
+
+
+def test_buy_potions():
+    s = server()
+    s.load(MART)
+    assert _money(s) == 2784 and _bag_count(s, "Potion") == 0
+    r = s.call("mcp_buy_item", {"item": "Potion", "count": 3})
+    print("   ", r)
+    assert r["success"] is True and r["status"] == "BOUGHT", r
+    assert _money(s) == 2784 - 3 * 300, _money(s)
+    assert _bag_count(s, "Potion") == 3
+    assert "money $2784 -> $1884" in r["summary"] and "Potion in bag 0 -> 3" in r["summary"], r
+    assert s.srv._player_can_walk(), "the shop should be closed"
+
+
+def test_buy_twelve_poke_balls_counts_by_tens():
+    """12 = RIGHT (+10) then UP, UP; 10+ Poké Balls also bring a free Premier Ball."""
+    s = server()
+    s.load(MART)
+    r = s.call("mcp_buy_item", {"item": "POKé BALL", "count": 12})
+    print("   ", r)
+    assert r["success"] is True, r
+    assert _bag_count(s, "Poke Ball") == 5 + 12
+    assert _money(s) == 2784 - 12 * 200
+    assert "Premier Ball x1" in r["summary"], r
+
+
+def test_buy_refuses_an_item_not_sold_and_lists_the_stock():
+    s = server()
+    s.load(MART)
+    r = s.call("mcp_buy_item", {"item": "Ultra Ball", "count": 1})
+    print("   ", r)
+    assert r["success"] is False and "doesn't sell Ultra Ball" in r["error"], r
+    assert "Potion $300" in r["error"] and "Poke Ball $200" in r["error"], r
+    assert _money(s) == 2784
+    assert _wait(s.srv._player_can_walk), "the shop should be closed"
+
+
+def test_buy_refuses_more_than_you_can_afford():
+    s = server()
+    s.load(MART)
+    r = s.call("mcp_buy_item", {"item": "Potion", "count": 20})
+    print("   ", r)
+    assert r["success"] is False and "you can afford 9" in r["error"], r
+    assert _money(s) == 2784 and _bag_count(s, "Potion") == 0
+
+
+def test_buy_refuses_outside_a_mart():
+    s = server()
+    s.load(ROUTE101)
+    r = s.call("mcp_buy_item", {"item": "Potion", "count": 1})
+    print("   ", r)
+    assert r["success"] is False and "no shop clerk here" in r["error"], r
+
+
+def _run_all():
+    import test_movement_feedback as harness
+
+    failures = 0
+    tests = [(n, f) for n, f in globals().items() if n.startswith("test_") and callable(f)]
+    only = sys.argv[1:]
+    if only:
+        tests = [(n, f) for n, f in tests if any(o in n for o in only)]
+    for name, fn in tests:
+        started = time.time()
+        try:
+            fn()
+            print(f"PASS {name} ({time.time() - started:.1f}s)")
+        except Exception as e:  # report every failure, not just the first
+            failures += 1
+            print(f"FAIL {name}: {type(e).__name__}: {e}")
+    print(f"{len(tests) - failures}/{len(tests)} passed")
+    if harness._SERVER is not None:
+        harness._SERVER.stop()
+    return failures
+
+
+if __name__ == "__main__":
+    sys.exit(1 if _run_all() else 0)

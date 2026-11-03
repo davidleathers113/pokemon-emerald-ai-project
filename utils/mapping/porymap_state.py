@@ -3,6 +3,7 @@
 import json
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -535,6 +536,239 @@ def _object_ascii_marker(obj: Dict[str, Any]) -> str:
     return "O"
 
 
+# Tiles a player can't stand on when looking for openings on a map edge.
+_EDGE_BLOCKED = {"#", "X", "W"}
+
+
+def _readable_map_name(map_const: str) -> str:
+    """MAP_LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB -> LITTLEROOT TOWN PROFESSOR BIRCHS LAB."""
+    name = str(map_const)
+    if name.startswith("MAP_"):
+        name = name[len("MAP_"):]
+    # pokeemerald writes ROUTE101; the rest of the prompt says ROUTE 101.
+    out = []
+    for i, ch in enumerate(name):
+        if i and ch.isdigit() and name[i - 1].isalpha():
+            out.append(" ")
+        out.append(ch)
+    return "".join(out).replace("_", " ")
+
+
+@lru_cache(maxsize=1)
+def _map_dirs_by_const() -> Dict[str, str]:
+    """MAP_ROUTE101 -> Route101 (the data/maps directory), from each map.json's id."""
+    root = _get_pokeemerald_root()
+    out: Dict[str, str] = {}
+    if not root:
+        return out
+    for map_file in (root / "data" / "maps").glob("*/map.json"):
+        try:
+            with open(map_file, encoding="utf-8") as fh:
+                map_id = json.load(fh).get("id")
+        except (OSError, ValueError):
+            continue
+        if map_id:
+            out[map_id] = map_file.parent.name
+    return out
+
+
+@lru_cache(maxsize=64)
+def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
+    """A map's collision grid from the decomp, one string per row."""
+    from utils.mapping.porymap_json_builder import build_json_map
+
+    root = _get_pokeemerald_root()
+    if not root:
+        return None
+    try:
+        built = build_json_map(map_dir, root, include_grid=True, include_ascii=False)
+    except Exception as e:  # a broken neighbour must not take the prompt down with it
+        logger.warning(f"Porymap: could not build grid for {map_dir}: {e}")
+        return None
+    grid = (built or {}).get("grid")
+    if not grid:
+        return None
+    return tuple("".join(str(cell) for cell in row) for row in grid)
+
+
+def connection_open_span(conn: Dict[str, Any]) -> Optional[set]:
+    """Positions along this map's edge where the connected map is walkable.
+
+    A map edge only leads somewhere where the tile across it, on the neighbouring map,
+    can be stood on: Oldale Town's whole south row is open ground, but Route 101 has
+    trees under all of it except x=8-11. Positions are in this map's frame (x for a
+    north/south edge, y for east/west), using pokeemerald's connection offset
+    (neighbour = this - offset). None when the neighbour's layout can't be read.
+    """
+    direction = conn.get("direction")
+    map_dir = _map_dirs_by_const().get(str(conn.get("map", "")))
+    grid = _static_grid(map_dir) if map_dir else None
+    if direction not in ("up", "down", "left", "right") or not grid:
+        return None
+    offset = int(conn.get("offset", 0) or 0)
+    if direction in ("up", "down"):
+        row = grid[-1] if direction == "up" else grid[0]
+        return {i + offset for i, cell in enumerate(row) if cell not in _EDGE_BLOCKED}
+    width = max(len(row) for row in grid)
+    col = width - 1 if direction == "left" else 0
+    return {
+        y + offset for y, row in enumerate(grid)
+        if col < len(row) and row[col] not in _EDGE_BLOCKED
+    }
+
+
+def _edge_openings(ascii_lines: List[str], direction: str, allowed: Optional[set] = None) -> str:
+    """Walkable stretches on one edge of the map, e.g. 'x=10-11, y=0'.
+
+    allowed, when given, keeps only those positions along the edge (see
+    connection_open_span).
+    """
+    if not ascii_lines:
+        return ""
+    height, width = len(ascii_lines), max(len(line) for line in ascii_lines)
+    if direction in ("up", "down"):
+        y = 0 if direction == "up" else height - 1
+        cells = [(x, y) for x in range(len(ascii_lines[y]))]
+    elif direction in ("left", "right"):
+        x = 0 if direction == "left" else width - 1
+        cells = [(x, y) for y in range(height) if x < len(ascii_lines[y])]
+    else:
+        return ""
+    axis = 0 if direction in ("up", "down") else 1
+    open_cells = [
+        c for c in cells
+        if ascii_lines[c[1]][c[0]] not in _EDGE_BLOCKED and (allowed is None or c[axis] in allowed)
+    ]
+    if not open_cells:
+        return ""
+    # Group consecutive open tiles into ranges along the edge.
+    ranges, start, prev = [], open_cells[0][axis], open_cells[0][axis]
+    for cell in open_cells[1:]:
+        if cell[axis] != prev + 1:
+            ranges.append((start, prev))
+            start = cell[axis]
+        prev = cell[axis]
+    ranges.append((start, prev))
+    spans = ", ".join(f"{a}" if a == b else f"{a}-{b}" for a, b in ranges)
+    if axis == 0:
+        return f"x={spans}, y={open_cells[0][1]}"
+    return f"x={open_cells[0][0]}, y={spans}"
+
+
+_TRAINER_FLAGS_START = 0x500  # pret include/constants/flags.h
+
+
+@lru_cache(maxsize=1)
+def _trainer_ids() -> Dict[str, int]:
+    """TRAINER_JOSH -> 600 etc., from include/constants/opponents.h (copied from pret)."""
+    root = _get_pokeemerald_root()
+    path = Path(root) / "include" / "constants" / "opponents.h" if root else None
+    if path is None or not path.exists():
+        return {}
+    ids = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "#define" and parts[1].startswith("TRAINER_") and parts[2].isdigit():
+            ids[parts[1]] = int(parts[2])
+    return ids
+
+
+@lru_cache(maxsize=64)
+def _map_trainers(map_dir: str) -> Tuple[Tuple[int, int, str, int], ...]:
+    """(x, y, name, trainer id) for each object on a map whose script starts a trainer battle.
+
+    The object's own trainer_type isn't enough: gym leaders are TRAINER_TYPE_NONE and
+    battle from their script. The script label's first trainerbattle line names the
+    trainer (`trainerbattle_single TRAINER_JOSH, ...`).
+    """
+    root = _get_pokeemerald_root()
+    if not root or not map_dir:
+        return ()
+    map_path = Path(root) / "data" / "maps" / map_dir
+    try:
+        with open(map_path / "map.json", encoding="utf-8") as fh:
+            objects = json.load(fh).get("object_events") or []
+        scripts = (map_path / "scripts.inc").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ()
+    ids = _trainer_ids()
+    out = []
+    for obj in objects:
+        label = f"{obj.get('script', '')}::"
+        start = scripts.find(label)
+        if not obj.get("script") or start == -1:
+            continue
+        body_end = scripts.find("::", start + len(label))
+        body = scripts[start + len(label): body_end if body_end != -1 else len(scripts)]
+        for line in body.splitlines():
+            words = line.replace(",", " ").split()
+            if len(words) >= 2 and words[0].startswith("trainerbattle") and words[1] in ids:
+                name = words[1][len("TRAINER_"):]
+                # TRAINER_ROXANNE_1 -> ROXANNE: the number is the rematch tier.
+                head, _, tail = name.rpartition("_")
+                if head and tail.isdigit():
+                    name = head
+                out.append((int(obj.get("x", 0)), int(obj.get("y", 0)), name.replace("_", " "), ids[words[1]]))
+                break
+    return tuple(out)
+
+
+def _format_trainers(map_dir: str, memory_reader: Any) -> List[str]:
+    """Trainers on this map the player hasn't beaten yet, with where they stand.
+
+    Seen live: objective "Defeat Gym trainers" in Rustboro Gym. The model crept up one tile
+    per decision, not knowing where anyone was. Beaten is read from the game's trainer
+    flags (TRAINER_FLAGS_START + id), so the list shrinks as they fall.
+    """
+    trainers = _map_trainers(map_dir)
+    if not trainers or memory_reader is None:
+        return []
+    left = []
+    for x, y, name, trainer_id in trainers:
+        try:
+            beaten = memory_reader._is_event_flag_set(_TRAINER_FLAGS_START + trainer_id)
+        except Exception:
+            return []  # can't read flags: say nothing rather than something wrong
+        if not beaten:
+            left.append(f"{name} at ({x}, {y})")
+    if not left:
+        return ["- every trainer on this map is already beaten"]
+    return [
+        "- " + "; ".join(left),
+        "  (walking into a trainer's line of sight starts the battle; or stand next to them, face them and press A)",
+    ]
+
+
+def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str]) -> List[str]:
+    """Plain-language list of where each exit leads.
+
+    The same facts are in the Map Data JSON below, but a small model reads the raw
+    warp/connection objects poorly (e.g. it took Birch's lab door for the way to
+    Route 101, which is an open map edge). One line per exit is cheap and unambiguous.
+    """
+    lines = []
+    for conn in json_map.get("connections", []):
+        direction = conn.get("direction", "?")
+        span = connection_open_span(conn)
+        where = _edge_openings(ascii_lines, direction, span)
+        edge = {"up": "north", "down": "south", "left": "west", "right": "east"}.get(direction, direction)
+        if where:
+            how = f" (walk off at {where})"
+        elif span is not None and ascii_lines:
+            # Seen live: Route 104's "south edge -> ROUTE 105" (all sea) drew the model
+            # south when it had no way to cross.
+            how = " (no way across on foot: water or cliff all along it)"
+        else:
+            how = ""
+        lines.append(f"- {edge} edge of the map{how} -> {_readable_map_name(conn.get('map', '?'))}")
+    for warp in json_map.get("warps", []):
+        lines.append(
+            f"- door/warp at ({warp.get('x', '?')}, {warp.get('y', '?')}) -> "
+            f"{_readable_map_name(warp.get('dest_map', '?'))}"
+        )
+    return lines
+
+
 def _format_porymap_info(
     location_name: Optional[str],
     player_coords: Optional[Tuple[int, int]] = None,
@@ -1058,7 +1292,16 @@ def _format_porymap_info(
             context_parts.append("\nASCII Map:")
             context_parts.append(ascii_map)
             context_parts.append("(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = walkable (different elevation), 'N' = NPC, 'I' = item, 'O' = other object, '~' = tall grass, 'W' = water, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
-        
+
+            exits = _format_exits(json_map, ascii_lines)
+            if exits:
+                context_parts.append("\nEXITS (where each way out of this map leads):")
+                context_parts.extend(exits)
+            trainers = _format_trainers(porymap_map_name, memory_reader)
+            if trainers:
+                context_parts.append("\nTRAINERS not yet beaten on this map:")
+                context_parts.extend(trainers)
+
         # NOTE: Warps, Objects/NPCs, and Connections lists are DEPRECATED
         # This data is already included in the Map Data (JSON) section below.
         # Removed to reduce redundancy and potential agent confusion.
@@ -1103,7 +1346,9 @@ def _format_porymap_info(
             "bg_events": bg_events_for_json,
             "connections": simplified_connections
         }
-        context_parts.append(json.dumps(compact_json_map, indent=2))
+        # Single-line JSON: the same data at roughly half the tokens of indent=2 (every model
+        # call re-reads it; server/app.py parses this block back out by brace matching).
+        context_parts.append(json.dumps(compact_json_map, separators=(",", ":")))
         
         logger.info(f"Porymap: Successfully added map data for '{porymap_map_name}' ({json_map['dimensions']['width']}x{json_map['dimensions']['height']})")
         

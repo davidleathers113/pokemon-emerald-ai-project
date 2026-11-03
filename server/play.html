@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emerald Controller</title>
+<style>
+  :root {
+    --bg: #111418; --panel: #1b2027; --text: #e8edf2; --muted: #9aa6b2;
+    --accent: #3ddc84; --warn: #ffb020; --key: #2a313b; --key-active: #3ddc84;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f3f5f7; --panel: #ffffff; --text: #14181d; --muted: #5b6672;
+      --accent: #12924f; --warn: #b26a00; --key: #e3e8ee; --key-active: #12924f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; align-items: center; min-height: 100vh;
+    padding: 16px;
+  }
+  header { width: 100%; max-width: 980px; display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  header h1 { font-size: 18px; margin: 0; flex: 1; }
+  #mode { padding: 8px 14px; border-radius: 8px; border: 0; font-weight: 600; cursor: pointer; font-size: 14px; }
+  #mode.ai { background: var(--accent); color: #04140a; }
+  #mode.human { background: var(--warn); color: #1d1200; }
+  main { width: 100%; max-width: 980px; display: grid; grid-template-columns: 1fr 260px; gap: 16px; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  .screen { background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 3 / 2; }
+  .screen img { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
+  aside { background: var(--panel); border-radius: 10px; padding: 14px; }
+  aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
+  td { padding: 3px 0; }
+  td:first-child { color: var(--muted); }
+  kbd { background: var(--key); border-radius: 4px; padding: 1px 6px; font: 12px ui-monospace, monospace; }
+  .pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 6px; justify-content: center; margin: 8px 0 14px; }
+  .pad button, .face button, .sys button {
+    background: var(--key); color: var(--text); border: 0; border-radius: 8px;
+    height: 44px; font-weight: 600; cursor: pointer;
+  }
+  .pad button:active, .face button:active, .sys button:active, .pressed { background: var(--key-active) !important; color: #04140a !important; }
+  .face, .sys { display: flex; gap: 8px; justify-content: center; margin-bottom: 10px; }
+  .face button { width: 56px; border-radius: 50%; height: 56px; }
+  .sys button { padding: 0 14px; font-size: 12px; }
+  #status { color: var(--muted); font-size: 13px; min-height: 1.4em; }
+  #saved { color: var(--muted); font-size: 12px; min-height: 1.2em; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  #offline {
+    display: none; width: 100%; max-width: 980px; margin-bottom: 12px; padding: 10px 14px;
+    border-radius: 8px; background: #b3261e; color: #fff; font-weight: 600;
+  }
+  #offline.show { display: block; }
+  .screen.stale img { opacity: .35; filter: grayscale(1); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pokémon Emerald — Controller</h1>
+  <button id="mode" class="ai" title="Pause the AI and take control, or hand control back">AI is playing — take control</button>
+</header>
+<div id="offline" role="alert">Game server not responding — the picture below is frozen. Run <code>./play-local.sh</code> to resume from the last checkpoint.</div>
+<main>
+  <div class="screen" id="screen"><img id="frame" alt="Game screen"></div>
+  <aside>
+    <h2>Keyboard</h2>
+    <table>
+      <tr><td>D-pad</td><td><kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd></td></tr>
+      <tr><td>A</td><td><kbd>X</kbd></td></tr>
+      <tr><td>B</td><td><kbd>Z</kbd></td></tr>
+      <tr><td>Start</td><td><kbd>Return</kbd></td></tr>
+      <tr><td>Select</td><td><kbd>Delete</kbd></td></tr>
+    </table>
+    <div class="pad">
+      <span></span><button data-btn="UP">▲</button><span></span>
+      <button data-btn="LEFT">◀</button><span></span><button data-btn="RIGHT">▶</button>
+      <span></span><button data-btn="DOWN">▼</button><span></span>
+    </div>
+    <div class="face"><button data-btn="B">B</button><button data-btn="A">A</button></div>
+    <div class="sys"><button data-btn="SELECT">SELECT</button><button data-btn="START">START</button></div>
+    <div id="status"></div>
+    <div id="saved"></div>
+    <div class="note">Take control first so the AI doesn't press buttons at the same time. The AI resumes when you hand control back. While you play, progress is checkpointed every minute.</div>
+  </aside>
+</main>
+<script>
+const base = window.location.origin;
+const frame = document.getElementById("frame");
+const screenEl = document.getElementById("screen");
+const modeBtn = document.getElementById("mode");
+const statusEl = document.getElementById("status");
+const savedEl = document.getElementById("saved");
+const offlineEl = document.getElementById("offline");
+const KEYS = { ArrowUp: "UP", ArrowDown: "DOWN", ArrowLeft: "LEFT", ArrowRight: "RIGHT",
+               x: "A", X: "A", z: "B", Z: "B", Enter: "START", Backspace: "SELECT" };
+const DPAD = new Set(["UP", "DOWN", "LEFT", "RIGHT"]);
+const CHECKPOINT_EVERY_MS = 60000;
+let paused = false;
+let online = true;
+let busy = false;           // a take-control / hand-back switch is in progress
+let pressInFlight = false;  // one press at a time, so held keys can't flood the queue
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  };
+  const r = await fetch(`${base}${path}`, opts);
+  if (!r.ok) throw new Error(`${path} returned ${r.status}`);
+  return r.json();
+}
+
+function setOnline(ok) {
+  online = ok;
+  offlineEl.classList.toggle("show", !ok);
+  screenEl.classList.toggle("stale", !ok);
+  modeBtn.disabled = !ok;
+}
+
+function renderMode() {
+  modeBtn.className = paused ? "human" : "ai";
+  modeBtn.textContent = paused ? "You are playing — hand back to AI" : "AI is playing — take control";
+}
+
+async function refreshState() {
+  try {
+    await api("/health");
+    const state = await api("/agent_pause");
+    setOnline(true);
+    if (!busy) { paused = state.paused; renderMode(); }
+  } catch (e) { setOnline(false); }
+}
+
+// The harness only checkpoints on AI moves, so human play is checkpointed here:
+// at every hand-over, every minute while a human has control, and when the tab is left.
+async function checkpoint(reason) {
+  try {
+    await api("/checkpoint", {});
+    savedEl.textContent = `Checkpoint saved ${new Date().toLocaleTimeString()} (${reason}).`;
+    return true;
+  } catch (e) {
+    savedEl.textContent = `Checkpoint FAILED ${new Date().toLocaleTimeString()}: ${e.message}`;
+    return false;
+  }
+}
+
+modeBtn.addEventListener("click", async () => {
+  if (busy) return;
+  busy = true;
+  modeBtn.disabled = true;
+  try {
+    const want = !(await api("/agent_pause")).paused;  // decide from the server's state, not a stale copy
+    await checkpoint(want ? "taking control" : "handing back");
+    paused = (await api("/agent_pause", { paused: want })).paused;
+    renderMode();
+    statusEl.textContent = paused
+      ? "AI paused (it finishes the move it was already thinking about)."
+      : "AI resumed.";
+  } catch (e) {
+    statusEl.textContent = `Couldn't switch control: ${e.message}`;
+  } finally {
+    busy = false;
+    modeBtn.disabled = !online;
+  }
+});
+
+async function press(button) {
+  if (pressInFlight) return;
+  pressInFlight = true;
+  if (!paused) statusEl.textContent = "Tip: take control first, or the AI may fight you.";
+  try {
+    // "normal" holds long enough to step a tile; "fast" suits menus and dialogue
+    // (the harness's own presets, server/app.py SPEED_PRESETS).
+    await api("/action", { buttons: [button], speed: DPAD.has(button) ? "normal" : "fast", source: "manual" });
+  } catch (e) {
+    statusEl.textContent = `Button press failed: ${e.message}`;
+  } finally {
+    pressInFlight = false;
+  }
+}
+
+setInterval(() => { if (paused && online) checkpoint("auto, every minute"); }, CHECKPOINT_EVERY_MS);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && paused && online) {
+    // sendBeacon survives the tab closing; fetch may be cancelled.
+    navigator.sendBeacon(`${base}/checkpoint`, new Blob(["{}"], { type: "application/json" }));
+  }
+});
+
+function flash(button) {
+  const el = document.querySelector(`[data-btn="${button}"]`);
+  if (!el) return;
+  el.classList.add("pressed");
+  setTimeout(() => el.classList.remove("pressed"), 120);
+}
+
+document.addEventListener("keydown", (e) => {
+  const button = KEYS[e.key];
+  // Holding an arrow keeps walking; holding A/B/Start must not repeat-press menus.
+  if (!button || (e.repeat && !DPAD.has(button)) || e.metaKey || e.ctrlKey) return;
+  e.preventDefault();
+  flash(button);
+  press(button);
+});
+document.querySelectorAll("[data-btn]").forEach((el) =>
+  el.addEventListener("click", () => press(el.dataset.btn)));
+
+async function pollFrame() {
+  try {
+    const r = await fetch(`${base}/api/frame`);
+    const data = await r.json();
+    if (data.frame) frame.src = `data:image/png;base64,${data.frame}`;
+  } catch (e) { /* the offline banner comes from refreshState */ }
+  setTimeout(pollFrame, 100);
+}
+
+refreshState();
+setInterval(refreshState, 3000);
+pollFrame();
+</script>
+</body>
+</html>

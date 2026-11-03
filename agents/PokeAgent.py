@@ -23,6 +23,9 @@ import base64
 import json as json_module
 from collections import OrderedDict
 
+# Shared with server/app.py's /agent_pause endpoint (both run with cwd = repo root).
+AGENT_PAUSE_FLAG = os.path.join(".pokeagent_cache", "AGENT_PAUSED")
+
 import google.generativeai.types as genai_types
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
@@ -95,6 +98,136 @@ logger = logging.getLogger(__name__)
 # Orchestrator short-term action history: slice size and prompt header must stay in sync
 ACTION_HISTORY_WINDOW = 20
 
+# Context budget (local addition). Small local models run with a 32K context and
+# Ollama errors instead of truncating when an image prompt overflows, so every
+# variable-size block that is replayed into the prompt is capped.
+# - Each tool result and each reply kept in short-term memory (both are replayed
+#   for ACTION_HISTORY_WINDOW steps).
+HISTORY_TOOL_RESULT_MAX_CHARS = 1500
+HISTORY_RESPONSE_MAX_CHARS = 1500
+# - How each step is replayed in SHORT-TERM MEMORY. The old layout repeated the
+#   model's reasoning three times per entry (THINKING, the call's args, and the
+#   press_buttons result echoing it back): ~980 chars/entry, ~4.9K of a 13.5K-token
+#   prompt. Now: one header line (tiles, map, call, one-line outcome) plus the
+#   reasoning once, capped.
+HISTORY_WHY_MAX_CHARS = 200
+HISTORY_OUTCOME_MAX_CHARS = 300
+HISTORY_ARGS_MAX_CHARS = 120
+# Keys holding the model's reasoning; shown once as "why", never inside args.
+_REASONING_ARG_KEYS = ("reasoning", "reason")
+# - The one-shot "RESULTS FROM PREVIOUS STEP" block: a get_walkthrough part is up
+#   to ~8K chars and must stay readable the step after it is fetched.
+PREVIOUS_RESULT_MAX_CHARS = 8000
+PREVIOUS_RESULTS_TOTAL_MAX_CHARS = 10000
+# - Whole prompt: trim the oldest history once the estimate passes this. Leaves
+#   room for max_output_tokens (1024) inside a 32768-token context.
+PROMPT_TOKEN_BUDGET = int(os.environ.get("POKEAGENT_PROMPT_TOKEN_BUDGET", "28000"))
+# Measured on qwen3-vl:8b-instruct (Ollama usage vs. prompt length): ~3.2 chars
+# per token, ~5.3K tokens of system prompt + tool schemas, ~1,080 per screenshot.
+# Used only until the first real prompt_tokens value is known.
+CHARS_PER_TOKEN_ESTIMATE = 3.2
+FIXED_PROMPT_TOKENS_ESTIMATE = 5300
+IMAGE_TOKENS_ESTIMATE = 1080
+
+# After the wall-clock guard fires, wait this long for the abandoned call to
+# finish or fail on its own SDK timeout before deciding what to do. A new request
+# is never fired while the old one is still running: on a single-slot local
+# server (Ollama NUM_PARALLEL=1) it would just queue behind the ghost call.
+VLM_GUARD_GRACE_S = 60.0
+# Guard used when the backend does not declare its own worst-case call duration.
+# Must stay >= GeminiBackend's 600 s inner SDK deadline.
+VLM_GUARD_DEFAULT_S = 600.0
+
+# Sent once when the model replies with text but no tool call.
+TEXT_ONLY_REPROMPT = (
+    "\n\n### ACTION REQUIRED\n"
+    "Your previous reply contained no tool call, so nothing happened in the game. "
+    "Reply now by calling exactly one tool (usually press_buttons or navigate_to). "
+    "Do not answer with plain text."
+)
+
+
+def truncate_middle(text: Any, max_chars: int) -> Any:
+    """Shorten ``text`` to at most ``max_chars`` keeping the head and the tail.
+
+    Tool results usually carry the status/message at the start and the most
+    recent detail at the end, so both ends are kept around an explicit marker
+    that says how much was removed. Non-strings are returned unchanged.
+    """
+    if not isinstance(text, str) or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker_reserve = 48  # "\n... [N chars truncated] ...\n" for any realistic N
+    keep = max(0, max_chars - marker_reserve)
+    head = (keep * 2) // 3
+    tail = keep - head
+    omitted = len(text) - head - tail
+    marker = f"\n... [{omitted} chars truncated] ...\n"
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+# Server-side macros (server/app.py): each runs a whole menu chore and answers only
+# when its presses are done, like use_move.
+MACRO_TOOLS = ("heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item")
+# Tools that press buttons and answer after the presses ran.
+PRESSING_TOOLS = ("press_buttons", "navigate_to", "go_to_exit", "use_move") + MACRO_TOOLS
+
+
+def auto_dialogue_enabled() -> bool:
+    """POKEAGENT_AUTO_DIALOGUE (default on): let the server press A through plain text
+    boxes before each model call instead of spending a ~35 s decision per box."""
+    return os.environ.get("POKEAGENT_AUTO_DIALOGUE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _clip(text: Any, max_chars: int) -> str:
+    """One line, at most max_chars, marked when cut."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= max_chars else flat[: max_chars - 1].rstrip() + "…"
+
+
+def summarize_tool_result(result: Any) -> str:
+    """One-line outcome of a tool call for short-term memory (not the raw JSON)."""
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except (ValueError, TypeError):
+            return _clip(result, HISTORY_OUTCOME_MAX_CHARS) if result else ""
+    if not isinstance(data, dict):
+        return _clip(data, HISTORY_OUTCOME_MAX_CHARS)
+    if data.get("summary"):
+        text = data["summary"]
+    elif data.get("success") is False or data.get("error"):
+        text = f"ERROR: {data.get('error') or 'failed'}"
+    elif data.get("message"):
+        text = data["message"]
+    elif data.get("success") is True:
+        text = "ok"
+    else:
+        text = json.dumps(data, ensure_ascii=False, default=str)
+    return _clip(text, HISTORY_OUTCOME_MAX_CHARS)
+
+
+def format_tool_call_brief(name: str, args: Any) -> str:
+    """'press_buttons UP,UP', 'navigate_to (9,0)', 'go_to_exit "north"'; reasoning left out."""
+    args = args if isinstance(args, dict) else {}
+    if name == "press_buttons":
+        buttons = args.get("buttons", [])
+        if isinstance(buttons, (list, tuple)):
+            return f"press_buttons {','.join(str(b) for b in buttons)}"
+        return f"press_buttons {buttons}"
+    if name == "navigate_to":
+        return f"navigate_to ({args.get('x')},{args.get('y')})"
+    if name == "go_to_exit":
+        return f"go_to_exit \"{args.get('exit', '')}\""
+    if name == "use_move":
+        return f"use_move \"{args.get('move', '')}\""
+    if name == "buy_item":
+        return f"buy_item \"{args.get('item', '')}\" x{args.get('count', 1)}"
+    rest = {k: v for k, v in args.items() if k not in _REASONING_ARG_KEYS}
+    if not rest:
+        return name
+    return f"{name} {_clip(json.dumps(rest, ensure_ascii=False, default=str), HISTORY_ARGS_MAX_CHARS)}"
+
 
 class MCPToolAdapter:
     """Adapter to call MCP server tools via HTTP."""
@@ -112,6 +245,9 @@ class MCPToolAdapter:
                 "get_map_data": "/mcp/get_map_data",
                 "press_buttons": "/mcp/press_buttons",
                 "navigate_to": "/mcp/navigate_to",
+                "go_to_exit": "/mcp/go_to_exit",
+                "use_move": "/mcp/use_move",
+                **{name: f"/mcp/{name}" for name in MACRO_TOOLS},
                 "add_memory": "/mcp/add_memory",
                 "search_memory": "/mcp/search_memory",
                 "get_memory_summary": "/mcp/get_memory_summary",
@@ -148,6 +284,11 @@ class MCPToolAdapter:
             # Use longer timeout for initial MCP calls that may need to load data from disk
             # (memory, porymap data, etc.)
             timeout = 90  # Increased from 30 to handle startup initialization
+            if tool_name in PRESSING_TOOLS:
+                # These now answer after the presses ran (with the BLOCKED / arrival
+                # report); a long walk plus a door warp, or a macro reading a nurse's
+                # or clerk's text at slow text speed, can take over a minute.
+                timeout = 150
             response = requests.post(url, json=arguments, timeout=timeout)
             response.raise_for_status()
 
@@ -216,6 +357,13 @@ class PokeAgent:
         # Recent function call results to add to next step's context
         # Format: [(function_name, result_json_string, timestamp), ...]
         self.recent_function_results = []
+        # Text-only (no tool call) replies: how many happened, and how many were
+        # still text-only after the one re-prompt (wasted no-op steps).
+        self.text_only_reply_count = 0
+        self.text_only_noop_count = 0
+        # Last real prompt size reported by the backend, used to calibrate the
+        # token estimate for the next prompt: (prompt_tokens, prompt_chars).
+        self._last_prompt_usage: Optional[Tuple[int, int]] = None
         self._subagent_vlm_cache: OrderedDict[Tuple, Any] = OrderedDict()
         self._VLM_CACHE_CAP = 10
         self._local_subagent_vlm = None
@@ -1517,7 +1665,8 @@ class PokeAgent:
 
         entry = {
             "step": step_number if step_number is not None else self.step_count,
-            "llm_response": response_stripped,
+            # Replayed as THINKING for ACTION_HISTORY_WINDOW steps, so capped.
+            "llm_response": truncate_middle(response_stripped, HISTORY_RESPONSE_MAX_CHARS),
             "timestamp": time.time()
         }
 
@@ -1538,13 +1687,36 @@ class PokeAgent:
                 entry["action_details"] = f"{last_call.get('name', 'unknown')}(...)"
 
         if tool_calls:
-            entry["tool_calls"] = tool_calls
+            # Shallow-copy each call so capping the replayed result does not
+            # alter the caller's list (full results are logged elsewhere).
+            # The one-line outcome is taken from the full result: the capped copy of a
+            # large result is no longer valid JSON.
+            entry["tool_calls"] = [
+                {
+                    **tc,
+                    "result": truncate_middle(tc.get("result", ""), HISTORY_TOOL_RESULT_MAX_CHARS),
+                    "outcome": summarize_tool_result(tc.get("result", "")),
+                }
+                if isinstance(tc, dict) else tc
+                for tc in tool_calls
+            ]
+        elif action_details:
+            entry["action_details"] = action_details
 
         # Store explicit step start/end coordinates when available
         if start_coords:
             entry["start_coords"] = start_coords
         if end_coords:
             entry["end_coords"] = end_coords
+        end_location = getattr(self, "_last_end_location", None)
+        if end_location:
+            entry["end_location"] = end_location
+            self._last_end_location = None
+        # Text the harness advanced through before this step's model call.
+        dialogue = getattr(self, "_pending_dialogue_note", None)
+        if dialogue:
+            entry["dialogue"] = dialogue
+            self._pending_dialogue_note = None
 
         # Backward-compatible coordinate field (treated as end-of-step position)
         if player_coords:
@@ -1570,6 +1742,117 @@ class PokeAgent:
             for tool_call in entry.get("tool_calls", []):
                 total_chars += len(str(tool_call))
         return total_chars
+
+    def _vlm_guard_timeout_s(self) -> float:
+        """Wall-clock guard for one orchestrator VLM call.
+
+        Backends that declare ``call_deadline_s`` (worst case of their own SDK
+        timeout x attempts + backoff, e.g. OpenAIBackend) get a guard just above
+        it, so the guard only fires if the backend's own timeouts failed.
+        """
+        deadline = getattr(getattr(self.vlm, "backend", None), "call_deadline_s", None)
+        if isinstance(deadline, (int, float)) and deadline > 0:
+            return float(deadline) + 30.0
+        return VLM_GUARD_DEFAULT_S
+
+    def _call_vlm_with_guard(self, call_fn, max_attempts: int = 3):
+        """Run ``call_fn`` in a worker thread under a wall-clock guard.
+
+        On a guard timeout the old call is given VLM_GUARD_GRACE_S to finish; a
+        late success is used, a late failure allows another attempt, and a call
+        that is still running raises TimeoutError instead of stacking a second
+        request on top of it (the old code retried immediately, leaving the ghost
+        call occupying Ollama's only slot).
+        """
+        guard_s = self._vlm_guard_timeout_s()
+        call_start = time.time()
+        logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - guard {guard_s:.0f}s")
+        for attempt in range(1, max_attempts + 1):
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(call_fn)
+                try:
+                    response = future.result(timeout=guard_s)
+                except FutureTimeoutError:
+                    logger.error(
+                        f"   ⏱️ VLM call exceeded the {guard_s:.0f}s guard (attempt {attempt}/{max_attempts}); "
+                        f"waiting up to {VLM_GUARD_GRACE_S:.0f}s for it to finish before deciding"
+                    )
+                    try:
+                        response = future.result(timeout=VLM_GUARD_GRACE_S)
+                        logger.warning("   ⚠️ Timed-out VLM call finished during the grace period; using its result")
+                    except FutureTimeoutError:
+                        raise TimeoutError(
+                            f"VLM call still running after {time.time() - call_start:.0f}s; "
+                            f"not starting another request on top of it"
+                        )
+                    except Exception as e:
+                        if attempt >= max_attempts:
+                            raise
+                        logger.error(f"   ⚠️ Timed-out VLM call then failed ({type(e).__name__}); retrying")
+                        continue
+                logger.info(
+                    f"   ✅ VLM call completed in {time.time() - call_start:.1f}s (attempt {attempt}/{max_attempts})"
+                )
+                return response
+            finally:
+                executor.shutdown(wait=False)
+        raise TimeoutError(f"VLM call timed out after {max_attempts} attempts")
+
+    def _estimate_prompt_tokens(self, prompt: str, has_image: bool) -> int:
+        """Estimate total prompt tokens (system + tools + image + prompt text).
+
+        Once a real prompt_tokens value is known, extrapolate from it: the system
+        prompt, tool schemas and screenshot are the same every step, so only the
+        change in prompt text needs converting with the chars/token ratio.
+        """
+        if self._last_prompt_usage:
+            last_tokens, last_chars = self._last_prompt_usage
+            return int(last_tokens + (len(prompt) - last_chars) / CHARS_PER_TOKEN_ESTIMATE)
+        fixed = FIXED_PROMPT_TOKENS_ESTIMATE + (IMAGE_TOKENS_ESTIMATE if has_image else 0)
+        return int(fixed + len(prompt) / CHARS_PER_TOKEN_ESTIMATE)
+
+    def _record_prompt_usage(self, response, prompt: str) -> None:
+        """Log actual prompt tokens (when the backend reports usage) next to the
+        estimate, and keep it to calibrate the next estimate."""
+        usage = getattr(response, "usage_metadata", None)
+        actual = getattr(usage, "prompt_token_count", None) if usage is not None else None
+        if isinstance(actual, int) and actual > 0:
+            logger.info(
+                f"🧮 Prompt tokens: actual={actual:,} (budget {PROMPT_TOKEN_BUDGET:,}, prompt text {len(prompt):,} chars)"
+            )
+            self._last_prompt_usage = (actual, len(prompt))
+
+    def _fit_prompt_to_budget(self, build_prompt, has_image: bool) -> str:
+        """Build the prompt, dropping the oldest short-term history entries until
+        the estimated size fits PROMPT_TOKEN_BUDGET.
+
+        ``build_prompt`` must be re-callable; the one-shot previous-step results
+        are restored before each rebuild because formatting consumes them.
+        """
+        pending_results = list(self.recent_function_results)
+        prompt = build_prompt()
+        estimate = self._estimate_prompt_tokens(prompt, has_image)
+        dropped = 0
+        while estimate > PROMPT_TOKEN_BUDGET and self.conversation_history:
+            self.conversation_history.pop(0)
+            dropped += 1
+            self.recent_function_results = list(pending_results)
+            prompt = build_prompt()
+            estimate = self._estimate_prompt_tokens(prompt, has_image)
+        if dropped:
+            logger.warning(
+                f"✂️ Prompt over budget: dropped {dropped} oldest history entries "
+                f"(estimate now {estimate:,} tokens, budget {PROMPT_TOKEN_BUDGET:,})"
+            )
+        else:
+            logger.info(f"🧮 Prompt estimate: {estimate:,} tokens (budget {PROMPT_TOKEN_BUDGET:,})")
+        if estimate > PROMPT_TOKEN_BUDGET:
+            logger.error(
+                f"🚨 Prompt still estimated at {estimate:,} tokens with no history left; "
+                f"the model call may fail with a context-length error"
+            )
+        return prompt
 
     def _format_history_for_display(self) -> str:
         """Format conversation history for display."""
@@ -1610,14 +1893,17 @@ class PokeAgent:
                 if response.status_code == 200:
                     logger.info(f"✅ Game server is ready")
                     break
+                # /health answers 503 while the emulator is starting or stalled: wait, don't proceed
+                reason = f"HTTP {response.status_code}"
             except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    logger.info(f"⏳ Server not ready yet (attempt {attempt + 1}/{max_retries}), waiting {retry_delay}s...")
-                    logger.info(f"   (Server may be loading porymap data, memory, etc.)")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"Game server not running at {self.server_url} after {max_retries * retry_delay}s: {e}")
-                    return False
+                reason = str(e)
+            if attempt < max_retries - 1:
+                logger.info(f"⏳ Server not ready yet ({reason}; attempt {attempt + 1}/{max_retries}), waiting {retry_delay}s...")
+                logger.info(f"   (Server may be loading porymap data, memory, etc.)")
+                time.sleep(retry_delay)
+        else:
+            logger.error(f"Game server not ready at {self.server_url} after {max_retries * retry_delay}s: {reason}")
+            return False
 
         logger.info("✅ All prerequisites met")
         return True
@@ -1748,80 +2034,24 @@ class PokeAgent:
                         interaction_name=orchestrator_interaction_name,
                     )
 
-                    def call_vlm_with_image():
-                        return self.vlm.get_query(image, prompt, orchestrator_interaction_name)
+                    def call_vlm(prompt_text):
+                        return self.vlm.get_query(image, prompt_text, orchestrator_interaction_name)
 
                     logger.info(f"📡 Calling VLM API with image (prompt: {len(prompt)} chars, image: {len(screenshot_b64)} bytes)")
-                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 600s...")
-
-                    max_retries = 3
-                    retry_count = 0
-                    response = None
-
-                    while retry_count < max_retries:
-                        executor = ThreadPoolExecutor(max_workers=1)
-                        future = None
-                        try:
-                            future = executor.submit(call_vlm_with_image)
-                            # 600s outer wall must be >= the inner SDK deadline in
-                            # vlm_backends.GeminiBackend._call_generate_content (also 600s
-                            # for pro-preview thinking models). Anything smaller would
-                            # silently truncate slow calls and leak ghost worker threads
-                            # whose responses get logged but never used by the agent.
-                            response = future.result(timeout=600)
-                            vlm_duration = time.time() - vlm_call_start
-                            logger.info(f"   ✅ VLM call completed in {vlm_duration:.1f}s (attempt {retry_count + 1}/{max_retries})")
-                            break
-                        except FutureTimeoutError:
-                            retry_count += 1
-                            vlm_duration = time.time() - vlm_call_start
-                            logger.error(f"   ⏱️ VLM call TIMED OUT after {vlm_duration:.1f}s (attempt {retry_count}/{max_retries})")
-                            logger.error(f"   ⚠️  Abandoning timed-out thread and retrying immediately...")
-                            if retry_count >= max_retries:
-                                logger.error(f"   ❌ Max retries ({max_retries}) reached - giving up")
-                                raise TimeoutError(f"VLM call timed out after {max_retries} attempts")
-                        finally:
-                            executor.shutdown(wait=False)
+                    response = self._call_vlm_with_guard(lambda: call_vlm(prompt))
                 else:
                     claimed_step = self.runtime.claim_step(
                         owner="orchestrator",
                         interaction_name=orchestrator_interaction_name,
                     )
 
-                    def call_vlm_with_text():
-                        return self.vlm.get_text_query(prompt, orchestrator_interaction_name)
+                    def call_vlm(prompt_text):
+                        return self.vlm.get_text_query(prompt_text, orchestrator_interaction_name)
 
                     logger.info(f"📡 Calling VLM API with text only (prompt: {len(prompt)} chars)")
-                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 600s...")
+                    response = self._call_vlm_with_guard(lambda: call_vlm(prompt))
 
-                    max_retries = 3
-                    retry_count = 0
-                    response = None
-
-                    while retry_count < max_retries:
-                        executor = ThreadPoolExecutor(max_workers=1)
-                        future = None
-                        try:
-                            future = executor.submit(call_vlm_with_text)
-                            # 600s outer wall must be >= the inner SDK deadline in
-                            # vlm_backends.GeminiBackend._call_generate_content (also 600s
-                            # for pro-preview thinking models). Anything smaller would
-                            # silently truncate slow calls and leak ghost worker threads
-                            # whose responses get logged but never used by the agent.
-                            response = future.result(timeout=600)
-                            vlm_duration = time.time() - vlm_call_start
-                            logger.info(f"   ✅ VLM call completed in {vlm_duration:.1f}s (attempt {retry_count + 1}/{max_retries})")
-                            break
-                        except FutureTimeoutError:
-                            retry_count += 1
-                            vlm_duration = time.time() - vlm_call_start
-                            logger.error(f"   ⏱️ VLM call TIMED OUT after {vlm_duration:.1f}s (attempt {retry_count}/{max_retries})")
-                            logger.error(f"   ⚠️  Abandoning timed-out thread and retrying immediately...")
-                            if retry_count >= max_retries:
-                                logger.error(f"   ❌ Max retries ({max_retries}) reached - giving up")
-                                raise TimeoutError(f"VLM call timed out after {max_retries} attempts")
-                        finally:
-                            executor.shutdown(wait=False)
+                self._record_prompt_usage(response, prompt)
 
                 is_function_calling = hasattr(response, 'candidates')
                 
@@ -1900,6 +2130,42 @@ class PokeAgent:
                 response, tool_calls_made, tool_call_count, max_tool_calls
             )
 
+            if not function_calls_executed and not tool_calls_made and self.tools:
+                # Text-only reply: nothing happened in the game. Re-prompt once
+                # (same step, same screenshot) asking for a tool call instead of
+                # silently counting the step as done.
+                self.text_only_reply_count += 1
+                first_text = self._extract_text_from_response(response)
+                logger.warning(
+                    f"⚠️ Text-only reply without a tool call (#{self.text_only_reply_count} this run); "
+                    f"re-prompting once. Reply was: {first_text[:300]!r}"
+                )
+                try:
+                    retry_response = self._call_vlm_with_guard(lambda: call_vlm(prompt + TEXT_ONLY_REPROMPT))
+                    self._record_prompt_usage(retry_response, prompt + TEXT_ONLY_REPROMPT)
+                    if self._handle_vlm_function_calls(
+                        retry_response, tool_calls_made, tool_call_count, max_tool_calls
+                    ):
+                        function_calls_executed = True
+                        response = retry_response
+                        logger.info("✅ Re-prompt produced a tool call")
+                    else:
+                        self.text_only_noop_count += 1
+                        logger.warning(
+                            f"⚠️ Re-prompt still had no tool call; recording a NO-OP step "
+                            f"(#{self.text_only_noop_count} no-op steps this run)"
+                        )
+                except Exception as e:
+                    if tool_calls_made:
+                        # The re-prompt's tool already ran (e.g. buttons were pressed) before
+                        # something later failed: report what happened, not a NO-OP, or the
+                        # model reasons from a false account of the screen.
+                        function_calls_executed = True
+                        logger.error(f"❌ Re-prompt's tool call ran but then failed ({type(e).__name__}: {e})")
+                    else:
+                        self.text_only_noop_count += 1
+                        logger.error(f"❌ Re-prompt after text-only reply failed ({type(e).__name__}: {e}); recording a NO-OP step")
+
             if function_calls_executed:
                 duration = time.time() - start_time
 
@@ -1910,7 +2176,7 @@ class PokeAgent:
                     try:
                         if last_tool_call['name'] == "navigate_to" and "reason" in last_tool_call["args"]:
                             tool_reasoning = last_tool_call["args"]["reason"]
-                        elif last_tool_call['name'] == "press_buttons" and "reasoning" in last_tool_call["args"]:
+                        elif last_tool_call['name'] in PRESSING_TOOLS and "reasoning" in last_tool_call["args"]:
                             tool_reasoning = last_tool_call["args"]["reasoning"]
                     except Exception as e:
                         logger.debug(f"Could not extract tool reasoning: {e}")
@@ -1991,7 +2257,7 @@ class PokeAgent:
                 start_coords = pre_state.get("player_coords") if pre_state else None
                 end_coords = None
                 last_tool_name = last_tool_call.get("name")
-                if last_tool_name in {"press_buttons", "navigate_to"}:
+                if last_tool_name in PRESSING_TOOLS:
                     self._wait_for_actions_complete()
                 try:
                     final_state_result = self._execute_function_call_by_name("get_game_state", {})
@@ -2000,6 +2266,7 @@ class PokeAgent:
                         player_pos = final_state_data.get("player_position", {})
                         if player_pos and "x" in player_pos and "y" in player_pos:
                             end_coords = (player_pos.get("x"), player_pos.get("y"))
+                        self._last_end_location = final_state_data.get("location")
                 except Exception as e:
                     logger.debug(f"Could not capture post-step coordinates for history: {e}")
 
@@ -2076,13 +2343,24 @@ class PokeAgent:
 
                 duration = time.time() - start_time
 
-                logger.info(f"✅ Step completed in {duration:.2f}s")
+                logger.warning(f"⚠️ NO-OP step {active_step} completed in {duration:.2f}s: no tool call, no game action")
 
                 self.runtime.publish_history(
                     step_number=active_step,
                     prompt=prompt,
                     response=text_content,
                     tool_calls=[],
+                    action_details="NO-OP: replied with text only, no tool was called",
+                )
+                # Tell the model on the next step why nothing changed on screen.
+                self.runtime.publish_function_result(
+                    step_number=active_step,
+                    function_name="no_tool_call",
+                    result_json=json.dumps({
+                        "success": False,
+                        "error": "Your last reply had no tool call, so no action was taken. "
+                                 "Every step must call a tool (e.g. press_buttons).",
+                    }),
                 )
                 
                 # Log trajectory for this step (text response, no tool calls)
@@ -2137,6 +2415,36 @@ class PokeAgent:
             traceback.print_exc()
             return False, str(e)
 
+    def _auto_advance_dialogue(self) -> None:
+        """Ask the server to press A through a plain text box (never a YES/NO or menu).
+
+        What was read goes to the next prompt's RESULTS FROM PREVIOUS STEP and to this
+        step's short-term memory entry. Off with POKEAGENT_AUTO_DIALOGUE=0.
+        """
+        if not auto_dialogue_enabled():
+            return
+        try:
+            response = requests.post(f"{self.server_url}/mcp/auto_advance_dialogue", json={}, timeout=120)
+            data = response.json()
+        except Exception as e:
+            logger.warning(f"Auto-advance dialogue failed: {e}")
+            return
+        if data.get("presses"):
+            summary = data.get("summary") or "Dialogue auto-advanced."
+            logger.info(f"💬 {summary}")
+            shown = summary
+            if self.recent_function_results:
+                # The previous tool result was written before these presses. Seen live in
+                # Birch's lab: it said 'A text box is still open ...: press A to continue'
+                # above 'The text box closed.', the model believed the older line, and
+                # pressed A at May eleven times, restarting her line each time.
+                shown += (
+                    " This is the screen now: any 'text box is still open' or 'menu is open'"
+                    " note in the result above is from before these presses."
+                )
+            self._store_function_result_for_context("auto_dialogue", shown)
+            self._pending_dialogue_note = summary
+
     def _wait_for_actions_complete(self, timeout: int = 30) -> None:
         """Wait for all queued actions to complete before proceeding.
 
@@ -2152,6 +2460,12 @@ class PokeAgent:
             if response.status_code == 200:
                 status = response.json()
                 initial_queue_len = status.get("queue_length", 0)
+
+                # PRESSING_TOOLS (press_buttons, navigate_to, go_to_exit, use_move, the
+                # macros) answer only after their presses ran, so the queue is usually
+                # empty already: don't sleep.
+                if status.get("queue_empty"):
+                    return
 
                 # If only 1-3 actions, use fixed wait instead of polling
                 # Avoids timeout errors when server is under load
@@ -2276,18 +2590,23 @@ class PokeAgent:
 
         lines = ["\n" + "="*70, "📋 RESULTS FROM PREVIOUS STEP:", "="*70]
 
-        for entry in self.recent_function_results:
+        # Up to 3 results are kept; cap each one and the block as a whole so a
+        # couple of large results cannot push the prompt past the context.
+        # The newest result gets first claim on the block budget; every result
+        # keeps at least 500 chars so its status line stays visible.
+        entries = self.recent_function_results[-3:]
+        caps = [PREVIOUS_RESULT_MAX_CHARS] * len(entries)
+        remaining = PREVIOUS_RESULTS_TOTAL_MAX_CHARS
+        for i in range(len(entries) - 1, -1, -1):
+            caps[i] = max(500, min(PREVIOUS_RESULT_MAX_CHARS, remaining))
+            remaining -= min(len(str(entries[i]["result"])), caps[i])
+        for entry, cap in zip(entries, caps):
             func_name = entry["function_name"]
-            result = entry["result"]
+            result = str(entry["result"])
 
             lines.append(f"\n🔧 Function: {func_name}")
             lines.append(f"Result:")
-
-            # Truncate very long results
-            if len(result) > 10000:
-                lines.append(result[:10000] + "\n... (truncated)")
-            else:
-                lines.append(result)
+            lines.append(truncate_middle(result, cap))
             lines.append("")
 
         lines.append("="*70)
@@ -2472,7 +2791,7 @@ class PokeAgent:
                         if hint:
                             formatted += f"\n      Hint: {hint}"
 
-                formatted += "\n\n  💡 TIP: Complete these in any order. Use complete_direct_objective(category=\"battling\") for each."
+                formatted += "\n\n  💡 TIP: Complete these in any order. When you have actually done one, call complete_direct_objective(objective_id=\"<its ID>\")."
                 return formatted
 
             # Format recommended battling objectives if they exist
@@ -2588,7 +2907,7 @@ class PokeAgent:
 {direct_objective_status}
 
 ⚠️ **CRITICAL**: When you complete the objective, IMMEDIATELY call:
-   complete_direct_objective(category="<story/battling/dynamics>", reasoning="<explain why it's complete>")
+   complete_direct_objective(objective_id="<the ID shown for that objective>", reasoning="<explain why it's complete>")
 
 ### CURRENT GAME STATE:
 {state_text}
@@ -2719,7 +3038,7 @@ Step {step_count}"""
                                 formatted += f"\n      Target Location: {target_location}"
                             if hint:
                                 formatted += f"\n      Hint: {hint}"
-                    formatted += "\n\n  💡 TIP: Complete these in any order. Use complete_direct_objective(category=\"battling\") for each."
+                    formatted += "\n\n  💡 TIP: Complete these in any order. When you have actually done one, call complete_direct_objective(objective_id=\"<its ID>\")."
                     return formatted
 
                 recommended_text = ""
@@ -2950,7 +3269,12 @@ Step {step_count}"""
             logger.error(traceback.format_exc())
 
     def _format_action_history(self) -> str:
-        """Format short-term memory (last ACTION_HISTORY_WINDOW steps) with full tool details."""
+        """Short-term memory (last ACTION_HISTORY_WINDOW steps), one compact entry each:
+
+        [16] (12,2)->(13,2) ROUTE 101 | press_buttons RIGHT,UP,UP,UP | BLOCKED moving UP ...
+          why: <the call's reasoning, once, capped>
+          dialogue: <text the harness advanced through before this step>
+        """
         if not self.conversation_history:
             return "No previous actions recorded."
 
@@ -2959,7 +3283,6 @@ Step {step_count}"""
         history_lines = []
         for entry in recent_entries:
             step = entry.get("step", "?")
-            llm_response = entry.get("llm_response", "").strip()
             start_coords = entry.get("start_coords")
             end_coords = entry.get("end_coords")
             coords = entry.get("player_coords", None)
@@ -2971,26 +3294,37 @@ Step {step_count}"""
 
             start_str = f"({start_coords[0]},{start_coords[1]})" if start_coords else "(?)"
             end_str = f"({end_coords[0]},{end_coords[1]})" if end_coords else "(?)"
+            where = f"{start_str}->{end_str}"
+            if entry.get("end_location"):
+                where += f" {entry['end_location']}"
 
-            history_lines.append(f"[{step}] start={start_str} end={end_str}")
-            if llm_response:
-                history_lines.append(f"  THINKING: {llm_response}")
-
-            tool_calls = entry.get("tool_calls", [])
+            tool_calls = [tc for tc in entry.get("tool_calls", []) if isinstance(tc, dict)]
+            why = ""
             if tool_calls:
-                history_lines.append("  TOOLS:")
+                segments = []
                 for tool_call in tool_calls:
-                    name = tool_call.get("name", "unknown")
-                    args = tool_call.get("args", {})
-                    result = tool_call.get("result", "")
-                    history_lines.append(f"    - {name}")
-                    history_lines.append(f"      args: {json.dumps(args, ensure_ascii=False)}")
-                    if result != "":
-                        try:
-                            history_lines.append(f"      result: {json.dumps(result, ensure_ascii=False)}")
-                        except TypeError:
-                            history_lines.append(f"      result: {str(result)}")
-            history_lines.append("")
+                    args = tool_call.get("args", {}) or {}
+                    if not why and isinstance(args, dict):
+                        why = next((str(args[k]) for k in _REASONING_ARG_KEYS if args.get(k)), "")
+                    outcome = tool_call.get("outcome")
+                    if outcome is None:
+                        outcome = summarize_tool_result(tool_call.get("result", ""))
+                    call = format_tool_call_brief(tool_call.get("name", "unknown"), args)
+                    segments.append(f"{call} | {outcome}" if outcome else call)
+                history_lines.append(f"[{step}] {where} | {segments[-1]}")
+                for earlier in segments[:-1]:
+                    history_lines.append(f"  also: {earlier}")
+            else:
+                action = entry.get("action_details") or "no action"
+                history_lines.append(f"[{step}] {where} | ACTION: {_clip(action, HISTORY_OUTCOME_MAX_CHARS)}")
+            if not why:
+                # No reasoning argument: fall back to the model's own text, minus the
+                # "Action executed: ..." trailer run_step appends.
+                why = entry.get("llm_response", "").split("\n\nAction executed:")[0]
+            if why.strip():
+                history_lines.append(f"  why: {_clip(why, HISTORY_WHY_MAX_CHARS)}")
+            if entry.get("dialogue"):
+                history_lines.append(f"  dialogue: {_clip(entry['dialogue'], HISTORY_OUTCOME_MAX_CHARS)}")
 
         return "\n".join(history_lines).strip()
 
@@ -3030,6 +3364,14 @@ Step {step_count}"""
 
         try:
             while True:
+                # Local addition: a human can pause the agent (controller page →
+                # POST /agent_pause creates this flag file) to take over the game.
+                if os.path.exists(AGENT_PAUSE_FLAG):
+                    logger.info("⏸️  Agent paused by human; waiting...")
+                    while os.path.exists(AGENT_PAUSE_FLAG):
+                        time.sleep(1)
+                    logger.info("▶️  Agent resumed")
+
                 # Check max steps
                 if self.max_steps and self.step_count >= self.max_steps:
                     logger.info(f"\n✅ Reached max steps ({self.max_steps})")
@@ -3043,6 +3385,10 @@ Step {step_count}"""
                 logger.info(f"📚 History: {len(self.conversation_history)} turns ({context_size:,} chars)")
                 logger.info(f"{'='*70}")
 
+                # Plain text boxes only need A: let the server read through them
+                # before spending a model call on the screen.
+                self._auto_advance_dialogue()
+
                 # Fetch game state
                 game_state_result = self._execute_function_call_by_name("get_game_state", {})
 
@@ -3053,11 +3399,13 @@ Step {step_count}"""
                 except:
                     screenshot_b64 = None
 
-                # Build prompt (conditional based on optimization mode)
+                # Build prompt (conditional based on optimization mode), trimming
+                # the oldest history if it would not fit the context budget.
                 if self.optimization_enabled:
-                    prompt = self._build_optimized_prompt(game_state_result, next_step)
+                    build_prompt = lambda: self._build_optimized_prompt(game_state_result, next_step)
                 else:
-                    prompt = self._build_structured_prompt(game_state_result, next_step)
+                    build_prompt = lambda: self._build_structured_prompt(game_state_result, next_step)
+                prompt = self._fit_prompt_to_budget(build_prompt, has_image=bool(screenshot_b64))
 
                 # Run step
                 success, output = self.run_step(prompt, screenshot_b64=screenshot_b64, step_number=next_step)
@@ -3164,7 +3512,27 @@ Step {step_count}"""
                 function_call = part.function_call
                 tool_call_count += 1
                 logger.info(f"🔧 VLM wants to call: {function_call.name} ({tool_call_count}/{max_tool_calls})")
-                
+
+                parse_error = getattr(function_call, "parse_error", None)
+                if parse_error:
+                    # The backend could not parse the arguments. Running the tool
+                    # with {} would act on garbage; instead record the error as
+                    # this call's result so the model sees it next step.
+                    logger.error(f"❌ Malformed tool call for {function_call.name}: {parse_error}")
+                    error_result = json.dumps({
+                        "success": False,
+                        "error": f"Tool call to {function_call.name} was not executed: {parse_error}. "
+                                 f"Call it again with a valid JSON object matching the tool's parameters.",
+                    })
+                    tool_calls_made.append({
+                        "name": function_call.name,
+                        "args": {},
+                        "result": error_result,
+                        "error": parse_error,
+                    })
+                    function_calls_found = True
+                    continue
+
                 # Log detailed function call information
                 logger.info(f"   📋 Function call details:")
                 logger.info(f"      Name: {function_call.name}")

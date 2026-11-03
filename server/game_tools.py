@@ -9,6 +9,7 @@ tool calls to app.py over HTTP instead.
 
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -206,6 +207,136 @@ def get_game_state_direct(env, state_formatter, action_history=None, current_obs
         return {"success": False, "error": str(e)}
 
 
+def load_pathfinding_state(env) -> tuple:
+    """Comprehensive state with the current map's porymap data loaded for the pathfinder.
+
+    Returns (state, coord_offset, map_source). coord_offset is (offset_x, offset_y) when
+    an override map is used (local = ROM - offset), else None. map_source is
+    {"json_map", "porymap_map_name"} for Emerald (json_map carries connections and the
+    porymap warps), or {} when no porymap data could be loaded.
+    """
+    state = env.get_comprehensive_state()
+
+    location_name = state.get("player", {}).get("location", "Unknown")
+    coord_offset = None
+    map_source: dict = {}
+
+    # --- Red: load native map data as porymap-compatible format ---
+    _game_type = os.environ.get("GAME_TYPE", "emerald")
+    if _game_type == "red":
+        try:
+            if hasattr(env, "memory_reader") and hasattr(env.memory_reader, "map_reader"):
+                whole_map = env.memory_reader.map_reader.get_whole_map_data()
+                if whole_map and whole_map.get("grid"):
+                    if "map" not in state:
+                        state["map"] = {}
+                    state["map"]["porymap"] = {
+                        "grid": whole_map["grid"],
+                        "objects": whole_map.get("objects", []),
+                        "dimensions": whole_map.get("dimensions", {}),
+                        "warps": whole_map.get("warp_events", []),
+                        "raw_tiles": whole_map.get("raw_tiles"),
+                    }
+                    logger.info(
+                        f"Loaded Red map for pathfinding: '{whole_map.get('location')}', "
+                        f"grid: {whole_map['dimensions'].get('width')}x{whole_map['dimensions'].get('height')}"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to load Red map data for pathfinding: {e}")
+
+    elif location_name and location_name not in ("Unknown", "TITLE_SEQUENCE"):
+        try:
+            from utils.mapping.porymap_json_builder import build_json_map_for_llm
+            from utils.mapping.ascii_map_loader import get_effective_map_name, get_override
+            from utils.mapping.dynamic_map_overlay import apply_live_metatile_overlay
+            from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+            badge_count = 0
+            badges = state.get("game", {}).get("badges", [])
+            if isinstance(badges, list):
+                badge_count = len(badges)
+            elif isinstance(badges, int):
+                badge_count = badges
+
+            from pokemon_env.porymap_paths import get_porymap_root
+            pokeemerald_root = get_porymap_root()
+
+            if pokeemerald_root:
+                porymap_map_name = ROM_TO_PORYMAP_MAP.get(location_name)
+
+                if porymap_map_name:
+                    effective_map_name = get_effective_map_name(porymap_map_name, badge_count=badge_count)
+                    override = get_override(effective_map_name)
+                    if override and ("offset_x" in override or "offset_y" in override):
+                        offset_x = override.get("offset_x", 0)
+                        offset_y = override.get("offset_y", 0)
+                        coord_offset = (offset_x, offset_y)
+                        logger.info(
+                            f"Using override map '{effective_map_name}' with coord offset ({offset_x}, {offset_y})"
+                        )
+
+                    try:
+                        json_map = build_json_map_for_llm(
+                            porymap_map_name, pokeemerald_root, badge_count=badge_count
+                        )
+                    except ValueError as e:
+                        logger.error(
+                            f"Failed to build porymap for '{porymap_map_name}' due to corrupted tileset: {e}"
+                        )
+                        json_map = None
+
+                    if json_map and "grid" in json_map:
+                        raw_tiles = json_map.get("raw_tiles")
+                        player_pos = state.get("player", {}).get("position", {})
+                        px = player_pos.get("x", 0)
+                        py = player_pos.get("y", 0)
+
+                        if raw_tiles and 0 <= py < len(raw_tiles) and 0 <= px < len(raw_tiles[py]):
+                            player_tile = raw_tiles[py][px]
+                            if len(player_tile) >= 4:
+                                player_elevation = player_tile[3]
+                                logger.info(
+                                    f"Skipping elevation filtering - pathfinding handles elevation "
+                                    f"via E0 connectors (player at elevation {player_elevation})"
+                                )
+
+                        if "map" not in state:
+                            state["map"] = {}
+                        if "porymap" not in state["map"]:
+                            state["map"]["porymap"] = {}
+
+                        state["map"]["porymap"]["grid"] = json_map["grid"]
+                        state["map"]["porymap"]["objects"] = json_map.get("objects", [])
+                        state["map"]["porymap"]["dimensions"] = json_map.get("dimensions", {})
+                        state["map"]["porymap"]["warps"] = json_map.get("warps", [])
+                        state["map"]["porymap"]["raw_tiles"] = raw_tiles
+
+                        # For selected dynamic maps (e.g. Mauville Gym), replace static
+                        # porymap tiles with the current live map buffer state.
+                        apply_live_metatile_overlay(state, env, location_name)
+                        map_source = {"json_map": json_map, "porymap_map_name": porymap_map_name}
+
+                        grid_dims = (
+                            f"{len(json_map['grid'][0])}x{len(json_map['grid'])}"
+                            if json_map.get("grid")
+                            else "None"
+                        )
+                        logger.info(
+                            f"Loaded UNFILTERED porymap for pathfinding: '{porymap_map_name}' "
+                            f"(ROM: '{location_name}'), grid: {grid_dims}"
+                        )
+                    else:
+                        logger.warning(f"Porymap data for '{porymap_map_name}' missing grid data")
+                else:
+                    logger.warning(f"Could not map ROM location '{location_name}' to porymap map name")
+            else:
+                logger.warning("Could not find pokeemerald root for porymap data")
+        except Exception as porymap_err:
+            logger.warning(f"Failed to load porymap data for pathfinding: {porymap_err}")
+
+    return state, coord_offset, map_source
+
+
 def navigate_to_direct(
     env,
     x,
@@ -239,122 +370,7 @@ def navigate_to_direct(
             variance_level = nav_reason.lower()
             nav_reason = ""
 
-        state = env.get_comprehensive_state()
-
-        location_name = state.get("player", {}).get("location", "Unknown")
-        coord_offset = None
-
-        # --- Red: load native map data as porymap-compatible format ---
-        _game_type = os.environ.get("GAME_TYPE", "emerald")
-        if _game_type == "red":
-            try:
-                if hasattr(env, "memory_reader") and hasattr(env.memory_reader, "map_reader"):
-                    whole_map = env.memory_reader.map_reader.get_whole_map_data()
-                    if whole_map and whole_map.get("grid"):
-                        if "map" not in state:
-                            state["map"] = {}
-                        state["map"]["porymap"] = {
-                            "grid": whole_map["grid"],
-                            "objects": whole_map.get("objects", []),
-                            "dimensions": whole_map.get("dimensions", {}),
-                            "warps": whole_map.get("warp_events", []),
-                            "raw_tiles": whole_map.get("raw_tiles"),
-                        }
-                        logger.info(
-                            f"Loaded Red map for pathfinding: '{whole_map.get('location')}', "
-                            f"grid: {whole_map['dimensions'].get('width')}x{whole_map['dimensions'].get('height')}"
-                        )
-            except Exception as e:
-                logger.warning(f"Failed to load Red map data for pathfinding: {e}")
-
-        elif location_name and location_name not in ("Unknown", "TITLE_SEQUENCE"):
-            try:
-                from utils.mapping.porymap_json_builder import build_json_map_for_llm
-                from utils.mapping.ascii_map_loader import get_effective_map_name, get_override
-                from utils.mapping.dynamic_map_overlay import apply_live_metatile_overlay
-                from utils.state_formatter import ROM_TO_PORYMAP_MAP
-
-                badge_count = 0
-                badges = state.get("game", {}).get("badges", [])
-                if isinstance(badges, list):
-                    badge_count = len(badges)
-                elif isinstance(badges, int):
-                    badge_count = badges
-
-                from pokemon_env.porymap_paths import get_porymap_root
-                pokeemerald_root = get_porymap_root()
-
-                if pokeemerald_root:
-                    porymap_map_name = ROM_TO_PORYMAP_MAP.get(location_name)
-
-                    if porymap_map_name:
-                        effective_map_name = get_effective_map_name(porymap_map_name, badge_count=badge_count)
-                        override = get_override(effective_map_name)
-                        if override and ("offset_x" in override or "offset_y" in override):
-                            offset_x = override.get("offset_x", 0)
-                            offset_y = override.get("offset_y", 0)
-                            coord_offset = (offset_x, offset_y)
-                            logger.info(
-                                f"Using override map '{effective_map_name}' with coord offset ({offset_x}, {offset_y})"
-                            )
-
-                        try:
-                            json_map = build_json_map_for_llm(
-                                porymap_map_name, pokeemerald_root, badge_count=badge_count
-                            )
-                        except ValueError as e:
-                            logger.error(
-                                f"Failed to build porymap for '{porymap_map_name}' due to corrupted tileset: {e}"
-                            )
-                            json_map = None
-
-                        if json_map and "grid" in json_map:
-                            raw_tiles = json_map.get("raw_tiles")
-                            player_pos = state.get("player", {}).get("position", {})
-                            px = player_pos.get("x", 0)
-                            py = player_pos.get("y", 0)
-
-                            if raw_tiles and 0 <= py < len(raw_tiles) and 0 <= px < len(raw_tiles[py]):
-                                player_tile = raw_tiles[py][px]
-                                if len(player_tile) >= 4:
-                                    player_elevation = player_tile[3]
-                                    logger.info(
-                                        f"Skipping elevation filtering - pathfinding handles elevation "
-                                        f"via E0 connectors (player at elevation {player_elevation})"
-                                    )
-
-                            if "map" not in state:
-                                state["map"] = {}
-                            if "porymap" not in state["map"]:
-                                state["map"]["porymap"] = {}
-
-                            state["map"]["porymap"]["grid"] = json_map["grid"]
-                            state["map"]["porymap"]["objects"] = json_map.get("objects", [])
-                            state["map"]["porymap"]["dimensions"] = json_map.get("dimensions", {})
-                            state["map"]["porymap"]["warps"] = json_map.get("warps", [])
-                            state["map"]["porymap"]["raw_tiles"] = raw_tiles
-
-                            # For selected dynamic maps (e.g. Mauville Gym), replace static
-                            # porymap tiles with the current live map buffer state.
-                            apply_live_metatile_overlay(state, env, location_name)
-
-                            grid_dims = (
-                                f"{len(json_map['grid'][0])}x{len(json_map['grid'])}"
-                                if json_map.get("grid")
-                                else "None"
-                            )
-                            logger.info(
-                                f"Loaded UNFILTERED porymap for pathfinding: '{porymap_map_name}' "
-                                f"(ROM: '{location_name}'), grid: {grid_dims}"
-                            )
-                        else:
-                            logger.warning(f"Porymap data for '{porymap_map_name}' missing grid data")
-                    else:
-                        logger.warning(f"Could not map ROM location '{location_name}' to porymap map name")
-                else:
-                    logger.warning("Could not find pokeemerald root for porymap data")
-            except Exception as porymap_err:
-                logger.warning(f"Failed to load porymap data for pathfinding: {porymap_err}")
+        state, coord_offset, _map_source = load_pathfinding_state(env)
 
         player_pos = state.get("player", {}).get("position", {})
         rom_start_x = player_pos.get("x", 0)
@@ -377,19 +393,54 @@ def navigate_to_direct(
         goal = (goal_x, goal_y)
 
         goal_was_blocked = False
+        goal_cell = None
+        location_name = state.get("player", {}).get("location", "")
+        width = 0
         map_data = state.get("map", {}).get("porymap", {})
         if map_data.get("grid"):
             grid = map_data["grid"]
+            width = max(len(r) for r in grid) if grid else 0
+            # A target off the map used to be clamped silently to the edge; the model then
+            # thought it had left the map. Say so and point at the tool that does leave it.
+            if not (0 <= goal_y < len(grid) and 0 <= goal_x < len(grid[goal_y])):
+                side = "up" if goal_y < 0 else "down" if goal_y >= len(grid) else "left" if goal_x < 0 else "right"
+                hint = exit_hint(location_name, side) or "To leave the map use go_to_exit with an entry of the EXITS list."
+                return {
+                    "success": False,
+                    "error": f"({x}, {y}) is outside this map (x 0-{width - 1}, y 0-{len(grid) - 1}). {hint}",
+                    "target": f"({x}, {y})",
+                    "reason": "out_of_map",
+                }
             if 0 <= goal_y < len(grid):
                 row = grid[goal_y]
                 if isinstance(row, (list, str)) and 0 <= goal_x < len(row):
                     cell = row[goal_x] if isinstance(row, str) else row[goal_x]
-                    if cell == "#":
+                    goal_cell = cell
+                    if cell in ("#", "W", "X"):
                         goal_was_blocked = True
 
         buttons = pathfinder.find_path(
             start, goal, state, variance=variance_level, consider_npcs=consider_npcs, blocked_coords=blocked_coords
         )
+
+        if not buttons and goal_was_blocked and start != goal:
+            grid = map_data["grid"]
+            near_edge = (
+                "up" if goal_y <= 1 else "down" if goal_y >= len(grid) - 2
+                else "left" if goal_x <= 1 else "right" if goal_x >= width - 2 else ""
+            )
+            hint = exit_hint(location_name, near_edge) if near_edge else ""
+            return {
+                "success": False,
+                "error": (
+                    f"({x}, {y}) is not walkable (map tile '{goal_cell}') and you already stand on the "
+                    f"nearest reachable tile ({start_x}, {start_y}). Pick a walkable tile "
+                    "('.' or '~' on the ASCII map), or use go_to_exit to leave the map."
+                    + (f" {hint}" if hint else "")
+                ),
+                "target": f"({x}, {y})",
+                "reason": "unwalkable",
+            }
 
         if not buttons:
             error_msg = f"No path found from ({start_x}, {start_y}) to ({x}, {y})"
@@ -424,17 +475,36 @@ def navigate_to_direct(
 
         logger.info(f"🗺️ {nav_reason_text} - Buttons calculated: {len(buttons)}")
 
+        from server.field_control import end_of_path
+
+        # Same coordinate frame as the requested target (map-local on override maps).
+        local_end = end_of_path(start, buttons)
+        path_end = local_end
+
         result = {
             "success": True,
             "buttons": buttons,
             "target": f"({x}, {y})",
+            "path_end": list(path_end),
+            "coord_offset": list(coord_offset) if coord_offset else None,
             "path_length": len(buttons),
             "reason": nav_reason,
             "variance": variance_level or "none",
         }
 
-        if goal_was_blocked:
-            result["note"] = f"Requested target ({x}, {y}) was blocked; navigated to nearest reachable tile"
+        # The pathfinder quietly retargets an unwalkable goal and returns partial paths;
+        # without this note the model believes it reached the tile it asked for.
+        if local_end != goal:
+            if goal_was_blocked:
+                result["note"] = (
+                    f"({x}, {y}) is not walkable (map tile '{goal_cell}'); walking to the nearest "
+                    f"reachable tile ({path_end[0]}, {path_end[1]}) instead"
+                )
+            else:
+                result["note"] = (
+                    f"No complete path to ({x}, {y}); walking to ({path_end[0]}, {path_end[1]}), "
+                    "the closest point the pathfinder could reach"
+                )
 
         return result
     except Exception as e:
@@ -443,6 +513,520 @@ def navigate_to_direct(
 
         logger.error(traceback.format_exc())
         return {"success": False, "error": str(e)}
+
+
+def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None) -> list:
+    """Every exit the EXITS prompt line lists, with the coordinates go_to_exit needs.
+
+    Warp coordinates come from the map's raw warp_events: the json_map copies are
+    nudged toward the map edge for display (a house's exit mats at y=8 are listed at
+    y=9), and walking to the listed tile would miss the warp.
+    """
+    import json as _json
+
+    from pokemon_env.porymap_paths import get_porymap_root
+    from server.field_control import EDGE_NAMES
+    from utils.mapping.porymap_state import _readable_map_name, connection_open_span
+
+    exits = []
+    for conn in json_map.get("connections", []) or []:
+        direction = conn.get("direction")
+        if direction not in EDGE_NAMES:
+            continue  # dive/emerge connections are not walkable exits
+        name = _readable_map_name(conn.get("map", "?"))
+        exits.append({
+            "kind": "edge",
+            "direction": direction,
+            "open_span": connection_open_span(conn),
+            "name": name,
+            "label": f"{EDGE_NAMES[direction]} edge -> {name}",
+        })
+
+    raw_warps = []
+    root = get_porymap_root()
+    if root and porymap_map_name:
+        map_file = Path(root) / "data" / "maps" / porymap_map_name / "map.json"
+        try:
+            with open(map_file, encoding="utf-8") as fh:
+                raw_warps = _json.load(fh).get("warp_events", []) or []
+        except (OSError, ValueError) as e:
+            logger.warning(f"go_to_exit: could not read warps from {map_file}: {e}")
+    listed = json_map.get("warps", []) or []
+    ox, oy = coord_offset or (0, 0)
+    for i, warp in enumerate(raw_warps):
+        name = _readable_map_name(warp.get("dest_map", "?"))
+        shown = listed[i] if i < len(listed) else warp
+        listed_xy = (shown.get("x"), shown.get("y"))
+        exits.append({
+            "kind": "warp",
+            "x": int(warp.get("x", 0)) - ox,
+            "y": int(warp.get("y", 0)) - oy,
+            "listed_xy": listed_xy,
+            "name": name,
+            "label": f"door/warp at ({listed_xy[0]}, {listed_xy[1]}) -> {name}",
+        })
+    return exits
+
+
+@lru_cache(maxsize=256)
+def _map_connections(porymap_map_name: str) -> tuple:
+    """(direction, readable destination) pairs from a map's raw map.json."""
+    import json as _json
+
+    from pokemon_env.porymap_paths import get_porymap_root
+    from utils.mapping.porymap_state import _readable_map_name
+
+    root = get_porymap_root()
+    if not root or not porymap_map_name:
+        return ()
+    try:
+        with open(Path(root) / "data" / "maps" / porymap_map_name / "map.json", encoding="utf-8") as fh:
+            connections = _json.load(fh).get("connections") or []
+    except (OSError, ValueError):
+        return ()
+    return tuple((c.get("direction"), _readable_map_name(c.get("map", "?"))) for c in connections)
+
+
+def exit_hint(location_name: str, direction: str) -> str:
+    """'To go north to OLDALE TOWN use go_to_exit("north").' if this map has that edge exit.
+
+    direction is a button (UP/DOWN/LEFT/RIGHT) or a connection direction (up/down/...).
+    A small model that keeps walking into the trees along an edge needs the exact call,
+    not a reminder that an EXITS list exists.
+    """
+    from server.field_control import EDGE_NAMES
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    wanted = str(direction).lower()
+    for conn_dir, destination in _map_connections(ROM_TO_PORYMAP_MAP.get(location_name, "")):
+        if conn_dir == wanted:
+            edge = EDGE_NAMES[conn_dir]
+            return f'To go {edge} to {destination} use go_to_exit("{edge}").'
+    return ""
+
+
+def exit_hint_for_text(location_name: str, text: str, position: Optional[Tuple[int, int]] = None) -> str:
+    """The go_to_exit call for a neighbouring map that `text` names, or "".
+
+    position is the player's map tile, so a far route starts from the part of the map
+    the player can actually walk from.
+
+    Seen live: the model wrote "Destination: Route 101 (south edge)" in its navigate_to
+    reason and then walked one tile per call for minutes, wobbling against walls,
+    instead of calling go_to_exit. Names are compared without spaces and case, so
+    "Route101", "ROUTE 101" and "route 101" all match, and a town or city may be named
+    without the suffix ("Littleroot"). The model often copies the whole route
+    ("Oldale → Route 101 → Littleroot"), naming the maps on both sides, so every named
+    neighbour is listed rather than guessing which way it means to go. When no neighbour
+    is named but a map further away is, the hint gives the way there (_far_map_hint).
+    """
+    from server.field_control import EDGE_NAMES
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    squashed = "".join(str(text).upper().split())
+    if not squashed:
+        return ""
+
+    def names(name: str) -> bool:
+        # "ROUTE11" must not match inside "ROUTE110".
+        start = squashed.find(name)
+        while start != -1:
+            end = start + len(name)
+            if end == len(squashed) or not squashed[end].isdigit():
+                return True
+            start = squashed.find(name, start + 1)
+        return False
+
+    here = "".join(str(location_name).upper().split())
+
+    def named(destination: str) -> bool:
+        words = destination.split()
+        short = words[:-1] if len(words) > 1 and words[-1] in ("TOWN", "CITY") else words
+        # Seen live: inside RUSTBORO CITY GYM the model wrote "In Rustboro City Gym", and
+        # "Rustboro City" matched, so every result said go_to_exit("RUSTBORO CITY") and
+        # pulled it out of the gym it had to fight in. Inside a building, the town's name
+        # in the text is about where the player is, not where to go.
+        if any(here.startswith("".join(w)) for w in (words, short)):
+            return False
+        return names("".join(words)) or names("".join(short))
+
+    found = []
+    for conn_dir, destination in _map_connections(ROM_TO_PORYMAP_MAP.get(location_name, "")):
+        if conn_dir in EDGE_NAMES and named(destination):
+            found.append((destination, EDGE_NAMES[conn_dir]))
+    if not found:
+        return _far_map_hint(ROM_TO_PORYMAP_MAP.get(location_name, ""), named, position)
+    if len(found) == 1:
+        destination, edge = found[0]
+        return (
+            f'{destination} is off this map: go_to_exit("{edge}") walks to the opening '
+            f"and through it in one call."
+        )
+    calls = "; ".join(f'to {d} use go_to_exit("{e}")' for d, e in found)
+    return f"These maps are off this map: {calls}. Each call walks to the opening and through it."
+
+
+@lru_cache(maxsize=None)
+def _raw_map_json(map_dir: str) -> dict:
+    """A map's data/maps/<dir>/map.json, or {} when it can't be read."""
+    import json as _json
+
+    from pokemon_env.porymap_paths import get_porymap_root
+
+    root = get_porymap_root()
+    if not root or not map_dir:
+        return {}
+    try:
+        with open(Path(root) / "data" / "maps" / map_dir / "map.json", encoding="utf-8") as fh:
+            return _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+@lru_cache(maxsize=None)
+def _walk_areas(map_dir: str) -> dict:
+    """(x, y) -> area number for every tile a player can stand on, on foot.
+
+    Two tiles share an area when one can be walked to from the other without
+    surfing, cutting or crossing a wall. Ledges count as two-way, which is wrong only
+    for the rare route that needs to climb back up one.
+    """
+    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid
+
+    grid = _static_grid(map_dir) if map_dir else None
+    if not grid:
+        return {}
+    area: dict = {}
+    number = -1
+    for y0, row in enumerate(grid):
+        for x0, cell in enumerate(row):
+            if cell in _EDGE_BLOCKED or (x0, y0) in area:
+                continue
+            number += 1
+            stack = [(x0, y0)]
+            area[(x0, y0)] = number
+            while stack:
+                x, y = stack.pop()
+                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                    if (nx, ny) in area or ny < 0 or ny >= len(grid) or nx < 0 or nx >= len(grid[ny]):
+                        continue
+                    if grid[ny][nx] in _EDGE_BLOCKED:
+                        continue
+                    area[(nx, ny)] = number
+                    stack.append((nx, ny))
+    return area
+
+
+def _areas_at(map_dir: str, x: int, y: int) -> set:
+    """Areas of a tile, or of the tiles beside it when it is a door or warp in a wall."""
+    areas = _walk_areas(map_dir)
+    if (x, y) in areas:
+        return {areas[(x, y)]}
+    return {areas[c] for c in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)) if c in areas}
+
+
+@lru_cache(maxsize=None)
+def _walk_exits(map_dir: str) -> tuple:
+    """Ways off a map on foot: (from area, go_to_exit argument, to map dir, to area, to name).
+
+    Map edges count where the tiles on both sides are walkable (Oldale's south row is
+    open but Route 101 has trees under most of it). Doors and other warps count from
+    the area beside them to the area they arrive in.
+    """
+    from server.field_control import EDGE_NAMES
+    from utils.mapping.porymap_state import _map_dirs_by_const, _readable_map_name, _static_grid
+
+    raw = _raw_map_json(map_dir)
+    grid = _static_grid(map_dir) if raw else None
+    if not grid:
+        return ()
+    here = _walk_areas(map_dir)
+    height, width = len(grid), max(len(row) for row in grid)
+    out = set()
+    for conn in raw.get("connections") or []:
+        direction = conn.get("direction")
+        dest = _map_dirs_by_const().get(str(conn.get("map", "")))
+        dest_grid = _static_grid(dest) if dest else None
+        if direction not in EDGE_NAMES or not dest_grid:
+            continue
+        offset = int(conn.get("offset", 0) or 0)
+        dest_height, dest_width = len(dest_grid), max(len(row) for row in dest_grid)
+        if direction == "up":
+            pairs = [((x, 0), (x - offset, dest_height - 1)) for x in range(width)]
+        elif direction == "down":
+            pairs = [((x, height - 1), (x - offset, 0)) for x in range(width)]
+        elif direction == "left":
+            pairs = [((0, y), (dest_width - 1, y - offset)) for y in range(height)]
+        else:
+            pairs = [((width - 1, y), (0, y - offset)) for y in range(height)]
+        there = _walk_areas(dest)
+        name = _readable_map_name(conn["map"])
+        for mine, theirs in pairs:
+            if mine in here and theirs in there:
+                out.add((here[mine], EDGE_NAMES[direction], dest, there[theirs], name))
+    for warp in raw.get("warp_events") or []:
+        dest = _map_dirs_by_const().get(str(warp.get("dest_map", "")))
+        try:
+            dest_warp = (_raw_map_json(dest).get("warp_events") or [])[int(warp.get("dest_warp_id"))]
+        except (TypeError, ValueError, IndexError):
+            continue  # dynamic warps (dest set at run time) can't be followed statically
+        name = _readable_map_name(warp["dest_map"])
+        for mine in _areas_at(map_dir, int(warp.get("x", -1)), int(warp.get("y", -1))):
+            for theirs in _areas_at(dest, int(dest_warp.get("x", -1)), int(dest_warp.get("y", -1))):
+                out.add((mine, name, dest, theirs, name))
+    return tuple(sorted(out))
+
+
+def _squash_name(text: str) -> str:
+    """'Birch's Lab' -> 'BIRCHSLAB': letters and digits only, upper case."""
+    return "".join(ch for ch in str(text).upper() if ch.isalnum())
+
+
+_HALVES = {"NORTH": (1, -1), "SOUTH": (1, 1), "WEST": (0, -1), "EAST": (0, 1)}
+
+
+def arrived_at(location_name: str, position: Optional[Tuple[int, int]], target: str) -> bool:
+    """True when the player is on the map an objective's target_location names.
+
+    The target is matched against the end of the map name, so "Birch's Lab" matches
+    LITTLEROOT TOWN PROFESSOR BIRCHS LAB. A trailing North/South/East/West ("Route 104
+    South") names part of a route: it holds when the walkable area the player is in
+    lies clearly on that side of the map. Route 104's halves are separate areas joined
+    only through Petalburg Woods; a map that is one open area claims neither half.
+    """
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    words = str(target).split()
+    half = _HALVES.get(words[-1].upper()) if len(words) > 1 else None
+    wanted = _squash_name(" ".join(words[:-1] if half else words))
+    here = _squash_name(location_name)
+    if not wanted or not here.endswith(wanted):
+        return False
+    if half is None:
+        return True
+    map_dir = ROM_TO_PORYMAP_MAP.get(location_name, "")
+    areas = _walk_areas(map_dir)
+    mine = _areas_at(map_dir, *position) if position is not None else set()
+    if len(mine) != 1 or not areas:
+        return False
+    (number,) = mine
+    axis, sign = half
+    cells = [cell[axis] for cell, a in areas.items() if a == number]
+    span = max(cell[axis] for cell in areas) + 1
+    # Signed distance of the area's centre from the map's middle, as a share of the map.
+    lean = (sum(cells) / len(cells) - span / 2) / span
+    return lean * sign > 0.1
+
+
+_FAR_MAP_MAX_STEPS = 16
+
+
+def _far_map_hint(map_dir: str, matches, position: Optional[Tuple[int, int]] = None) -> str:
+    """The first go_to_exit toward a map `matches(readable map name)` accepts.
+
+    Seen live: in Littleroot the model wrote "travel west through Route 102 to Petalburg
+    City" and walked one tile at a time around Littleroot for twenty minutes. Route 102
+    is three maps away (north via Route 101 and Oldale). A breadth-first walk over the
+    maps' walkable areas, joined by edges and doors, finds the shortest way on foot, so
+    a route never runs across the sea or through the trees between two halves of a
+    route. Destinations whose ways start through the same exit share one line, naming
+    the farthest so the whole way is shown.
+    """
+    if not map_dir:
+        return ""
+    areas = _walk_areas(map_dir)
+    start = set()
+    if position is not None:
+        start = {(map_dir, a) for a in _areas_at(map_dir, *position)}
+    if not start:
+        start = {(map_dir, a) for a in set(areas.values())}
+    # parent[node] = (previous node, go_to_exit argument, name of the map entered)
+    parent = {node: None for node in start}
+    frontier, hits, seen_maps = list(start), [], {map_dir}
+    for _ in range(_FAR_MAP_MAX_STEPS):
+        nxt = []
+        for node in frontier:
+            for from_area, exit_arg, dest, dest_area, name in _walk_exits(node[0]):
+                target = (dest, dest_area)
+                if from_area != node[1] or target in parent:
+                    continue
+                parent[target] = (node, exit_arg, name)
+                nxt.append(target)
+                if dest in seen_maps:
+                    continue
+                seen_maps.add(dest)
+                if matches(name):
+                    hits.append(target)
+        frontier = nxt
+        if not frontier:
+            break
+    by_first_exit = {}
+    for hit in hits:
+        path, node = [], hit
+        while parent[node] is not None:
+            previous, exit_arg, name = parent[node]
+            path.append((exit_arg, name))
+            node = previous
+        path.reverse()
+        # Hits arrive nearest first, so a later one with the same first exit is farther.
+        by_first_exit[path[0][0]] = path
+    lines = []
+    for exit_arg, path in by_first_exit.items():
+        if len(path) == 1:
+            lines.append(f'{path[0][1]} is through an exit of this map: go_to_exit("{exit_arg}").')
+            continue
+        way = " → ".join(name for _, name in path)
+        lines.append(
+            f"{path[-1][1]} is not next to this map; the way on foot is {way}. "
+            f'go_to_exit("{exit_arg}") takes the first step.'
+        )
+    return " ".join(lines)
+
+
+def _place_words(text: str) -> List[str]:
+    """'Birch's Lab' -> ['BIRCHS', 'LAB']: upper-case words, letters and digits only."""
+    return [w for w in (_squash_name(word) for word in str(text).split()) if w]
+
+
+def way_to_place(location_name: str, position: Optional[Tuple[int, int]], target: str) -> str:
+    """How to walk to the map an objective's target_location names, or "" if unknown or here.
+
+    Seen live: objective "Defeat Gym trainers" with target "Rustboro Gym". The model went
+    in, came out, and then walked Rustboro one tile at a time "to find trainers"; the
+    door at (27,19) -> RUSTBORO CITY GYM was in its exit list. Targets name maps loosely,
+    so a map matches when every word of the target appears in its name in order ("Rustboro
+    Gym" ~ RUSTBORO CITY GYM, "Birch's Lab" ~ LITTLEROOT TOWN PROFESSOR BIRCHS LAB). A
+    trailing North/South/East/West is dropped here; arrived_at handles route halves.
+    """
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    if arrived_at(location_name, position, target):
+        return ""
+    words = _place_words(target)
+    if len(words) > 1 and words[-1] in _HALVES:
+        words = words[:-1]
+    if not words:
+        return ""
+
+    def matches(name: str) -> bool:
+        have, at = _place_words(name), 0
+        for word in words:
+            while at < len(have) and have[at] != word:
+                at += 1
+            if at == len(have):
+                return False
+            at += 1
+        return True
+
+    if matches(location_name):
+        return ""  # on the named map already (e.g. the other half of a route)
+    return _far_map_hint(ROM_TO_PORYMAP_MAP.get(location_name, ""), matches, position)
+
+
+def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16) -> dict:
+    """Resolve an EXITS entry to a walkable route (caller holds the emulator lock).
+
+    Edge exits: the reachable standable tile on that edge nearest the player, then one
+    more press off the edge. Warps: the warp tile itself (doors and stairs fire when
+    stepped on; the caller handles arrow warps that fire when walked off).
+    """
+    from server.field_control import (
+        EDGE_BUTTON,
+        edge_candidates,
+        end_of_path,
+        match_exits,
+    )
+
+    state, coord_offset, source = load_pathfinding_state(env)
+    location = state.get("player", {}).get("location", "Unknown")
+    json_map = source.get("json_map")
+    grid = state.get("map", {}).get("porymap", {}).get("grid")
+    if not json_map or not grid:
+        return {"success": False, "error": f"No map data for {location}; walk with press_buttons instead."}
+
+    exits = list_map_exits(json_map, source.get("porymap_map_name"), coord_offset)
+    if not exits:
+        return {"success": False, "error": f"{location} has no exits in the map data."}
+    matches = match_exits(exits, exit_query)
+    if not matches:
+        options = "; ".join(e["label"] for e in exits)
+        return {
+            "success": False,
+            "error": f"No exit of {location} matches '{exit_query}'. Exits here: {options}",
+        }
+
+    pos = state.get("player", {}).get("position", {})
+    ox, oy = coord_offset or (0, 0)
+    start = (int(pos.get("x", 0)) - ox, int(pos.get("y", 0)) - oy)
+
+    def route_to(tile):
+        if tile == start:
+            return []
+        buttons = pathfinder.find_path(start, tile, state, consider_npcs=True, allow_partial=False)
+        if buttons and end_of_path(start, buttons) == tile:
+            return buttons
+        return None
+
+    best = None
+    tried = []
+    for exit_entry in matches:
+        if exit_entry["kind"] == "edge":
+            candidates = edge_candidates(grid, exit_entry["direction"])
+            span = exit_entry.get("open_span")
+            if span is not None:
+                # Only where the neighbouring map is walkable too (span is in full-map coords).
+                along, shift = (0, ox) if exit_entry["direction"] in ("up", "down") else (1, oy)
+                candidates = [c for c in candidates if c[along] + shift in span]
+            candidates.sort(key=lambda c: abs(c[0] - start[0]) + abs(c[1] - start[1]))
+            if not candidates:
+                tried.append(f"{exit_entry['label']}: no standable tile on that edge (water or wall)")
+                continue
+            for tile in candidates[:max_edge_candidates]:
+                buttons = route_to(tile)
+                if buttons is not None:
+                    if best is None or len(buttons) < len(best["buttons"]):
+                        best = {
+                            "kind": "edge",
+                            "label": exit_entry["label"],
+                            "target": tile,
+                            "buttons": buttons,
+                            "final_button": EDGE_BUTTON[exit_entry["direction"]],
+                        }
+                    break
+            else:
+                tried.append(f"{exit_entry['label']}: no walkable path to that edge from {start}")
+        else:
+            tile = (exit_entry["x"], exit_entry["y"])
+            buttons = route_to(tile)
+            if buttons is None:
+                tried.append(f"{exit_entry['label']}: no walkable path to the warp at {tile}")
+                continue
+            if best is None or len(buttons) < len(best["buttons"]):
+                best = {
+                    "kind": "warp",
+                    "label": exit_entry["label"],
+                    "target": tile,
+                    "buttons": buttons,
+                    "final_button": None,
+                }
+
+    if best is None:
+        return {
+            "success": False,
+            "error": (
+                f"Cannot reach '{exit_query}' from ({pos.get('x')}, {pos.get('y')}) on {location}: "
+                + "; ".join(tried)
+                + ". A ledge (one-way), water (needs Surf) or a person may be in the way."
+            ),
+        }
+    best.update({
+        "success": True,
+        "grid": grid,
+        "raw_tiles": state.get("map", {}).get("porymap", {}).get("raw_tiles"),
+        "coord_offset": coord_offset,
+        "location": location,
+    })
+    return best
 
 
 # ---------------------------------------------------------------------------

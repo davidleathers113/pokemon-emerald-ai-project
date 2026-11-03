@@ -10,6 +10,7 @@ import time
 import argparse
 import subprocess
 import signal
+import threading
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -191,6 +192,51 @@ def start_server(args, run_id=None):
     except Exception as e:
         print(f"❌ Failed to start server: {e}")
         return None
+
+
+def watch_server(server_process, frame_server_process, stopping):
+    """Block until the game server exits; if nobody asked it to, end the whole run.
+
+    The agent runs on the main thread inside blocking LLM/HTTP calls and retries on
+    errors, so with a dead server it just loops and the container stays "Up". This
+    thread notices the exit and calls os._exit, because neither an exception nor a
+    signal can be relied on to get through the agent's own error handling; as PID 1
+    of the container, run.py exiting stops the container.
+    """
+    returncode = server_process.wait()
+    if stopping.is_set():
+        return  # run.py's own shutdown terminated it
+    if returncode == -signal.SIGINT:
+        # Ctrl+C in a terminal signals the whole process group, so the server can die
+        # before main's finally sets `stopping`. A crash never ends in SIGINT; let the
+        # main thread's KeyboardInterrupt handling shut down normally.
+        return
+
+    if returncode < 0:
+        try:
+            signal_name = signal.Signals(-returncode).name
+        except ValueError:
+            signal_name = "unknown signal"
+        how = f"was killed by signal {-returncode} ({signal_name})"
+        exit_code = 128 - returncode  # shell convention for death by signal
+    else:
+        how = f"exited with status {returncode}"
+        exit_code = returncode or 1  # even a clean exit is fatal: the agent cannot play without it
+
+    banner = "!" * 72
+    sys.stdout.flush()
+    print(
+        f"\n{banner}\n"
+        f"❌ GAME SERVER (PID {server_process.pid}) {how}.\n"
+        f"   Stopping the run (exit {exit_code}) instead of leaving the agent talking to a dead server.\n"
+        f"   The server's last output above says why.\n"
+        f"{banner}\n",
+        file=sys.stderr,
+        flush=True,
+    )
+    if frame_server_process and frame_server_process.poll() is None:
+        frame_server_process.kill()
+    os._exit(exit_code)
 
 
 def start_frame_server(port):
@@ -424,7 +470,8 @@ def main():
     
     server_process = None
     frame_server_process = None
-    
+    stopping_server = threading.Event()  # set before we stop the server ourselves
+
     try:
         # Restore from backup if requested
         if args.backup_state:
@@ -495,6 +542,13 @@ def main():
             
             # Also start frame server for web visualization
             frame_server_process = start_frame_server(args.port)
+
+            threading.Thread(
+                target=watch_server,
+                args=(server_process, frame_server_process, stopping_server),
+                name="server-watchdog",
+                daemon=True,
+            ).start()
         else:
             print("\n📋 Manual server mode - start server separately with:")
             print("   python -m server.app --port", args.port)
@@ -529,6 +583,7 @@ def main():
         
     finally:
         # Clean up server processes
+        stopping_server.set()
         if server_process:
             print("\n📡 Stopping server process...")
             server_process.terminate()

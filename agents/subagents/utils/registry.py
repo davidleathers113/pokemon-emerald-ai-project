@@ -28,6 +28,10 @@ def _puzzle_tool_name() -> str:
 
 BATTLE_ALLOWED_TOOL_NAMES = (
     "press_buttons",
+    "use_move",  # local: picks a move by name (the cursor starts on slot 1)
+    "run_from_battle",  # local macros: whole battle-menu chores checked from memory
+    "throw_ball",
+    "switch_pokemon",
     "process_memory",
     "process_skill",
     "add_memory",

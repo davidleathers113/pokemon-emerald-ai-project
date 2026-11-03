@@ -1,0 +1,430 @@
+"""Menu, battle-flow and shop state behind the closed-loop macros (heal, run, catch,
+switch, buy).
+
+Each macro presses a button only after reading from RAM that the game shows exactly
+the screen and cursor it expects, and stops with a reason when it doesn't. The state
+is recognized by *which task or callback is running* (gTasks[].func,
+gMain.callback2, gBattlerControllerFuncs) rather than by frame counts; the frame
+budgets in server/app.py only guard against waiting forever. This follows the method
+pokebot-gen3 documents for Emerald (same pret symbols); no code was copied from it.
+
+Addresses are pret/pokeemerald symbols for the US ROM ("l" = file-static in the
+.sym). Each one was checked on a savestate before use, by printing it next to a
+screenshot: the nurse's YES/NO (Rustboro and Oldale centers), the Rustboro Mart's
+BUY menu, quantity box and YES/NO, a wild battle's bag, ball throw, catch, nickname
+prompt and Pokédex page, the battle party menu's SHIFT, and a successful run.
+
+Function pointers are Thumb (bit 0 set), so they are compared with `| 1`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+from server.field_control import (
+    G_MAIN_CALLBACK2,
+    G_OBJECT_EVENTS,
+    MAP_OFFSET,
+    OBJECT_EVENT_COUNT,
+    OBJECT_EVENT_SIZE,
+    decode_field_message,
+)
+
+# ---------------------------------------------------------------------------
+# Generic engine state
+# ---------------------------------------------------------------------------
+
+# gTasks[16]: struct Task {func (4), isActive (1), prev, next, priority, s16 data[16]}.
+G_TASKS = 0x03005E00
+TASK_SIZE = 0x28
+TASK_COUNT = 16
+TASK_DATA = 8
+# menu.c's sMenu (struct Menu): +2 cursorPos, +3 minCursorPos, +4 maxCursorPos. Every
+# standard menu (YES/NO, BUY/SELL/QUIT, the bag's USE/CANCEL, the party SHIFT menu)
+# moves this cursor; the .sym has two other static sMenu symbols in other files.
+S_MENU = 0x0203CD90
+# sTextPrinters[32] (text.c), one per window: +0x1B active, +0x1C state. States 1
+# (RENDER_STATE_WAIT) and 2 (RENDER_STATE_CLEAR) wait for A/B with the down arrow.
+# Seen live: every battle message ("Wild SHROOMISH appeared!", "Got away safely!")
+# waits for A in a single-player battle, so the macros must press through them.
+S_TEXT_PRINTERS = 0x020201B0
+TEXT_PRINTER_SIZE = 0x24
+TEXT_PRINTER_COUNT = 32
+TEXT_WAITING_STATES = (1, 2)
+# gPaletteFade: bit 7 of the byte at +7 is set while a screen fade runs.
+G_PALETTE_FADE_FLAGS = 0x02037FD4 + 7
+PALETTE_FADE_ACTIVE = 0x80
+
+# Callbacks (gMain.callback2).
+CB2_BATTLE_MAIN = 0x08038420       # BattleMainCB2
+CB2_BAG_MENU_RUN = 0x081AAD5C      # CB2_BagMenuRun
+CB2_UPDATE_PARTY_MENU = 0x081B01B0  # CB2_UpdatePartyMenu
+CB2_BUY_MENU = 0x080DFD64          # CB2_BuyMenu
+
+# Task functions.
+TASK_FIELD_YES_NO = 0x080E215C          # Task_HandleYesNoInput (script yesnobox: the nurse)
+TASK_SHOP_MENU = 0x080DFB88             # Task_ShopMenu (BUY / SELL / SEE YA!)
+TASK_BUY_MENU = 0x080E0AC8              # Task_BuyMenu (the item list)
+TASK_BUY_HOW_MANY = 0x080E0D88          # Task_BuyHowManyDialogueHandleInput
+TASK_YES_NO_CALLBACK = 0x08121FDC       # Task_CallYesOrNoCallback (the purchase YES/NO)
+TASK_AFTER_PURCHASE = 0x080E100C        # Task_ReturnToItemListAfterItemPurchase (waits for A)
+TASK_BAG_INPUT = 0x081ABD28             # Task_BagMenu_HandleInput (the item list)
+TASK_BAG_CONTEXT = (0x081ACC04, 0x081ACC78)  # Task_ItemContext_SingleRow / _MultipleRows
+TASK_PARTY_CHOOSE = 0x081B1370          # Task_HandleChooseMonInput
+TASK_PARTY_SELECTION = 0x081B3730       # Task_HandleSelectionMenuInput (SHIFT/SUMMARY/CANCEL)
+TASK_CAUGHT_DEX_PAGE = 0x080C0088       # Task_HandleCaughtMonPageInput (waits for A/B)
+
+# ---------------------------------------------------------------------------
+# Battle
+# ---------------------------------------------------------------------------
+
+G_BATTLER_CONTROLLER_FUNCS = 0x03005D60
+CONTROLLER_CHOOSE_ACTION = 0x08057588   # HandleInputChooseAction
+CONTROLLER_YES_NO = 0x080599D4          # PlayerHandleYesNoInput ("Use next POKéMON?")
+G_BATTLE_OUTCOME = 0x0202433A
+B_OUTCOME_WON, B_OUTCOME_LOST, B_OUTCOME_DREW, B_OUTCOME_RAN = 1, 2, 3, 4
+B_OUTCOME_PLAYER_TELEPORTED, B_OUTCOME_MON_FLED, B_OUTCOME_CAUGHT = 5, 6, 7
+G_BATTLESCRIPT_CURR_INSTR = 0x02024214
+G_BATTLE_COMMUNICATION = 0x02024332     # [0] MULTIUSE_STATE, [1] CURSOR_POSITION
+G_DISPLAYED_STRING_BATTLE = 0x02022E2C
+DISPLAYED_STRING_BATTLE_SIZE = 300
+# The nickname YES/NO runs `trygivecaughtmonnick` inside this script; its state 1
+# waits for input, and B there means NO (Cmd_trygivecaughtmonnick).
+BS_TRY_NICKNAME_CAUGHT_MON = 0x082DBDA5
+BS_GIVE_CAUGHT_MON_END = 0x082DBDC2
+BS_ASK_TO_LEARN_MOVE = 0x082DABE3
+BS_ASK_TO_LEARN_MOVE_END = 0x082DAC10   # BattleScript_ForgotAndLearnedNewMove, the next label
+G_BATTLER_PARTY_INDEXES = 0x0202406E     # u16[4]
+G_BATTLE_MONS = 0x02024084
+BATTLE_MON_SIZE = 0x58
+BATTLE_MON_PERSONALITY = 0x48
+ACTION_FIGHT, ACTION_BAG, ACTION_POKEMON, ACTION_RUN = 0, 1, 2, 3
+
+# Party (gPlayerParty: 100-byte struct Pokemon; +0 personality, +0x56 hp, +0x58 maxHP).
+G_PLAYER_PARTY_COUNT = 0x020244E9
+G_PLAYER_PARTY = 0x020244EC
+PARTY_MON_SIZE = 100
+
+# Bag: gBagPosition +5 pocket, +8 cursorPosition[5], +0x12 scrollPosition[5].
+G_BAG_POSITION = 0x0203CE58
+BALLS_POCKET = 1
+POCKET_NAMES = ("ITEMS", "POKé BALLS", "TMs & HMs", "BERRIES", "KEY ITEMS")
+# gBagPockets[5]: struct BagPocket {struct ItemSlot *itemSlots; u8 capacity;}; the bag
+# lists itemSlots in order, so the cursor index names the item under it.
+G_BAG_POCKETS = 0x02039DD8
+BAG_POCKET_SIZE = 8
+G_SPECIAL_VAR_ITEM_ID = 0x0203CE7C       # set to the chosen item when its context menu opens
+
+# Party menu: gPartyMenu +9 slotId; sPartyMenuInternal (pointer) +0xF actions[8], +0x17 numActions.
+G_PARTY_MENU = 0x0203CEC8
+S_PARTY_MENU_INTERNAL = 0x0203CEC4
+MENU_SHIFT = 10  # party_menu.c MENU_SHIFT, the battle selection menu's first entry
+
+# Mart: sMartInfo +8 itemList (u16 *), +0xC itemCount; sShopData (pointer)
+# +0x2006 selectedRow, +0x2008 scrollOffset, +0x200A maxQuantity (what money and bag
+# room allow, set when the quantity box opens).
+S_MART_INFO = 0x02039F60
+S_SHOP_DATA = 0x02039F70
+SHOP_SELECTED_ROW = 0x2006
+SHOP_SCROLL_OFFSET = 0x2008
+SHOP_MAX_QUANTITY = 0x200A
+# The quantity task's data[1] is the count shown, data[5] the item being bought.
+BUY_TASK_COUNT = 1
+BUY_TASK_ITEM = 5
+# gItems[]: 0x2C-byte struct Item, price (u16) at +0x10.
+G_ITEMS = 0x085839A0
+ITEM_SIZE = 0x2C
+ITEM_PRICE = 0x10
+
+# Object event graphics (include/constants/event_objects.h).
+OBJ_EVENT_GFX_NURSE = 58
+OBJ_EVENT_GFX_MART_EMPLOYEE = 83
+# pokeemerald DIR_SOUTH=1, DIR_NORTH=2, DIR_WEST=3, DIR_EAST=4, as D-pad presses.
+FACING_BUTTON = {1: "DOWN", 2: "UP", 3: "LEFT", 4: "RIGHT"}
+OPPOSITE = {"DOWN": "UP", "UP": "DOWN", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+
+
+def _is(func: int, address: int) -> bool:
+    return (func | 1) == (address | 1)
+
+
+def active_task_funcs(reader) -> List[int]:
+    funcs = []
+    for i in range(TASK_COUNT):
+        base = G_TASKS + i * TASK_SIZE
+        if reader._read_u8(base + 4):
+            funcs.append(reader._read_u32(base))
+    return funcs
+
+
+def find_task(reader, func: int) -> Optional[int]:
+    """Index of the active task running `func`, or None."""
+    for i in range(TASK_COUNT):
+        base = G_TASKS + i * TASK_SIZE
+        if reader._read_u8(base + 4) and _is(reader._read_u32(base), func):
+            return i
+    return None
+
+
+def task_data(reader, task_id: int, index: int) -> int:
+    return reader._read_s16(G_TASKS + task_id * TASK_SIZE + TASK_DATA + 2 * index)
+
+
+def task_running(reader, *funcs: int) -> bool:
+    return any(find_task(reader, f) is not None for f in funcs)
+
+
+@dataclass
+class MenuCursor:
+    cursor: int
+    max_cursor: int
+
+
+def read_menu_cursor(reader) -> MenuCursor:
+    return MenuCursor(cursor=reader._read_u8(S_MENU + 2), max_cursor=reader._read_u8(S_MENU + 4))
+
+
+def text_waiting_for_button(reader) -> bool:
+    """True while any text printer shows the down arrow and waits for A/B."""
+    for i in range(TEXT_PRINTER_COUNT):
+        base = S_TEXT_PRINTERS + i * TEXT_PRINTER_SIZE
+        if reader._read_u8(base + 0x1B) and reader._read_u8(base + 0x1C) in TEXT_WAITING_STATES:
+            return True
+    return False
+
+
+def fade_active(reader) -> bool:
+    return bool(reader._read_u8(G_PALETTE_FADE_FLAGS) & PALETTE_FADE_ACTIVE)
+
+
+def callback2_is(reader, address: int) -> bool:
+    return _is(reader._read_u32(G_MAIN_CALLBACK2), address)
+
+
+# ---------------------------------------------------------------------------
+# Battle flow
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BattleFlow:
+    """One read of where a battle stands, for deciding the next press."""
+
+    in_battle: bool
+    in_battle_screen: bool       # gMain.callback2 is BattleMainCB2 (not the bag/party/dex)
+    choosing_action: bool        # FIGHT/BAG/POKEMON/RUN is waiting for the player
+    yes_no_prompt: bool          # the battle's own YES/NO ("Use next POKéMON?")
+    nickname_prompt: bool        # "Give a nickname to the captured X?" waiting for input
+    learn_move_prompt: bool
+    dex_page: bool               # the caught Pokémon's Pokédex page, waiting for A/B
+    text_waiting: bool
+    outcome: int
+    text: str
+    tasks: List[int] = field(default_factory=list)
+
+
+def read_battle_flow(reader) -> BattleFlow:
+    from server.field_control import G_MAIN_IN_BATTLE_BYTE, IN_BATTLE_MASK
+
+    controller = reader._read_u32(G_BATTLER_CONTROLLER_FUNCS)
+    instr = reader._read_u32(G_BATTLESCRIPT_CURR_INSTR)
+    multiuse_state = reader._read_u8(G_BATTLE_COMMUNICATION)
+    tasks = active_task_funcs(reader)
+    return BattleFlow(
+        in_battle=bool(reader._read_u8(G_MAIN_IN_BATTLE_BYTE) & IN_BATTLE_MASK),
+        in_battle_screen=callback2_is(reader, CB2_BATTLE_MAIN),
+        choosing_action=_is(controller, CONTROLLER_CHOOSE_ACTION),
+        yes_no_prompt=_is(controller, CONTROLLER_YES_NO),
+        nickname_prompt=BS_TRY_NICKNAME_CAUGHT_MON <= instr < BS_GIVE_CAUGHT_MON_END and multiuse_state == 1,
+        learn_move_prompt=BS_ASK_TO_LEARN_MOVE <= instr < BS_ASK_TO_LEARN_MOVE_END,
+        dex_page=any(_is(f, TASK_CAUGHT_DEX_PAGE) for f in tasks),
+        text_waiting=text_waiting_for_button(reader),
+        outcome=reader._read_u8(G_BATTLE_OUTCOME),
+        text=decode_field_message(reader._read_bytes(G_DISPLAYED_STRING_BATTLE, DISPLAYED_STRING_BATTLE_SIZE)),
+        tasks=tasks,
+    )
+
+
+def active_battler_personality(reader) -> int:
+    return reader._read_u32(G_BATTLE_MONS + BATTLE_MON_PERSONALITY)
+
+
+# ---------------------------------------------------------------------------
+# Party
+# ---------------------------------------------------------------------------
+
+
+def party_personalities(reader) -> List[int]:
+    count = min(reader._read_u8(G_PLAYER_PARTY_COUNT), 6)
+    return [reader._read_u32(G_PLAYER_PARTY + i * PARTY_MON_SIZE) for i in range(count)]
+
+
+def party_menu_slot(reader) -> int:
+    slot = reader._read_u8(G_PARTY_MENU + 9)
+    return slot - 256 if slot >= 128 else slot
+
+
+def party_menu_actions(reader) -> List[int]:
+    internal = reader._read_u32(S_PARTY_MENU_INTERNAL)
+    if not internal:
+        return []
+    count = min(reader._read_u8(internal + 0x17), 8)
+    return [reader._read_u8(internal + 0xF + i) for i in range(count)]
+
+
+# ---------------------------------------------------------------------------
+# Bag
+# ---------------------------------------------------------------------------
+
+
+def bag_pocket(reader) -> int:
+    return reader._read_u8(G_BAG_POSITION + 5)
+
+
+def bag_cursor_index(reader, pocket: int) -> int:
+    cursor = reader._read_u16(G_BAG_POSITION + 8 + 2 * pocket)
+    scroll = reader._read_u16(G_BAG_POSITION + 0x12 + 2 * pocket)
+    return cursor + scroll
+
+
+def bag_pocket_item_ids(reader, pocket: int) -> List[int]:
+    """Item ids in the order the bag lists them (up to the first empty slot)."""
+    base = G_BAG_POCKETS + pocket * BAG_POCKET_SIZE
+    slots, capacity = reader._read_u32(base), reader._read_u8(base + 4)
+    ids = []
+    for i in range(capacity):
+        item_id = reader._read_u16(slots + 4 * i)
+        if item_id == 0:
+            break
+        ids.append(item_id)
+    return ids
+
+
+def pocket_presses(current: int, goal: int) -> List[str]:
+    """LEFT/RIGHT switch bag pockets one at a time (no wrap-around is assumed)."""
+    if goal > current:
+        return ["RIGHT"] * (goal - current)
+    return ["LEFT"] * (current - goal)
+
+
+def list_presses(current: int, goal: int) -> List[str]:
+    if goal > current:
+        return ["DOWN"] * (goal - current)
+    return ["UP"] * (current - goal)
+
+
+# ---------------------------------------------------------------------------
+# Mart
+# ---------------------------------------------------------------------------
+
+
+def mart_stock(reader) -> List[int]:
+    items_ptr = reader._read_u32(S_MART_INFO + 8)
+    count = reader._read_u16(S_MART_INFO + 0xC)
+    if not items_ptr or count > 64:
+        return []
+    return [reader._read_u16(items_ptr + 2 * i) for i in range(count)]
+
+
+def shop_list_index(reader) -> Optional[int]:
+    data = reader._read_u32(S_SHOP_DATA)
+    if not data:
+        return None
+    return reader._read_u16(data + SHOP_SELECTED_ROW) + reader._read_u16(data + SHOP_SCROLL_OFFSET)
+
+
+def shop_max_quantity(reader) -> Optional[int]:
+    data = reader._read_u32(S_SHOP_DATA)
+    return reader._read_u8(data + SHOP_MAX_QUANTITY) if data else None
+
+
+def item_price(reader, item_id: int) -> int:
+    return reader._read_u16(G_ITEMS + item_id * ITEM_SIZE + ITEM_PRICE)
+
+
+def quantity_presses(current: int, goal: int) -> List[str]:
+    """Shop quantity box: RIGHT/LEFT change by 10, UP/DOWN by 1 (goal within 1..max)."""
+    diff = goal - current
+    tens, ones = divmod(abs(diff), 10)
+    if diff >= 0:
+        return ["RIGHT"] * tens + ["UP"] * ones
+    return ["LEFT"] * tens + ["DOWN"] * ones
+
+
+def name_key(text: str) -> str:
+    """'Poke Ball', 'POKé BALL' and 'poke_ball' all name the same item."""
+    return "".join(ch for ch in str(text).upper().replace("É", "E") if ch.isalnum())
+
+
+# ---------------------------------------------------------------------------
+# People behind counters
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CounterPerson:
+    x: int
+    y: int
+    facing: str               # the way they face (toward customers)
+    stand: Tuple[int, int]    # the tile to talk from
+    face: str                 # the way to face from there
+    across_counter: bool
+
+
+def find_objects_by_graphics(reader, graphics_id: int) -> List[Tuple[int, int, str]]:
+    """(x, y, facing button) of every visible object event using this sprite.
+
+    gObjectEvents holds the people loaded on the current map; graphicsId (+5) names
+    the sprite, which is the same for every Pokémon Center nurse and Mart clerk.
+    """
+    found = []
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        flags = reader._read_u32(base)
+        if not flags & 0x1 or flags & (1 << 13):  # inactive or invisible
+            continue
+        if reader._read_u8(base + 5) != graphics_id:
+            continue
+        x = reader._read_s16(base + 0x10) - MAP_OFFSET
+        y = reader._read_s16(base + 0x12) - MAP_OFFSET
+        facing = FACING_BUTTON.get(reader._read_u16(base + 0x18) & 0xF, "DOWN")
+        found.append((x, y, facing))
+    return found
+
+
+def talk_spot(x: int, y: int, facing: str, counter_between: bool) -> CounterPerson:
+    """Where to stand to talk to a person who faces customers, maybe across a counter.
+
+    Every Pokémon Center nurse and Mart clerk stands behind a counter facing the
+    customers' side; the game lets the player talk across a counter tile
+    (MB_COUNTER), so the talking tile is two steps out when a counter is in between.
+    """
+    from server.field_control import DIRECTION_DELTAS
+
+    dx, dy = DIRECTION_DELTAS[facing]
+    steps = 2 if counter_between else 1
+    return CounterPerson(
+        x=x,
+        y=y,
+        facing=facing,
+        stand=(x + dx * steps, y + dy * steps),
+        face=OPPOSITE[facing],
+        across_counter=counter_between,
+    )
+
+
+def battle_text(reader) -> str:
+    return decode_field_message(reader._read_bytes(G_DISPLAYED_STRING_BATTLE, DISPLAYED_STRING_BATTLE_SIZE))
+
+
+def outcome_name(outcome: int) -> str:
+    return {
+        B_OUTCOME_WON: "won",
+        B_OUTCOME_LOST: "lost",
+        B_OUTCOME_DREW: "drew",
+        B_OUTCOME_RAN: "ran away",
+        B_OUTCOME_PLAYER_TELEPORTED: "teleported away",
+        B_OUTCOME_MON_FLED: "the wild Pokémon fled",
+        B_OUTCOME_CAUGHT: "caught",
+    }.get(outcome, f"outcome {outcome}")

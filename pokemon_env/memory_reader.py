@@ -19,6 +19,7 @@ from pokemon_env.emerald_utils import (
     Pokemon_format,
     SAVE_BLOCK_1_OFFSETS,
     _item_id_to_name,
+    _species_id_to_name,
     parse_pokemon,
 )
 from .enums import MetatileBehavior, StatusCondition, Tileset, PokemonType, PokemonSpecies, Move, Badge, MapLocation
@@ -28,6 +29,25 @@ from utils import state_formatter
 from utils.mapping import map_stitcher_singleton
 
 logger = logging.getLogger(__name__)
+
+# gBattleTypeFlags bits (pret/pokeemerald include/constants/battle.h).
+BATTLE_TYPE_DOUBLE = 1 << 0
+BATTLE_TYPE_LINK = 1 << 1
+BATTLE_TYPE_TRAINER = 1 << 3
+BATTLE_TYPE_FIRST_BATTLE = 1 << 4
+BATTLE_TYPE_MULTI = 1 << 6
+BATTLE_TYPE_SAFARI = 1 << 7
+BATTLE_TYPE_FRONTIER = (1 << 8) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21)
+
+# Player battle controller callbacks in gBattlerControllerFuncs (Thumb, so address + 1):
+# while one of these runs the game is waiting for the player in that menu; anything else
+# means text or an animation is playing.
+BATTLE_MENU_BY_CONTROLLER = {
+    0x08057588 + 1: "action",  # HandleInputChooseAction
+    0x08057BFC + 1: "move",    # HandleInputChooseMove
+    0x08057824 + 1: "target",  # HandleInputChooseTarget
+    0x08058138 + 1: "reorder",  # HandleMoveSwitching (SELECT in the move menu; A swaps moves)
+}
 
 @dataclass
 class MemoryAddresses:
@@ -115,8 +135,25 @@ class MemoryAddresses:
     # Enhanced battle detection addresses (following pokeemerald guide)
     IN_BATTLE_BIT_ADDR = 0x030026F9  # gMain.inBattle location
     IN_BATTLE_BITMASK = 0x02
-    BATTLE_TYPE_FLAGS = 0x02022AAE  # gBattleTypeFlags for detailed battle characteristics
-    BATTLE_COMMUNICATION = 0x02024A60  # gBattleCommunication array for battle phases
+    # gBattleTypeFlags (u32). It was 0x02022AAE, which reads 0 even in Bug Catcher Lyle's
+    # trainer battle; the pret symbol map puts it here, and the battle fixture reads 0xC
+    # (IS_MASTER | TRAINER). The game does NOT clear it when a battle ends (overworld
+    # fixtures read 0x4 and 0xC), so it only means something while gMain.inBattle is set.
+    BATTLE_TYPE_FLAGS = 0x02022FEC
+    # gBattleCommunication (pret/pokeemerald symbol map). 0x02024A60 was read here before
+    # and gave nonsense such as "phase_49".
+    BATTLE_COMMUNICATION = 0x02024332
+
+    # Live battle structures (pret/pokeemerald US symbol map, checked on test_battle_wurmple.state)
+    BATTLE_MONS = 0x02024084             # gBattleMons: struct BattlePokemon[4]
+    BATTLE_MON_SIZE = 0x58
+    BATTLERS_COUNT = 0x0202406C          # gBattlersCount (u8)
+    ACTION_SELECTION_CURSOR = 0x020244AC  # gActionSelectionCursor[4]: 0 FIGHT 1 BAG 2 POKEMON 3 RUN
+    MOVE_SELECTION_CURSOR = 0x020244B0   # gMoveSelectionCursor[4]: 0 TL 1 TR 2 BL 3 BR
+    BATTLER_CONTROLLER_FUNCS = 0x03005D60  # gBattlerControllerFuncs[4] (Thumb pointers)
+    MAIN_FRAME_COUNTER = 0x030022E4      # gMain.vblankCounter2: +1 per frame
+    ROM_BATTLE_MOVES = 0x0831C898        # gBattleMoves: 12-byte struct BattleMove
+    ROM_TYPE_EFFECTIVENESS = 0x0831ACE8  # gTypeEffectiveness: (atk, def, x10) triplets
     
     # Enhanced dialogue/script detection addresses (following pokeemerald guide)
     SCRIPT_CONTEXT_GLOBAL = 0x02037A58    # sGlobalScriptContext
@@ -527,26 +564,17 @@ class PokemonEmeraldReader:
         return data[offset] | (data[offset + 1] << 8)
 
     def is_in_battle(self) -> bool:
-        """Check if player is in battle using enhanced pokeemerald-based detection"""
+        """True while gMain.inBattle is set.
+
+        gBattleTypeFlags is deliberately not consulted: the game leaves it set after a
+        battle (test_after_woods_grunt.state and test_movement_route101.state, both on
+        the overworld, read 0x4), so "flags != 0" would keep every walk in battle mode.
+        The old fallback only looked harmless because it read a wrong address that was
+        always 0.
+        """
         try:
-            # Primary check: gMain.inBattle flag (most reliable indicator)
             main_in_battle = self._read_u8(self.addresses.IN_BATTLE_BIT_ADDR)
-            primary_battle_flag = (main_in_battle & self.addresses.IN_BATTLE_BITMASK) != 0
-            
-            if primary_battle_flag:
-                return True
-                
-            # Secondary validation: check battle type flags for additional battle states
-            try:
-                battle_type_flags = self._read_u16(self.addresses.BATTLE_TYPE_FLAGS)
-                # Any non-zero battle type flags indicate some form of battle
-                if battle_type_flags != 0:
-                    logger.debug(f"Battle detected via type flags: 0x{battle_type_flags:04X}")
-                    return True
-            except Exception:
-                pass  # Battle type flags check is supplementary
-                
-            return False
+            return (main_in_battle & self.addresses.IN_BATTLE_BITMASK) != 0
         except Exception as e:
             logger.warning(f"Failed to read battle state: {e}")
             return False
@@ -797,9 +825,8 @@ class PokemonEmeraldReader:
     def _check_area_transition(self):
         """Check if player has moved to a new area and invalidate cache if needed"""
         try:
-            current_map_bank = self._read_u8(self.addresses.MAP_BANK)
-            current_map_number = self._read_u8(self.addresses.MAP_NUMBER)
-            
+            current_map_bank, current_map_number = self._read_current_map()
+
             # Check if this is the first time or if area has changed
             if (self._last_map_bank is None or self._last_map_number is None or
                 current_map_bank != self._last_map_bank or 
@@ -1078,9 +1105,8 @@ class PokemonEmeraldReader:
             # Check if we have invalid map coordinates that indicate title sequence
             # Note: We removed the check for Petalburg City (0,0) as it's a valid location
             # Instead, check for truly invalid map values
-            map_bank = self._read_u8(self.addresses.MAP_BANK)
-            map_num = self._read_u8(self.addresses.MAP_NUMBER)
-            
+            map_bank, map_num = self._read_current_map()
+
             # Map banks above 0x2A are invalid in Pokemon Emerald
             if map_bank > 0x2A:
                 return True
@@ -1113,11 +1139,25 @@ class PokemonEmeraldReader:
             # If we can't read memory properly, assume title sequence
             return True
 
+    def _read_current_map(self) -> Tuple[int, int]:
+        """(map group, map number) of the map the player is on.
+
+        MAP_BANK/MAP_NUMBER (0x020322E4) is sWarpDestination in pokeemerald, the target
+        of the *last warp*. It only matches the current map once a warp has happened;
+        right after CONTINUE from an in-game save it is still 0,0 (Petalburg City).
+        gSaveBlock1Ptr->location (SaveBlock1 offset 4: s8 mapGroup, s8 mapNum) is the
+        authoritative current map. Fall back to the warp destination only while the
+        save block pointer isn't set up yet (boot/title screen).
+        """
+        save_block1 = self._read_u32(self.addresses.SAVESTATE_OBJECT_POINTER)
+        if 0x02000000 <= save_block1 < 0x02040000:
+            return self._read_u8(save_block1 + 4), self._read_u8(save_block1 + 5)
+        return self._read_u8(self.addresses.MAP_BANK), self._read_u8(self.addresses.MAP_NUMBER)
+
     def read_location(self) -> str:
         """Read current location"""
         try:
-            map_bank = self._read_u8(self.addresses.MAP_BANK)
-            map_num = self._read_u8(self.addresses.MAP_NUMBER)
+            map_bank, map_num = self._read_current_map()
             map_id = (map_bank << 8) | map_num
             
             # Log the raw map values for debugging location issues
@@ -1335,38 +1375,222 @@ class PokemonEmeraldReader:
             logger.warning(f"Failed to determine game state: {e}")
             return "unknown"
 
+    def _rom_battle_move(self, move_id: int) -> Dict[str, int]:
+        """gBattleMoves[move_id] from ROM (cached: ROM never changes)."""
+        cache = getattr(self, "_battle_move_cache", None)
+        if cache is None:
+            cache = self._battle_move_cache = {}
+        if move_id not in cache:
+            raw = bytes(self.read_memory(self.addresses.ROM_BATTLE_MOVES + 12 * move_id, 12))
+            cache[move_id] = {"effect": raw[0], "power": raw[1], "type": raw[2], "accuracy": raw[3], "pp": raw[4]}
+        return cache[move_id]
+
+    def _type_chart(self) -> List[Tuple[int, int, int]]:
+        """gTypeEffectiveness from ROM as (attack type, defending type, multiplier x10).
+
+        The 0xFE separator only marks where the ghost immunities Foresight can lift
+        begin; those entries still apply normally, so they are kept.
+        """
+        chart = getattr(self, "_type_chart_cache", None)
+        if chart is None:
+            chart = []
+            address = self.addresses.ROM_TYPE_EFFECTIVENESS
+            for _ in range(256):  # bounded: the US ROM has 110 entries plus the separator
+                attack, defend, multiplier = bytes(self.read_memory(address, 3))
+                address += 3
+                if attack == 0xFF:
+                    break
+                if attack != 0xFE:
+                    chart.append((attack, defend, multiplier))
+            self._type_chart_cache = chart
+        return chart
+
+    def type_effectiveness(self, attack_type: int, defend_types: List[int]) -> float:
+        """Damage multiplier of a move type against a Pokémon's types (a single type counts once)."""
+        result = 1.0
+        for defend in dict.fromkeys(defend_types):
+            for attack, chart_defend, multiplier in self._type_chart():
+                if attack == attack_type and chart_defend == defend:
+                    result *= multiplier / 10
+        return result
+
+    def _battle_species_name(self, species_id: int) -> str:
+        name = _species_id_to_name(species_id)
+        if not name.startswith("Species_"):
+            return name
+        # The local table only lists Hoenn species; route Pokémon such as Zubat or
+        # Marill are named from the ROM's own gSpeciesNames (11-byte entries).
+        raw = bytes(self.read_memory(ADDRESSES["gSpeciesNames"] + 11 * species_id, 11))
+        return EmeraldCharmap().decode(raw).title() or name
+
+    def _read_battle_mon(self, battler: int) -> Optional[Dict[str, Any]]:
+        """gBattleMons[battler] (struct BattlePokemon), or None if the slot is empty."""
+        base = self.addresses.BATTLE_MONS + battler * self.addresses.BATTLE_MON_SIZE
+        species_id = self._read_u16(base)
+        if species_id == 0:
+            return None
+        type_ids = [self._read_u8(base + 0x21), self._read_u8(base + 0x22)]
+        status1 = self._read_u32(base + 0x4C)
+        # STATUS1_* (pret include/constants/battle.h); bit 7 is bad poison.
+        if status1 & 0x07:
+            status = "SLEEP"
+        elif status1 & 0x88:
+            status = "POISON"
+        elif status1 & 0x10:
+            status = "BURN"
+        elif status1 & 0x20:
+            status = "FREEZE"
+        elif status1 & 0x40:
+            status = "PARALYSIS"
+        else:
+            status = "OK"
+        type_names = []
+        for type_id in dict.fromkeys(type_ids):
+            try:
+                type_names.append(PokemonType(type_id).name)
+            except ValueError:
+                type_names.append(f"TYPE{type_id}")
+        return {
+            "battler": battler,
+            "species_id": species_id,
+            "name": self._battle_species_name(species_id),
+            "level": self._read_u8(base + 0x2A),
+            "hp": self._read_u16(base + 0x28),
+            "max_hp": self._read_u16(base + 0x2C),
+            "type_ids": type_ids,
+            "types": type_names,
+            "status": status,
+            "move_ids": [self._read_u16(base + 0x0C + 2 * i) for i in range(4)],
+            "pp": list(bytes(self.read_memory(base + 0x24, 4))),
+        }
+
+    def read_battle_view(self) -> Optional[Dict[str, Any]]:
+        """What the player needs to pick a move, read from the live battle structs.
+
+        Seen live: the prompt only said "Opponent detection disabled", and every battle
+        opens with the move cursor on slot 1, so the model mashed A and a Lv11 Torchic
+        used SCRATCH on a Lv5 Poochyena for 12+ minutes instead of EMBER.
+
+        Returns None outside a battle. "menu" is the player's open battle menu:
+        "action" (FIGHT/BAG/POKEMON/RUN), "move", "target" (doubles), "reorder" (SELECT
+        in the move menu) or "busy" (text or an animation is playing).
+        """
+        if not self.is_in_battle():
+            return None
+        flags = self._read_u32(self.addresses.BATTLE_TYPE_FLAGS)
+        double = bool(flags & BATTLE_TYPE_DOUBLE) or self._read_u8(self.addresses.BATTLERS_COUNT) >= 4
+        player_battlers, opponent_battlers = ([0, 2], [1, 3]) if double else ([0], [1])
+
+        # Whichever player battler's controller is waiting for input is the one choosing.
+        menu, chooser = "busy", 0
+        for battler in player_battlers:
+            func = self._read_u32(self.addresses.BATTLER_CONTROLLER_FUNCS + 4 * battler)
+            if func in BATTLE_MENU_BY_CONTROLLER:
+                menu, chooser = BATTLE_MENU_BY_CONTROLLER[func], battler
+                break
+
+        player = self._read_battle_mon(chooser)
+        opponents = [mon for mon in (self._read_battle_mon(b) for b in opponent_battlers) if mon]
+        target = next((mon for mon in opponents if mon["hp"] > 0), opponents[0] if opponents else None)
+
+        moves = []
+        if player:
+            for index, move_id in enumerate(player["move_ids"]):
+                if move_id == 0:
+                    continue
+                data = self._rom_battle_move(move_id)
+                try:
+                    name = Move(move_id).name.replace("_", " ")
+                except ValueError:
+                    name = f"MOVE {move_id}"
+                try:
+                    type_name = PokemonType(data["type"]).name
+                except ValueError:
+                    type_name = f"TYPE{data['type']}"
+                effectiveness = self.type_effectiveness(data["type"], target["type_ids"]) if target else 1.0
+                stab = data["type"] in player["type_ids"]
+                pp = player["pp"][index]
+                # Accuracy 0 means the move never misses (Swift, Aerial Ace...).
+                accuracy = data["accuracy"] or 100
+                expected = 0.0
+                if data["power"] and pp:
+                    expected = data["power"] * effectiveness * (1.5 if stab else 1.0) * accuracy / 100
+                moves.append({
+                    "slot": index + 1,
+                    "id": move_id,
+                    "name": name,
+                    "type": type_name,
+                    "power": data["power"],
+                    "accuracy": data["accuracy"],
+                    "pp": pp,
+                    "effectiveness": effectiveness,
+                    "stab": stab,
+                    "expected": round(expected, 1),
+                })
+        scored = [m for m in moves if m["expected"] > 0]
+        best = max(scored, key=lambda m: (m["expected"], -m["slot"])) if scored else None
+
+        action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3
+        return {
+            "battle_type": "trainer" if flags & BATTLE_TYPE_TRAINER else "wild",
+            "is_trainer": bool(flags & BATTLE_TYPE_TRAINER),
+            "is_double": double,
+            "menu": menu,
+            "battler": chooser,
+            "action_cursor": action_cursor,
+            "action_cursor_name": ("FIGHT", "BAG", "POKEMON", "RUN")[action_cursor],
+            "move_cursor_slot": (self._read_u8(self.addresses.MOVE_SELECTION_CURSOR + chooser) & 3) + 1,
+            "player": player,
+            "opponents": opponents,
+            "target": target,
+            "moves": moves,
+            "best_move": best,
+        }
+
+    @staticmethod
+    def _legacy_battle_mon(mon: Dict[str, Any], moves: List[str], move_pp: List[int]) -> Dict[str, Any]:
+        """A battle-view mon in the player_pokemon/opponent_pokemon shape older code reads."""
+        max_hp = mon["max_hp"]
+        return {
+            "species": mon["name"],
+            "nickname": mon["name"],
+            "level": mon["level"],
+            "current_hp": mon["hp"],
+            "max_hp": max_hp,
+            "hp_percentage": round(mon["hp"] / max_hp * 100, 1) if max_hp > 0 else 0,
+            "status": "Normal" if mon["status"] == "OK" else mon["status"],
+            "types": mon["types"],
+            "moves": moves,
+            "move_pp": move_pp,
+            "is_fainted": mon["hp"] == 0,
+        }
+
     def read_battle_details(self) -> Dict[str, Any]:
         """Read enhanced battle-specific information following pokeemerald guide"""
         try:
             if not self.is_in_battle():
                 return None
             
-            # Battle type detection disabled - feature not working correctly
-            battle_type = "unknown"
-            battle_type_value = 0
-            battle_type_flags = 0
-            
-            # Enhanced battle characteristics
+            # Seen live: Bug Catcher Lyle showed as a wild battle. The flags were read
+            # from a wrong address (always 0) and tested with DOUBLE's bit as TRAINER.
+            battle_type_flags = self._read_u32(self.addresses.BATTLE_TYPE_FLAGS)
+            is_trainer = bool(battle_type_flags & BATTLE_TYPE_TRAINER)
+            # The first battle (Birch's bag) is wild but can be neither fled nor caught.
+            wild_free = not is_trainer and not battle_type_flags & BATTLE_TYPE_FIRST_BATTLE
             battle_details = {
                 "in_battle": True,
-                "battle_type": battle_type,
-                "battle_type_raw": battle_type_value,
-                "can_escape": False,  # Unknown since battle type detection disabled
+                "battle_type": "trainer" if is_trainer else "wild",
+                "battle_type_raw": battle_type_flags,
+                "battle_type_flags": battle_type_flags,
+                "is_trainer_battle": is_trainer,
+                "is_wild_battle": not is_trainer,
+                "is_double_battle": bool(battle_type_flags & BATTLE_TYPE_DOUBLE),
+                "is_multi_battle": bool(battle_type_flags & BATTLE_TYPE_MULTI),
+                "is_safari_battle": bool(battle_type_flags & BATTLE_TYPE_SAFARI),
+                "is_frontier_battle": bool(battle_type_flags & BATTLE_TYPE_FRONTIER),
+                "can_escape": wild_free,
+                "is_capturable": wild_free,
             }
-            
-            # Read detailed battle type flags (following pokeemerald guide)
-            try:
-                battle_type_flags = self._read_u16(self.addresses.BATTLE_TYPE_FLAGS)
-                battle_details.update({
-                    "battle_type_flags": battle_type_flags,
-                    "is_trainer_battle": bool(battle_type_flags & 0x01),    # BATTLE_TYPE_TRAINER
-                    "is_wild_battle": not bool(battle_type_flags & 0x01),
-                    "is_double_battle": bool(battle_type_flags & 0x02),     # BATTLE_TYPE_DOUBLE
-                    "is_multi_battle": bool(battle_type_flags & 0x20),      # BATTLE_TYPE_MULTI
-                    "is_frontier_battle": bool(battle_type_flags & 0x400),  # BATTLE_TYPE_FRONTIER
-                })
-            except Exception:
-                pass  # Battle type flags are supplementary
             
             # Read battle communication state for detailed battle phases
             try:
@@ -1410,8 +1634,6 @@ class PokemonEmeraldReader:
                 **battle_info,  # Include basic battle type info
                 "player_pokemon": None,
                 "opponent_pokemon": None,
-                "can_escape": False,  # Unknown since battle type detection disabled
-                "is_capturable": False,  # Unknown since battle type detection disabled
                 "battle_interface": {
                     "current_hover": None,
                     "available_actions": []
@@ -1439,184 +1661,33 @@ class PokemonEmeraldReader:
             except Exception as e:
                 logger.warning(f"Failed to read player battle Pokémon: {e}")
             
-            # Read opponent Pokémon data using ROM guide fallback approach
+            # The active Pokémon on both sides come from gBattleMons (the battle's own
+            # copy): party[0] above is wrong after a switch, and the old opponent probes
+            # (gEnemyParty read without decryption, a wrong gBattleMons address and
+            # layout, a RAM scan) were so unreliable they had been switched off.
             try:
-                opponent_data = None
-                
-                # Method 1: Try gEnemyParty first (ROM guide: "Always contains full opponent data")
-                g_enemy_party_base = 0x02023BC0  # gEnemyParty base address
-                logger.debug("Trying gEnemyParty for opponent data")
-                
-                # Read from gEnemyParty (standard Pokemon struct format)
-                enemy_species = self._read_u16(g_enemy_party_base + 0x20)  # Species in encrypted data
-                enemy_level = self._read_u8(g_enemy_party_base + 0x54)
-                enemy_hp = self._read_u16(g_enemy_party_base + 0x56)
-                enemy_max_hp = self._read_u16(g_enemy_party_base + 0x58)
-                
-                if enemy_species > 0 and enemy_species < 500 and enemy_level > 0 and enemy_level <= 100 and enemy_max_hp > 0:
-                    logger.info(f"Found valid opponent in gEnemyParty: Species {enemy_species} Lv{enemy_level}")
-                    
-                    # Read additional data from gEnemyParty (Pokemon struct format)
-                    # Note: gEnemyParty uses encrypted Pokemon format, need to decrypt
-                    try:
-                        # Try to parse the full Pokemon struct using existing utilities
-                        enemy_data = self._read_bytes(g_enemy_party_base, self.addresses.PARTY_POKEMON_SIZE)
-                        from pokemon_env.emerald_utils import parse_pokemon
-                        opponent_pokemon = parse_pokemon(enemy_data)
-                        
-                        opponent_data = {
-                            "species": opponent_pokemon.species_name,
-                            "level": opponent_pokemon.level,
-                            "current_hp": opponent_pokemon.current_hp,
-                            "max_hp": opponent_pokemon.max_hp,
-                            "hp_percentage": round((opponent_pokemon.current_hp / opponent_pokemon.max_hp * 100) if opponent_pokemon.max_hp > 0 else 0, 1),
-                            "status": opponent_pokemon.status.get_status_name() if opponent_pokemon.status else "Normal",
-                            "types": [t.name for t in [opponent_pokemon.type1, opponent_pokemon.type2] if t],
-                            "moves": opponent_pokemon.moves,
-                            "move_pp": opponent_pokemon.move_pp,
-                            "is_fainted": opponent_pokemon.current_hp == 0,
-                            "is_shiny": opponent_pokemon.is_shiny if hasattr(opponent_pokemon, 'is_shiny') else False
-                        }
-                        logger.info(f"Successfully parsed gEnemyParty opponent: {opponent_data['species']}")
-                    except Exception as e:
-                        logger.debug(f"Failed to parse gEnemyParty with full Pokemon parser: {e}")
-                        # Fallback to basic reading
-                        opponent_data = {
-                            "species": f"Species_{enemy_species}",
-                            "level": enemy_level,
-                            "current_hp": enemy_hp,
-                            "max_hp": enemy_max_hp,
-                            "hp_percentage": round((enemy_hp / enemy_max_hp * 100) if enemy_max_hp > 0 else 0, 1),
-                            "status": "Unknown",
-                            "types": [],
-                            "moves": [],
-                            "move_pp": [],
-                            "is_fainted": enemy_hp == 0,
-                            "is_shiny": False
-                        }
-                
-                # Method 2: Try gBattleMons if gEnemyParty didn't work
-                if not opponent_data:
-                    logger.debug("gEnemyParty invalid, trying gBattleMons")
-                    
-                    g_battle_mons_base = 0x02024A80
-                    battle_pokemon_struct_size = 0x58  # Size of BattlePokemon struct
-                    opponent_battler_id = 1  # B_POSITION_OPPONENT_LEFT
-                    opponent_base = g_battle_mons_base + (opponent_battler_id * battle_pokemon_struct_size)
-                    
-                    # Read BattlePokemon struct fields directly (from ROM guide)
-                    species_id = self._read_u16(opponent_base + 0x00)  # u16 species
-                    attack = self._read_u16(opponent_base + 0x02)      # u16 attack
-                    defense = self._read_u16(opponent_base + 0x04)     # u16 defense
-                    speed = self._read_u16(opponent_base + 0x06)       # u16 speed
-                    sp_attack = self._read_u16(opponent_base + 0x08)   # u16 spAttack
-                    sp_defense = self._read_u16(opponent_base + 0x0A)  # u16 spDefense
-                    type1 = self._read_u8(opponent_base + 0x0C)        # u8 type1
-                    type2 = self._read_u8(opponent_base + 0x0D)        # u8 type2
-                    level = self._read_u8(opponent_base + 0x0E)        # u8 level
-                    current_hp = self._read_u8(opponent_base + 0x0F)   # u8 hp
-                    max_hp = self._read_u16(opponent_base + 0x10)      # u16 maxHP
-                    
-                    # Read moves and PP
-                    moves = []
-                    move_pp = []
-                    for i in range(4):
-                        move_id = self._read_u16(opponent_base + 0x12 + (i * 2))  # u16 moves[4]
-                        pp = self._read_u8(opponent_base + 0x1A + i)              # u8 pp[4]
-                        
-                        if move_id > 0:
-                            try:
-                                from pokemon_env.enums import Move
-                                move = Move(move_id)
-                                move_name = move.name.replace('_', ' ').title()
-                                moves.append(move_name)
-                            except (ValueError, ImportError):
-                                moves.append(f"Move_{move_id}")
-                        else:
-                            moves.append("")
-                        move_pp.append(pp)
-                    
-                    # Read status
-                    status1 = self._read_u8(opponent_base + 0x1F)  # u8 status1
-                    
-                    # Convert status to name
-                    status_name = "Normal"
-                    if status1 & 0x07:  # Sleep
-                        status_name = "Sleep"
-                    elif status1 & 0x08:  # Poison
-                        status_name = "Poison" 
-                    elif status1 & 0x10:  # Burn
-                        status_name = "Burn"
-                    elif status1 & 0x20:  # Freeze
-                        status_name = "Freeze"
-                    elif status1 & 0x40:  # Paralysis
-                        status_name = "Paralysis"
-                    elif status1 & 0x80:  # Bad poison
-                        status_name = "Bad Poison"
-                    
-                    # Convert types to names
-                    type_names = []
-                    for type_id in [type1, type2]:
-                        if type_id > 0:
-                            try:
-                                from pokemon_env.enums import PokemonType
-                                ptype = PokemonType(type_id)
-                                type_names.append(ptype.name.title())
-                            except (ValueError, ImportError):
-                                type_names.append(f"Type_{type_id}")
-                    
-                    # Convert species to name
-                    species_name = f"Species_{species_id}"
-                    if species_id > 0:
-                        try:
-                            from pokemon_env.enums import PokemonSpecies
-                            species = PokemonSpecies(species_id)
-                            species_name = species.name.replace('_', ' ').title()
-                        except (ValueError, ImportError):
-                            pass
-                    
-                    # Check if this is valid opponent data
-                    if species_id > 0 and species_id < 500 and level > 0 and level <= 100 and max_hp > 0:
-                        opponent_data = {
-                            "species": species_name,
-                            "level": level,
-                            "current_hp": current_hp,
-                            "max_hp": max_hp,
-                            "hp_percentage": round((current_hp / max_hp * 100) if max_hp > 0 else 0, 1),
-                            "status": status_name,
-                            "types": type_names,
-                            "moves": moves,
-                            "move_pp": move_pp,
-                            "is_fainted": current_hp == 0,
-                            "is_shiny": False,
-                            "stats": {
-                                "attack": attack,
-                                "defense": defense,
-                                "speed": speed,
-                                "sp_attack": sp_attack,
-                                "sp_defense": sp_defense
-                            }
-                        }
-                        logger.info(f"Read opponent from gBattleMons: {species_name} Lv{level}")
-                
-                # Method 3: Known opponent addresses (for specific battle states)
-                if not opponent_data:
-                    logger.debug("Standard methods failed, checking known opponent addresses")
-                    opponent_data = self._check_known_opponent_addresses()
-                
-                # Method 4: Dynamic memory scanning as last resort
-                if not opponent_data:
-                    logger.debug("All methods failed, trying memory scan")
-                    opponent_data = self._scan_for_opponent_pokemon()
-                
-                # Opponent detection disabled - feature not working correctly
-                enhanced_battle["opponent_pokemon"] = None
-                enhanced_battle["opponent_status"] = "Opponent detection disabled (feature not reliable)"
-                logger.debug("Opponent detection disabled due to incorrect readings")
-                            
+                view = self.read_battle_view()
             except Exception as e:
-                logger.warning(f"Failed to read opponent battle Pokémon: {e}")
-            
+                logger.warning(f"Failed to read the battle view: {e}")
+                view = None
+            enhanced_battle["view"] = view
+            if view and view["player"]:
+                mon = view["player"]
+                enhanced_battle["player_pokemon"] = self._legacy_battle_mon(
+                    mon, [m["name"] for m in view["moves"]], [m["pp"] for m in view["moves"]]
+                )
+            if view and view["target"]:
+                mon = view["target"]
+                names = []
+                for move_id in mon["move_ids"]:
+                    try:
+                        names.append(Move(move_id).name.replace("_", " ") if move_id else "")
+                    except ValueError:
+                        names.append(f"MOVE {move_id}")
+                enhanced_battle["opponent_pokemon"] = self._legacy_battle_mon(mon, names, mon["pp"])
+            else:
+                enhanced_battle["opponent_status"] = "Opponent not sent out yet"
+
             # Check for remaining opponent Pokémon in trainer battles
             if enhanced_battle.get("is_trainer_battle"):
                 try:
@@ -2450,8 +2521,7 @@ class PokemonEmeraldReader:
     def get_all_metatile_behaviors(self) -> List[int]:
         """Get all metatile behaviors for current map"""
         try:
-            map_bank = self._read_u8(self.addresses.MAP_BANK)
-            map_number = self._read_u8(self.addresses.MAP_NUMBER)
+            map_bank, map_number = self._read_current_map()
             cache_key = (map_bank, map_number)
             
             if self._cached_behaviors_map_key == cache_key and self._cached_behaviors is not None:
@@ -2830,8 +2900,7 @@ class PokemonEmeraldReader:
                 self._setup_location_connections_callback()
             
             # Get current map identifiers
-            map_bank = self._read_u8(self.addresses.MAP_BANK)
-            map_number = self._read_u8(self.addresses.MAP_NUMBER)
+            map_bank, map_number = self._read_current_map()
             
             # Location name already retrieved above, but refresh it for accuracy
             location_name = state.get("player", {}).get("location")
@@ -3037,8 +3106,7 @@ class PokemonEmeraldReader:
             stats = self._map_stitcher.get_stats()
             
             # Get current area info
-            current_map_bank = self._read_u8(self.addresses.MAP_BANK)
-            current_map_number = self._read_u8(self.addresses.MAP_NUMBER)
+            current_map_bank, current_map_number = self._read_current_map()
             current_map_id = (current_map_bank << 8) | current_map_number
             
             current_area = self._map_stitcher.map_areas.get(current_map_id)

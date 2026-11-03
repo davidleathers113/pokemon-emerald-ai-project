@@ -1,0 +1,71 @@
+# Local (not upstream) image for running the harness on Apple Silicon.
+# mgba==0.10.2 ships no macOS arm64 wheel, but it does ship manylinux aarch64,
+# so the harness runs natively in a linux/arm64 container. The model runs on the
+# host (Ollama), reached via host.docker.internal.
+FROM python:3.11-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd
+
+COPY --from=ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 /uv /usr/local/bin/uv
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep the venv outside /app so mounting the repo at /app doesn't hide it.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_LINK_MODE=copy \
+    SDL_VIDEODRIVER=dummy \
+    SDL_AUDIODRIVER=dummy \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+# pyboy 2.5.2 (Pokemon Red only) has no linux/arm64 wheel and its sdist fails to
+# compile; it is imported lazily from pokemon_red_env only, so Emerald doesn't need it.
+RUN uv sync --frozen --no-install-project --no-dev --no-install-package pyboy
+
+# The mgba wheel links against an external libmgba.so.0.10 (ABI 0.10). mGBA 0.10.0-0.10.2
+# (Debian ships 0.10.1) have a latent bug on the first in-game save of a flash+RTC game such
+# as Emerald: GBASavedataRTCWrite remaps the save file but leaves savedata->currentBank
+# pointing at the old mapping (harmless only while mmap happens to reuse the same address).
+# Fixed upstream in ce4024a (backport 0e3d55c), first released in 0.10.3.
+# 0.10.4/0.10.5 also fix GPIO (RTC) state restore on savestate load. 0.10.2 -> 0.10.5 changes
+# no public struct or savestate layout, so the 0.10.2 wheel and existing states still work.
+# Build 0.10.5 pinned by commit as a library only; late layer keeps the dependency layer cached.
+# Build with mGBA's standard library features (FFmpeg, ELF, SQLite, libzip, Lua, PNG,
+# zlib), matching how the wheel was built; only the GUI frontends are off. The wheel
+# references e.g. the e-Reader scan API (USE_FFMPEG) and mCoreLoadELFSymbols (USE_ELF).
+# The build fails if the wheel needs any non-Python symbol the library lacks, or if the
+# library the bindings actually load is not the pinned commit.
+ARG MGBA_TAG=0.10.5
+ARG MGBA_COMMIT=26b7884bc25a5933960f3cdcd98bac1ae14d42e2
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config binutils \
+        zlib1g-dev libpng-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+        libswresample-dev libavfilter-dev libelf-dev libsqlite3-dev libzip-dev liblua5.4-dev \
+        zipcmp zipmerge ziptool \
+    && git clone --depth 1 --branch "$MGBA_TAG" https://github.com/mgba-emu/mgba.git /tmp/mgba \
+    && test "$(git -C /tmp/mgba rev-parse HEAD)" = "$MGBA_COMMIT" \
+    && cmake -S /tmp/mgba -B /tmp/mgba/build -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_QT=OFF -DBUILD_SDL=OFF -DBUILD_GL=OFF -DBUILD_GLES2=OFF -DBUILD_GLES3=OFF \
+        -DBUILD_SHARED=ON -DBUILD_STATIC=OFF -DUSE_EPOXY=OFF -DUSE_DISCORD_RPC=OFF \
+    && cmake --build /tmp/mgba/build -j"$(nproc)" \
+    && cmake --install /tmp/mgba/build \
+    && ldconfig \
+    && rm -rf /tmp/mgba /var/lib/apt/lists/* \
+    && nm -D --undefined-only /opt/venv/lib/python3.11/site-packages/mgba/_pylib.abi3.so | awk '{print $2}' | sort -u > /tmp/need \
+    && nm -D --defined-only /usr/local/lib/libmgba.so.0.10 | awk '{print $3}' | sort -u > /tmp/have \
+    && comm -23 /tmp/need /tmp/have \
+        | awk 'index($0, "@") == 0 && substr($0, 1, 1) != "_" && substr($0, 1, 2) != "Py"' > /tmp/missing \
+    && if [ -s /tmp/missing ]; then echo "Unresolved mGBA symbols:"; cat /tmp/missing; exit 1; fi \
+    && /opt/venv/bin/python -c "from mgba._pylib import ffi, lib; import mgba.core, mgba.image; \
+c = ffi.string(lib.gitCommit).decode(); v = ffi.string(lib.projectVersion).decode(); \
+assert c == '$MGBA_COMMIT', c; print('mgba bindings load libmgba', v, c)"
+
+# The actual cause of the in-game SAVE crash is in the Python bindings, not libmgba:
+# they leave mCoreCallbacks.savedataUpdated (and shutdown/alarm) as malloc garbage,
+# and the core calls savedataUpdated when a save finishes. See the script's docstring.
+COPY local_patches/fix_mgba_callbacks.py /opt/local_patches/fix_mgba_callbacks.py
+RUN /opt/venv/bin/python /opt/local_patches/fix_mgba_callbacks.py
+
+ENV PATH="/opt/venv/bin:$PATH"
+EXPOSE 8000
+ENTRYPOINT ["python", "run.py"]
