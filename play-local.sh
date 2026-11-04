@@ -7,8 +7,10 @@
 #
 # Defaults to the local Ollama model. To use a cloud model instead, set e.g.
 #   BACKEND=gemini MODEL=gemini-3.5-flash GEMINI_API_KEY=... ./play-local.sh
-# Gemini's free tier first, the local model when its daily quota is used up:
-#   BACKEND=gemini+ollama GEMINI_API_KEY=... [GEMINI_MODEL=gemini-3.5-flash] ./play-local.sh
+# Gemini's free tier first, then a Flash-Lite model, then the local model, each when the
+# one before has used up its daily quota (or can't answer a step in time):
+#   BACKEND=gemini+ollama GEMINI_API_KEY=... [GEMINI_MODEL=gemini-3.5-flash] \
+#       [GEMINI_FALLBACK_MODEL=gemini-3.1-flash-lite, or none] ./play-local.sh
 # (gemini-2.5-flash is listed but answers new keys "no longer available to new users";
 # gemini-3.8-flash didn't answer within 90 s when tried on 2026-11-04.)
 # Works with macOS /bin/bash 3.2 (empty arrays are expanded with ${a[@]+...}).
@@ -156,10 +158,11 @@ if [ "$BACKEND" = "ollama" ] || [ "$BACKEND" = "gemini+ollama" ]; then
     if [ "$BACKEND" = "ollama" ]; then
         harness_backend=openai
     else
-        # gemini+ollama (FallbackBackend): Gemini plays, and $MODEL on Ollama takes over
-        # when Gemini's daily quota is used up, so Ollama is set up and $MODEL loaded here
-        # just the same. The key is passed by name (-e VAR), never written out.
-        for var in GEMINI_API_KEY GOOGLE_API_KEY GEMINI_MODEL; do
+        # gemini+ollama (FallbackBackend): Gemini plays (GEMINI_MODEL, then
+        # GEMINI_FALLBACK_MODEL), and $MODEL on Ollama takes over when both are used up, so
+        # Ollama is set up and $MODEL loaded here just the same. The key is passed by name
+        # (-e VAR), never written out.
+        for var in GEMINI_API_KEY GOOGLE_API_KEY GEMINI_MODEL GEMINI_FALLBACK_MODEL; do
             if [ -n "${!var:-}" ]; then env_args+=(-e "$var"); fi
         done
         if [ -z "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]; then

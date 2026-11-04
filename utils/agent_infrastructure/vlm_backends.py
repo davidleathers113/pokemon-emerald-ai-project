@@ -2324,7 +2324,8 @@ class VertexBackend(VLMBackend):
 # classify_gemini_error kinds: what a failed Gemini call means for the next one.
 GEMINI_DAILY = "daily"          # the day's quota is used up: no use asking again before the reset
 GEMINI_MINUTE = "minute"        # a per-minute limit: a short wait helps
-GEMINI_AUTH = "auth"            # the key is wrong or not allowed: no use asking again at all
+GEMINI_AUTH = "auth"            # the key is wrong or not allowed: no Gemini model will answer
+GEMINI_GONE = "gone"            # this model is not served to this key (404): ask another one
 GEMINI_TRANSIENT = "transient"  # the server had a problem (5xx, timeout): try again
 
 
@@ -2340,6 +2341,27 @@ def _duration_s(value) -> Optional[float]:
             return float(text[:-1])
         except ValueError:
             return None
+    return None
+
+
+def gemini_quota_value(exc: BaseException) -> Optional[int]:
+    """The limit a 429 says was reached (QuotaFailure violations' quotaValue), or None.
+
+    Google's rate-limit docs no longer list the free tier's numbers ("can be viewed in
+    Google AI Studio"); the error carries them. Seen live (2026-11-04): quota_value 20 for
+    GenerateRequestsPerDayPerProjectPerModel-FreeTier on gemini-3.6-flash.
+    """
+    for detail in list(getattr(exc, "details", None) or []):
+        if isinstance(detail, dict):
+            values = [v.get("quotaValue") for v in detail.get("violations") or [] if isinstance(v, dict)]
+        else:
+            values = [getattr(v, "quota_value", None) for v in getattr(detail, "violations", None) or []]
+        for value in values:
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -2373,11 +2395,13 @@ def classify_gemini_error(exc: BaseException):
             delay = _duration_s(getattr(detail, "retry_delay", None)) if delay is None else delay
     if any("PerDay" in quota_id for quota_id in quota_ids):
         return GEMINI_DAILY, delay
-    if isinstance(exc, (gx.Unauthenticated, gx.PermissionDenied, gx.NotFound)) or "API_KEY_INVALID" in reasons:
-        # NotFound seen live with a new key (2026-11-04): "404 This model models/gemini-2.5-
-        # flash is no longer available to new users", though the model list names it. Like
-        # a bad key it won't fix itself.
+    if isinstance(exc, (gx.Unauthenticated, gx.PermissionDenied)) or "API_KEY_INVALID" in reasons:
         return GEMINI_AUTH, None
+    if isinstance(exc, gx.NotFound):
+        # Seen live with a new key (2026-11-04): "404 This model models/gemini-2.5-flash is
+        # no longer available to new users", though the model list names it. It won't fix
+        # itself, but only this model is affected.
+        return GEMINI_GONE, None
     if isinstance(exc, gx.ResourceExhausted) or getattr(exc, "code", None) == 429:
         return GEMINI_MINUTE, delay
     if isinstance(exc, (gx.ServerError, gx.DeadlineExceeded, TimeoutError, ConnectionError)):
@@ -2860,6 +2884,12 @@ class GeminiBackend(VLMBackend):
 # new keys "404 … no longer available to new users", and 3.7-flash / flash-latest gave
 # 429 on the first request.
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+# The second hop (David, 2026-11-04: "Have it fall back to flash-lite and then to qwen").
+# Of the Flash-Lite names his key answers, gemini-3.1-flash-lite is a different model from
+# gemini-3.5-flash-lite (which gemini-flash-lite-latest runs as, per its modelVersion):
+# aliases can draw on another model's quota (a gemini-3.5-flash request was counted under
+# gemini-3.6-flash), so this one is least likely to share a pool with the first hop.
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 # Gemini's free-tier daily quotas reset at midnight Pacific time.
 GEMINI_RESET_TZ = "America/Los_Angeles"
 # Seconds one step may wait on Gemini's per-minute limit or a server error before the
@@ -2881,44 +2911,57 @@ def next_gemini_reset(now: float) -> float:
 
 
 class FallbackBackend(VLMBackend):
-    """Gemini first, the local model (OpenAIBackend → Ollama) when Gemini can't answer.
+    """Gemini models in turn, then the local model (OpenAIBackend → Ollama).
 
-    David (2026-11-04): play on Gemini's free tier, and on the local Qwen when the day's
-    quota is used up. BACKEND=gemini+ollama; model_name is the local model (MODEL), the
-    Gemini model is GEMINI_MODEL (default DEFAULT_GEMINI_MODEL). By the error's kind
-    (classify_gemini_error):
-    - per-minute limit or server error: Gemini waits up to FALLBACK_MAX_PRIMARY_WAIT_S,
-      then the local model plays that one step; the next step asks Gemini again;
-    - the day's quota used up: the local model until the next midnight Pacific
-      (next_gemini_reset), then Gemini is asked once and kept if it answers;
-    - the key rejected, or no GEMINI_API_KEY at all: the local model for the whole run.
-    Each switch is logged and passed to the on_switch callbacks (the /play feed's 🔁 row).
-    Both backends take the same tool declarations and return the same Gemini-like reply.
+    David (2026-11-04): play on Gemini's free tier, "fall back to flash-lite and then to
+    qwen". BACKEND=gemini+ollama; model_name is the local model (MODEL), the hops are
+    GEMINI_MODEL (default DEFAULT_GEMINI_MODEL) then GEMINI_FALLBACK_MODEL (default
+    DEFAULT_GEMINI_FALLBACK_MODEL; "none" leaves it out). Each step asks the first hop
+    that isn't out; by the error's kind (classify_gemini_error):
+    - per-minute limit or server error: the next hop plays that one step, all within one
+      FALLBACK_MAX_PRIMARY_WAIT_S budget for the step; the local model is the floor;
+    - the day's quota used up (or 404, the model not served to this key): that hop is out
+      until the next midnight Pacific (next_gemini_reset; a 404 for the run), then asked
+      once and kept if it answers;
+    - the key rejected, or no GEMINI_API_KEY at all: every Gemini hop out for the run.
+    Each switch is logged and passed to the on_switch callbacks (the /play feed's 🔁 row),
+    naming the hop that plays next; current_model names the one that answered the step.
+    All backends take the same tool declarations and return the same Gemini-like reply.
     """
 
     def __init__(self, model_name: str, tools: list = None, system_instruction: str = None, **kwargs):
         self.secondary_model = model_name
         self.secondary = OpenAIBackend(model_name, tools=tools, system_instruction=system_instruction, **kwargs)
-        self.primary_model = os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
-        self.primary = None
+        fallback = os.getenv("GEMINI_FALLBACK_MODEL") or DEFAULT_GEMINI_FALLBACK_MODEL
+        names = [os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL]
+        if fallback.strip().lower() != "none":
+            names.append(fallback.strip())
+        self.primary_model = names[0]
+        # [{"model", "backend", "out_until" (epoch s; inf = this run), "limited_since"}]
+        self.hops: List[Dict[str, Any]] = []
         self.on_switch: List[Any] = []  # callables(text), e.g. a POST to the /play feed
-        self.on_secondary_until: Optional[float] = None  # epoch seconds; inf = for this run
         self.current_model = model_name
-        self._limited_since: Optional[float] = None
         if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
             # Never the key itself in a log line: only whether it is set.
             logger.warning(f"🔁 gemini+ollama: GEMINI_API_KEY is not set, so {model_name} plays alone.")
-            self.on_secondary_until = float("inf")
             return
-        try:
-            self.primary = GeminiBackend(
-                self.primary_model, tools=tools, system_instruction=system_instruction,
-                max_retry_wait_s=FALLBACK_MAX_PRIMARY_WAIT_S, raise_errors=True,
-            )
-            self.current_model = self.primary_model
-        except Exception as e:  # e.g. the Google client missing: play on locally
-            logger.error(f"🔁 gemini+ollama: Gemini could not start ({type(e).__name__}: {e}); {model_name} plays alone.")
-            self.on_secondary_until = float("inf")
+        for name in dict.fromkeys(names):
+            try:
+                backend = GeminiBackend(
+                    name, tools=tools, system_instruction=system_instruction,
+                    max_retry_wait_s=FALLBACK_MAX_PRIMARY_WAIT_S, raise_errors=True,
+                )
+            except Exception as e:  # e.g. the Google client missing: the next hop plays
+                logger.error(f"🔁 gemini+ollama: {name} could not start ({type(e).__name__}: {e}).")
+                continue
+            self.hops.append({"model": name, "backend": backend, "out_until": None, "limited_since": None})
+        if self.hops:
+            self.current_model = self.hops[0]["model"]
+
+    @property
+    def primary(self):
+        """The first Gemini hop's backend, or None (no key, or Gemini could not start)."""
+        return self.hops[0]["backend"] if self.hops else None
 
     def get_query(self, img, text: str, module_name: str = "Unknown"):
         return self._ask(lambda backend: backend.get_query(img, text, module_name))
@@ -2934,46 +2977,73 @@ class FallbackBackend(VLMBackend):
             except Exception as e:  # the feed is a nicety: a switch must never fail a step
                 logger.debug(f"on_switch callback failed: {e}")
 
+    def _available(self, now: float, after: int = -1) -> List[Dict[str, Any]]:
+        return [h for i, h in enumerate(self.hops) if i > after and (h["out_until"] is None or now >= h["out_until"])]
+
+    def _next_name(self, now: float, after: int) -> str:
+        """The hop that plays when hop `after` can't: the next Gemini model not out, else local."""
+        rest = self._available(now, after)
+        return rest[0]["model"] if rest else self.secondary_model
+
     def _ask(self, ask):
         now = time.time()
-        if self.primary is not None and (self.on_secondary_until is None or now >= self.on_secondary_until):
-            probing = self.on_secondary_until is not None
+        started = time.monotonic()
+        for index, hop in enumerate(self.hops):
+            if hop["out_until"] is not None and now < hop["out_until"]:
+                continue
+            budget = FALLBACK_MAX_PRIMARY_WAIT_S - (time.monotonic() - started)
+            if budget < 1.0:
+                logger.warning(f"🔁 the step's {FALLBACK_MAX_PRIMARY_WAIT_S:g} s are used: {self.secondary_model} plays it")
+                break
+            model, backend = hop["model"], hop["backend"]
+            backend.max_retry_wait_s = budget  # one budget for the whole step, across hops
+            probing = hop["out_until"] is not None
             try:
-                reply = ask(self.primary)
+                reply = ask(backend)
             except Exception as e:
                 kind, _ = classify_gemini_error(e)
                 if kind == GEMINI_MINUTE:
-                    self._limited_since = self._limited_since or now
-                    if now - self._limited_since >= FALLBACK_ASSUME_DAILY_AFTER_S:
+                    hop["limited_since"] = hop["limited_since"] or now
+                    if now - hop["limited_since"] >= FALLBACK_ASSUME_DAILY_AFTER_S:
                         kind = GEMINI_DAILY  # per-minute limits all along: the day's quota
                 if kind == GEMINI_DAILY:
-                    self._limited_since = None
-                    self.on_secondary_until = next_gemini_reset(now)
+                    hop["limited_since"] = None
+                    hop["out_until"] = next_gemini_reset(now)
+                    limit = gemini_quota_value(e)
+                    per_day = f" ({limit} requests/day)" if limit else ""
                     self._announce(
-                        f"Switched to {self.secondary_model}: Gemini's free daily quota for {self.primary_model} "
-                        "is used up; back after 00:00 PT"
+                        f"Switched to {self._next_name(now, index)}: the free daily quota for {model} is used up"
+                        f"{per_day}; back after 00:00 PT"
                     )
-                elif kind == GEMINI_AUTH:
-                    self.on_secondary_until = float("inf")
-                    # The error's first sentence says which: the key, or the model (NotFound).
+                elif kind == GEMINI_GONE:
+                    hop["out_until"] = float("inf")
                     first = str(getattr(e, "message", "") or e).split(". ")[0][:160]
                     self._announce(
-                        f"Switched to {self.secondary_model} for this run: Gemini refused {self.primary_model} "
-                        f"({type(e).__name__}: {first}); check GEMINI_API_KEY and GEMINI_MODEL"
+                        f"Switched to {self._next_name(now, index)} for this run: {model} is not served to this key "
+                        f"({first}); check GEMINI_MODEL / GEMINI_FALLBACK_MODEL"
                     )
+                elif kind == GEMINI_AUTH:
+                    for other in self.hops:
+                        other["out_until"] = float("inf")  # one key: no Gemini model will answer
+                    first = str(getattr(e, "message", "") or e).split(". ")[0][:160]
+                    self._announce(
+                        f"Switched to {self.secondary_model} for this run: Gemini rejected the API key "
+                        f"({type(e).__name__}: {first}); check GEMINI_API_KEY"
+                    )
+                    break
                 elif kind in (GEMINI_MINUTE, GEMINI_TRANSIENT):
                     logger.warning(
-                        f"🔁 Gemini busy ({kind}: {type(e).__name__}); {self.secondary_model} plays this step"
+                        f"🔁 {model} busy ({kind}: {type(e).__name__}); {self._next_name(now, index)} plays this step"
                     )
                 else:
                     raise  # not a quota, key or server problem: a real error
-            else:
-                self._limited_since = None
-                self.current_model = self.primary_model
-                if probing:
-                    self.on_secondary_until = None
-                    self._announce(f"Switched back to {self.primary_model}: Gemini answers again after the reset")
-                return reply
+                continue
+            hop["limited_since"] = None
+            self.current_model = model
+            if probing:
+                hop["out_until"] = None
+                self._announce(f"Switched back to {model}: it answers again after the reset")
+            return reply
         self.current_model = self.secondary_model
         return ask(self.secondary)
 

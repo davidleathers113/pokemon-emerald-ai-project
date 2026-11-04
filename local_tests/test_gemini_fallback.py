@@ -33,10 +33,12 @@ DAILY_ID = "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
 MINUTE_ID = "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
 
 
-def _quota(quota_id, retry="34s"):
-    """A 429 as Gemini's REST API sends it: QuotaFailure + RetryInfo details."""
+def _quota(quota_id, retry="34s", limit=20):
+    """A 429 as Gemini's REST API sends it: QuotaFailure (with the limit reached, seen live
+    as quota_value 20 on gemini-3.6-flash) + RetryInfo details."""
     return gx.ResourceExhausted("You exceeded your current quota", details=[
-        {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": quota_id}]},
+        {"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+         "violations": [{"quotaId": quota_id, "quotaValue": str(limit)}]},
         {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry},
     ])
 
@@ -48,6 +50,17 @@ def _bad_key():
 
 
 # -- reading the error ------------------------------------------------------------
+
+
+def test_the_limit_reached_is_read_from_the_error():
+    """Google's docs no longer list free-tier numbers; the 429 carries them (seen live:
+    quota_value 20 on gemini-3.6-flash), over REST as a string, over gRPC as a number."""
+    assert vb.gemini_quota_value(_quota(DAILY_ID, limit=20)) == 20
+    proto = gx.ResourceExhausted("quota", details=[
+        SimpleNamespace(violations=[SimpleNamespace(quota_id=DAILY_ID, quota_value=250)]),
+    ])
+    assert vb.gemini_quota_value(proto) == 250
+    assert vb.gemini_quota_value(gx.ResourceExhausted("429")) is None
 
 
 def test_errors_are_classified_by_their_own_fields():
@@ -192,38 +205,86 @@ def _fallback(env=None):
     return backend, said
 
 
-def test_a_per_minute_limit_stays_on_gemini():
+LITE = vb.DEFAULT_GEMINI_FALLBACK_MODEL
+
+
+def _hop(backend, model):
+    return next(h for h in backend.hops if h["model"] == model)
+
+
+def test_the_chain_is_flash_then_flash_lite_then_local():
+    """David (2026-11-04): "Have it fall back to flash-lite and then to qwen"."""
+    backend, _ = _fallback()
+    assert [h["model"] for h in backend.hops] == [vb.DEFAULT_GEMINI_MODEL, LITE]
+    assert all(h["backend"].kwargs["raise_errors"] is True for h in backend.hops)
+    backend, _ = _fallback({"GEMINI_FALLBACK_MODEL": "gemini-3.5-flash-lite", "GEMINI_MODEL": "gemini-3.6-flash"})
+    assert [h["model"] for h in backend.hops] == ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    backend, _ = _fallback({"GEMINI_FALLBACK_MODEL": "none"})
+    assert [h["model"] for h in backend.hops] == [vb.DEFAULT_GEMINI_MODEL]
+
+
+def test_a_per_minute_limit_or_outage_hands_that_one_step_to_the_next_hop():
     backend, said = _fallback()
-    assert backend.primary.model_name == vb.DEFAULT_GEMINI_MODEL
-    assert backend.primary.kwargs["max_retry_wait_s"] == vb.FALLBACK_MAX_PRIMARY_WAIT_S
     backend.primary.errors.append(_quota(MINUTE_ID))
-    assert backend.get_query(None, "step 1") == "qwen3-vl:8b-instruct: step 1"  # this step only
+    assert backend.get_query(None, "step 1") == f"{LITE}: step 1"  # this step only
+    assert backend.current_model == LITE
     assert backend.get_query(None, "step 2") == f"{vb.DEFAULT_GEMINI_MODEL}: step 2"
-    assert backend.current_model == vb.DEFAULT_GEMINI_MODEL and said == [] and backend.on_secondary_until is None
-    backend.primary.errors.append(gx.ServiceUnavailable("overloaded"))  # David: Qwen for that step
+    assert backend.current_model == vb.DEFAULT_GEMINI_MODEL and said == []
+    # Both busy: Qwen is the floor (David: Qwen for that step).
+    backend.primary.errors.append(gx.ServiceUnavailable("overloaded"))
+    _hop(backend, LITE)["backend"].errors.append(gx.DeadlineExceeded("slow"))
     assert backend.get_query(None, "step 3").startswith("qwen3-vl") and said == []
+    assert backend.current_model == "qwen3-vl:8b-instruct"
 
 
-def test_a_used_up_day_switches_until_the_reset_then_switches_back():
-    backend, said = _fallback({"GEMINI_MODEL": "gemini-2.5-flash-lite"})
-    assert backend.primary.model_name == "gemini-2.5-flash-lite"
+def test_the_step_s_budget_is_shared_across_hops():
+    """One 30 s budget for the whole step: a hop that used 25 s leaves the next 5."""
+    backend, _ = _fallback()
+    clock = [100.0]
+
+    def slow_primary(img, text, module_name="Unknown"):
+        clock[0] += 25
+        raise gx.DeadlineExceeded("slow")
+
+    backend.primary.get_query = slow_primary
+    with mock.patch.object(vb.time, "monotonic", side_effect=lambda: clock[0]):
+        assert backend.get_query(None, "x") == f"{LITE}: x"
+    assert 4.0 < _hop(backend, LITE)["backend"].max_retry_wait_s <= 5.0
+
+    def slower_primary(img, text, module_name="Unknown"):
+        clock[0] += 29.5
+        raise gx.DeadlineExceeded("slow")
+
+    backend.primary.get_query = slower_primary
+    lite_calls = _hop(backend, LITE)["backend"].calls
+    with mock.patch.object(vb.time, "monotonic", side_effect=lambda: clock[0]):
+        assert backend.get_query(None, "y").startswith("qwen3-vl")  # no time left for the lite hop
+    assert _hop(backend, LITE)["backend"].calls == lite_calls
+
+
+def test_a_used_up_day_moves_down_the_chain_until_the_reset():
+    backend, said = _fallback()
     now = datetime(2026, 11, 4, 15, 0, tzinfo=PT).timestamp()
-    backend.primary.errors.append(_quota(DAILY_ID))
+    backend.primary.errors.append(_quota(DAILY_ID, limit=20))
     with mock.patch.object(vb.time, "time", return_value=now):
-        # The step that hit the quota is answered by the local model in the same call.
-        assert backend.get_query(None, "step 1") == "qwen3-vl:8b-instruct: step 1"
-        assert backend.primary.calls == 1 and backend.secondary.calls == 1
-        assert backend.get_query(None, "step 2").startswith("qwen3-vl")
-    assert backend.primary.calls == 1, "Gemini must not be asked again before the reset"
+        # The step that hit the quota is answered by the next hop in the same call.
+        assert backend.get_query(None, "step 1") == f"{LITE}: step 1"
+        assert backend.get_query(None, "step 2") == f"{LITE}: step 2"
+    assert backend.primary.calls == 1, "a used-up model must not be asked again before the reset"
     assert said == [
-        "Switched to qwen3-vl:8b-instruct: Gemini's free daily quota for gemini-2.5-flash-lite is used up; "
+        f"Switched to {LITE}: the free daily quota for {vb.DEFAULT_GEMINI_MODEL} is used up (20 requests/day); "
         "back after 00:00 PT"
     ], said
+    # The lite hop's day runs out too: Qwen until the reset, and the row says so.
+    _hop(backend, LITE)["backend"].errors.append(_quota(DAILY_ID, limit=500))
+    with mock.patch.object(vb.time, "time", return_value=now + 600):
+        assert backend.get_query(None, "step 3").startswith("qwen3-vl")
+    assert said[-1].startswith(f"Switched to qwen3-vl:8b-instruct: the free daily quota for {LITE} is used up (500"), said
     after = datetime(2026, 11, 5, 0, 1, tzinfo=PT).timestamp()
     with mock.patch.object(vb.time, "time", return_value=after):
-        assert backend.get_query(None, "step 3") == "gemini-2.5-flash-lite: step 3"
-    assert said[-1] == "Switched back to gemini-2.5-flash-lite: Gemini answers again after the reset"
-    assert backend.current_model == "gemini-2.5-flash-lite" and backend.on_secondary_until is None
+        assert backend.get_query(None, "step 4") == f"{vb.DEFAULT_GEMINI_MODEL}: step 4"
+    assert said[-1] == f"Switched back to {vb.DEFAULT_GEMINI_MODEL}: it answers again after the reset"
+    assert _hop(backend, vb.DEFAULT_GEMINI_MODEL)["out_until"] is None
 
 
 def test_still_used_up_after_the_reset_waits_another_day():
@@ -232,8 +293,9 @@ def test_still_used_up_after_the_reset_waits_another_day():
     with mock.patch.object(vb.time, "time", return_value=datetime(2026, 11, 4, 15, 0, tzinfo=PT).timestamp()):
         backend.get_query(None, "a")
     with mock.patch.object(vb.time, "time", return_value=datetime(2026, 11, 5, 0, 1, tzinfo=PT).timestamp()):
-        assert backend.get_query(None, "b").startswith("qwen3-vl")
-    assert datetime.fromtimestamp(backend.on_secondary_until, PT) == datetime(2026, 11, 6, 0, 0, tzinfo=PT)
+        assert backend.get_query(None, "b") == f"{LITE}: b"
+    out = _hop(backend, vb.DEFAULT_GEMINI_MODEL)["out_until"]
+    assert datetime.fromtimestamp(out, PT) == datetime(2026, 11, 6, 0, 0, tzinfo=PT)
 
 
 def test_per_minute_limits_for_ten_minutes_count_as_the_day():
@@ -244,31 +306,34 @@ def test_per_minute_limits_for_ten_minutes_count_as_the_day():
         with mock.patch.object(vb.time, "time", return_value=start + 60 * minute):
             backend.get_query(None, f"step {minute}")
     assert len(said) == 1 and "daily quota" in said[0], said
-    assert backend.on_secondary_until is not None
+    assert _hop(backend, vb.DEFAULT_GEMINI_MODEL)["out_until"] is not None
 
 
-def test_a_rejected_key_switches_for_the_whole_run():
+def test_a_rejected_key_takes_every_gemini_hop_out_for_the_run():
     backend, said = _fallback()
     backend.primary.errors.append(_bad_key())
     assert backend.get_query(None, "x").startswith("qwen3-vl")
-    assert said and f"Gemini refused {vb.DEFAULT_GEMINI_MODEL} (InvalidArgument: API key not valid)" in said[0], said
+    assert _hop(backend, LITE)["backend"].calls == 0, "one key: the lite hop would be refused too"
+    assert said and "Gemini rejected the API key (InvalidArgument: API key not valid)" in said[0], said
     assert "test-key" not in said[0], said
     with mock.patch.object(vb.time, "time", return_value=4_000_000_000):  # long after any reset
         backend.get_query(None, "y")
+    assert backend.primary.calls == 1
 
 
-def test_a_model_this_key_cannot_use_switches_for_the_whole_run():
+def test_a_model_this_key_cannot_use_is_skipped_for_the_run():
     """Seen in the live check (2026-11-04) with David's new key: "404 This model
     models/gemini-2.5-flash is no longer available to new users", though the model list
     named it. The old path turned it into the canned "press 'A'" reply; under the
-    fallback Gemini raises every error (raise_errors) and a 404 means the local model."""
+    fallback Gemini raises every error (raise_errors) and a 404 skips that model."""
     error = gx.NotFound("This model models/gemini-2.5-flash is no longer available to new users. Please update")
-    assert vb.classify_gemini_error(error)[0] == vb.GEMINI_AUTH
+    assert vb.classify_gemini_error(error)[0] == vb.GEMINI_GONE
     backend, said = _fallback()
-    assert backend.primary.kwargs["raise_errors"] is True
     backend.primary.errors.append(error)
-    assert backend.get_query(None, "x").startswith("qwen3-vl")
-    assert said and "no longer available to new users" in said[0] and backend.on_secondary_until == float("inf"), said
+    assert backend.get_query(None, "x") == f"{LITE}: x"
+    assert said and f"Switched to {LITE} for this run: {vb.DEFAULT_GEMINI_MODEL} is not served to this key" in said[0]
+    assert "no longer available to new users" in said[0], said
+    assert _hop(backend, vb.DEFAULT_GEMINI_MODEL)["out_until"] == float("inf")
     # The real GeminiBackend with raise_errors: any error comes out, never the canned reply.
     gemini, calls = _gemini([gx.InvalidArgument("a schema problem")], raise_errors=True)
     try:
