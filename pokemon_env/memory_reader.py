@@ -75,6 +75,35 @@ EFFECT_LEECH_SEED = 84
 EFFECT_WILL_O_WISP = 167
 EFFECTS_MAJOR_STATUS = (EFFECT_SLEEP, EFFECT_TOXIC, EFFECT_POISON, EFFECT_PARALYZE, EFFECT_WILL_O_WISP)
 
+# Damage estimate (estimate_damage): pret battle_move_effects.h, abilities.h and
+# pokemon.c gStatStageRatios (stage -6..+6 as numerator/denominator).
+FLAG_BADGE01_GET = 0x867  # pret flags.h SYSTEM_FLAGS + 0x7; badges 2-8 follow
+EFFECT_EXPLOSION = 7
+EFFECT_SUPER_FANG = 40
+EFFECT_DRAGON_RAGE = 41
+EFFECT_LEVEL_DAMAGE = 87
+EFFECT_PSYWAVE = 88
+EFFECT_SONICBOOM = 130
+ABILITY_VOLT_ABSORB = 10
+ABILITY_WATER_ABSORB = 11
+ABILITY_FLASH_FIRE = 18
+ABILITY_WONDER_GUARD = 25
+ABILITY_LEVITATE = 26
+ABILITY_HUGE_POWER = 37
+ABILITY_THICK_FAT = 47
+ABILITY_HUSTLE = 55
+ABILITY_GUTS = 62
+ABILITY_MARVEL_SCALE = 63
+ABILITY_OVERGROW = 65
+ABILITY_BLAZE = 66
+ABILITY_TORRENT = 67
+ABILITY_SWARM = 68
+ABILITY_PURE_POWER = 74
+STAT_STAGE_RATIOS = (
+    (10, 40), (10, 35), (10, 30), (10, 25), (10, 20), (10, 15), (10, 10),
+    (15, 10), (20, 10), (25, 10), (30, 10), (35, 10), (40, 10),
+)
+
 
 def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]:
     """Is the team too worn down to fight a trainer? Eggs are ignored.
@@ -1542,6 +1571,98 @@ class PokemonEmeraldReader:
         threat = max((self.type_effectiveness(t, own_types) for t in dict.fromkeys(foe_types)), default=1.0)
         return offence / max(threat, 0.25)
 
+    def estimate_damage(self, attacker: Dict[str, Any], defender: Dict[str, Any], move_id: int) -> float:
+        """Average HP one hit of this move takes off the defender (no critical hit, before
+        accuracy), from two battle-view mons (_read_battle_mon).
+
+        Before, moves were scored by ROM power alone, and NIGHT SHADE, SEISMIC TOSS, SONIC
+        BOOM and DRAGON RAGE have power 1 there: a Lv25 SABLEYE's NIGHT SHADE (25 HP) was
+        rated below SCRATCH. Fixed-damage moves do what pret's Cmd_dmgtolevel,
+        psywavedamageeffect and damagetohalftargethp do (type immunity still applies).
+        The rest follow pret CalculateBaseDamage (stats, stat stages, Huge/Pure Power,
+        Hustle, Guts, Marvel Scale, Thick Fat, burn, Overgrow/Blaze/Torrent/Swarm,
+        Explosion, badge boosts), then STAB 1.5, the type chart and the average 85-100%
+        roll. Left out: held items, weather, screens, Flash Fire's boost.
+        """
+        data = self._rom_battle_move(move_id)
+        move_type, effect = data["type"], data["effect"]
+        effectiveness = self.type_effectiveness(move_type, defender["type_ids"])
+        ability = defender.get("ability")
+        absorbs = {ABILITY_VOLT_ABSORB: 13, ABILITY_WATER_ABSORB: 11, ABILITY_FLASH_FIRE: 10, ABILITY_LEVITATE: 4}
+        if effectiveness == 0 or absorbs.get(ability) == move_type:
+            return 0.0
+        if effect == EFFECT_LEVEL_DAMAGE or effect == EFFECT_PSYWAVE:  # psywave averages the level
+            return float(attacker["level"])
+        if effect == EFFECT_SONICBOOM:
+            return 20.0
+        if effect == EFFECT_DRAGON_RAGE:
+            return 40.0
+        if effect == EFFECT_SUPER_FANG:
+            return float(max(1, defender["hp"] // 2))
+        if ability == ABILITY_WONDER_GUARD and effectiveness <= 1:
+            return 0.0
+        power = data["power"]
+        if not power or move_type == 9:  # TYPE_MYSTERY
+            return 0.0
+        a_stats, d_stats = attacker.get("stats") or {}, defender.get("stats") or {}
+        if not a_stats or not d_stats:
+            return 0.0
+        attack, defense = a_stats["attack"], d_stats["defense"]
+        sp_attack, sp_defense = a_stats["sp_attack"], d_stats["sp_defense"]
+        a_ability = attacker.get("ability")
+        burned = attacker.get("status") == "BURN"
+        if a_ability in (ABILITY_HUGE_POWER, ABILITY_PURE_POWER):
+            attack *= 2
+        # pret ShouldGetStatBadgeBoost: the player's side (even battlers) gets 1.1x from the
+        # Stone (Attack), Balance (Defense) and Mind (Sp. Atk, Sp. Def) Badges. Seen in the
+        # first check of this estimate: SCRATCH from a Stone Badge holder hit 41-42 where
+        # the unboosted range topped out at 40.
+        def badge(index: int) -> bool:
+            return self._is_event_flag_set(FLAG_BADGE01_GET + index - 1)
+
+        if attacker.get("battler", 1) % 2 == 0:
+            if badge(1):
+                attack = 110 * attack // 100
+            if badge(7):
+                sp_attack = 110 * sp_attack // 100
+        if defender.get("battler", 1) % 2 == 0:
+            if badge(5):
+                defense = 110 * defense // 100
+            if badge(7):
+                sp_defense = 110 * sp_defense // 100
+        if ability == ABILITY_THICK_FAT and move_type in (10, 15):  # FIRE, ICE
+            sp_attack //= 2
+        if a_ability == ABILITY_HUSTLE:
+            attack = 150 * attack // 100
+        if a_ability == ABILITY_GUTS and attacker.get("status") != "OK":
+            attack = 150 * attack // 100
+        if ability == ABILITY_MARVEL_SCALE and defender.get("status") != "OK":
+            defense = 150 * defense // 100
+        pinch = {ABILITY_OVERGROW: 12, ABILITY_BLAZE: 10, ABILITY_TORRENT: 11, ABILITY_SWARM: 6}
+        if pinch.get(a_ability) == move_type and attacker["hp"] <= attacker["max_hp"] // 3:
+            power = 150 * power // 100
+        if effect == EFFECT_EXPLOSION:
+            defense //= 2
+
+        def staged(value: int, stages: List[int], index: int) -> int:
+            num, den = STAT_STAGE_RATIOS[max(0, min(12, (stages[index] if len(stages) > index else 6)))]
+            return value * num // den
+
+        a_stages, d_stages = attacker.get("stat_stages") or [], defender.get("stat_stages") or []
+        if move_type < 9:  # physical (pret IS_TYPE_PHYSICAL: below TYPE_MYSTERY)
+            damage = staged(attack, a_stages, 1) * power * (2 * attacker["level"] // 5 + 2)
+            damage = damage // max(1, staged(defense, d_stages, 2)) // 50
+            if burned and a_ability != ABILITY_GUTS:
+                damage //= 2
+            damage = max(1, damage)
+        else:
+            damage = staged(sp_attack, a_stages, 4) * power * (2 * attacker["level"] // 5 + 2)
+            damage = damage // max(1, staged(sp_defense, d_stages, 5)) // 50
+        damage += 2
+        if move_type in attacker["type_ids"]:
+            damage *= 1.5
+        return damage * effectiveness * 0.925  # the 85-100% roll averages 92.5%
+
     def status_move_failure(self, move_id: int, target: Optional[Dict[str, Any]]) -> Optional[str]:
         """Why a status move would fail on this target (a battle-view target dict), or None.
 
@@ -1672,6 +1793,16 @@ class PokemonEmeraldReader:
             "status": status,
             "move_ids": [self._read_u16(base + 0x0C + 2 * i) for i in range(4)],
             "pp": list(bytes(self.read_memory(base + 0x24, 4))),
+            # pret struct BattlePokemon: attack +2, defense +4, spAttack +8, spDefense
+            # +0xA, statStages[8] +0x18 (6 = no change), ability +0x20.
+            "stats": {
+                "attack": self._read_u16(base + 0x02),
+                "defense": self._read_u16(base + 0x04),
+                "sp_attack": self._read_u16(base + 0x08),
+                "sp_defense": self._read_u16(base + 0x0A),
+            },
+            "stat_stages": [b - 256 if b >= 128 else b for b in bytes(self.read_memory(base + 0x18, 8))],
+            "ability": self._read_u8(base + 0x20),
         }
 
     def read_battle_view(self) -> Optional[Dict[str, Any]]:
@@ -1722,9 +1853,11 @@ class PokemonEmeraldReader:
                 pp = player["pp"][index]
                 # Accuracy 0 means the move never misses (Swift, Aerial Ace...).
                 accuracy = data["accuracy"] or 100
-                expected = 0.0
-                if data["power"] and pp:
-                    expected = data["power"] * effectiveness * (1.5 if stab else 1.0) * accuracy / 100
+                # Expected HP off the target this turn: one hit's average damage, no more
+                # than the HP it has left (a sure knockout beats a bigger hit that may
+                # miss), times the chance to hit. Status moves score 0.
+                damage = self.estimate_damage(player, target, move_id) if target and pp else 0.0
+                expected = min(damage, target["hp"]) * accuracy / 100 if target else 0.0
                 moves.append({
                     "slot": index + 1,
                     "id": move_id,
@@ -1735,10 +1868,11 @@ class PokemonEmeraldReader:
                     "pp": pp,
                     "effectiveness": effectiveness,
                     "stab": stab,
+                    "damage": round(damage, 1),
                     "expected": round(expected, 1),
                 })
         scored = [m for m in moves if m["expected"] > 0]
-        best = max(scored, key=lambda m: (m["expected"], -m["slot"])) if scored else None
+        best = max(scored, key=lambda m: (m["expected"], m["damage"], -m["slot"])) if scored else None
         switch_hint = self._switch_hint(target, player_battlers) if moves and best is None else None
 
         action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3

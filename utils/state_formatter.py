@@ -388,10 +388,13 @@ def format_battle_view(view):
     target = view.get('target')
     if moves:
         against = f" vs {'/'.join(target['types'])}" if target else ""
-        lines.append(f"Moves (slot name type power PP effect{against}):")
+        lines.append(f"Moves (slot name type power PP effect{against}, ~HP one hit takes):")
         for m in moves:
             power = m['power'] if m['power'] else "-"
-            lines.append(f"  {m['slot']} {m['name']} {m['type']} {power} PP{m['pp']} {_effectiveness_label(m)}")
+            # NIGHT SHADE and the other fixed-damage moves have power 1 in the ROM; the
+            # estimate says what they really do.
+            hits = f" ~{round(m['damage'])} HP" if m.get('damage') else ""
+            lines.append(f"  {m['slot']} {m['name']} {m['type']} {power} PP{m['pp']} {_effectiveness_label(m)}{hits}")
     best = view.get('best_move')
     if best:
         lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\").")

@@ -12,6 +12,7 @@ import glob
 import io
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -3179,28 +3180,38 @@ def _set_grass_cost_for(guidance: Dict[str, Any]) -> None:
     game_tools.pathfinder.grass_cost = 1.0 if training else GRASS_TILE_COST_MULTIPLIER
 
 
+# _trainee_advantage: the trainee fights alone only if it knocks the foe out in this many
+# hits or fewer (and sooner than the foe could knock it out).
+TRAINEE_SOLO_HITS = 2
+
+
 def _trainee_advantage(view: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The move the Pokémon in battle (the trainee) can win with itself, or None to switch.
 
     David (2026-11-03): "You don't need to switch train when the other pokemon is weak
     against shroomish", and later: "I don't think we absolutely need to use combusken to
     fight every time. The pokemon are strong enough to fight on their own." The trainee
-    fights on its own when all of these hold: its best move with PP left (the battle
-    view's best_move) is not resisted (≥1x); none of the foe's types is super-effective
-    against the trainee's types (ROM type chart); the foe is at most 2 levels above it;
-    and it is above half HP. Anything else brings the partner in.
+    fights on its own when it wins the damage race: its best move (the battle view's
+    best_move, by estimated HP) knocks the foe out in at most TRAINEE_SOLO_HITS hits, and
+    in fewer hits than the foe needs with its own best move (gBattleMons' move ids, the
+    same estimate). Anything else brings the partner in.
+
+    Seen live: the level rule this replaces (foe at most 2 levels up, not super-effective,
+    trainee above half HP) let a Lv13 MARILL fight Lv13-14 Route 117 wilds alone; it
+    fainted, and the game's replacement menu then cost 30 minutes (M49).
     """
     player, target, best = view.get("player"), view.get("target"), view.get("best_move")
-    if not player or not target or not best or best["effectiveness"] < 1:
-        return None
-    if not player["max_hp"] or player["hp"] * 2 <= player["max_hp"]:
-        return None
-    if target.get("level", 0) > player.get("level", 0) + 2:
+    if not player or not target or not best or not best.get("damage") or not player["hp"]:
         return None
     with memory_lock:
         reader = env.memory_reader
-        threat = max(reader.type_effectiveness(t, player["type_ids"]) for t in dict.fromkeys(target["type_ids"]))
-    return best if threat < 2 else None
+        foe_best = max(
+            (reader.estimate_damage(target, player, move) for move, pp in zip(target["move_ids"], target["pp"]) if move and pp),
+            default=0.0,
+        )
+    hits_needed = math.ceil(target["hp"] / best["damage"])
+    hits_taken = math.ceil(player["hp"] / foe_best) if foe_best else math.inf
+    return best if hits_needed <= TRAINEE_SOLO_HITS and hits_needed < hits_taken else None
 
 
 def _switch_train_line(guidance: Dict[str, Any]) -> str:
@@ -3245,7 +3256,8 @@ def _switch_train_line(guidance: Dict[str, Any]) -> str:
     if move is not None:
         foe = str(view["target"]["name"]).upper()
         return (
-            f"{trainee} can beat {foe} on its own ({move['name']} {move['effectiveness']:g}x, no threat to it): "
+            f"{trainee} can beat {foe} on its own ({move['name']} {move['effectiveness']:g}x, "
+            f"~{round(move['damage'])} HP a hit vs {view['target']['hp']} HP left): "
             f'fight with use_move("{move["name"]}") — no switch needed.'
         )
     partners = [

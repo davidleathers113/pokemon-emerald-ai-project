@@ -353,30 +353,38 @@ def _shroomish_out_against(s, types):
 
 
 def test_trainee_with_the_advantage_is_told_to_fight():
-    """David: "You don't need to switch train when the other pokemon is weak against shroomish"."""
+    """David: "You don't need to switch train when the other pokemon is weak against
+    shroomish". Since 2026-11-04 "the advantage" is the damage race (estimated HP): the
+    trainee fights alone when it knocks the foe out in at most 2 hits and sooner than the
+    foe could knock it out. Seen live, the level/type rule it replaces let a Lv13 MARILL
+    fight Lv13-14 wilds alone, and it fainted. SILCOON knows only HARDEN; foe moves below
+    are RAM writes into gBattleMons[1].moves."""
+    from pokemon_env.enums import Move
+
     s = server()
     guidance = {"story": {"completion_condition": "level_shroomish_12: not yet (SHROOMISH is Lv6 of 12 needed)."}}
-    _shroomish_out_against(s, (TYPE_ROCK, TYPE_GROUND))  # a GEODUDE's types: ABSORB 4x, nothing hits Grass 2x
+    _shroomish_out_against(s, (TYPE_ROCK, TYPE_GROUND))  # GEODUDE's types: ABSORB 4x, ~17 HP of 20
     line = s.srv._switch_train_line(guidance)
     print("   ", line)
     assert line == (
-        'SHROOMISH can beat SILCOON on its own (ABSORB 4x, no threat to it): fight with use_move("ABSORB") — no switch needed.'
+        'SHROOMISH can beat SILCOON on its own (ABSORB 4x, ~17 HP a hit vs 20 HP left): '
+        'fight with use_move("ABSORB") — no switch needed.'
     ), line
-    _shroomish_out_against(s, (TYPE_FLYING, TYPE_FLYING))  # a TAILLOW's type: Flying hits Grass 2x
-    line = s.srv._switch_train_line(guidance)
-    print("   ", line)
-    assert line.startswith('SWITCH-TRAINING: SHROOMISH') and 'switch_pokemon("TORCHIC")' in line, line
-    # A WHISMUR's type, neutral both ways: it fights on its own too. David (2026-11-03):
-    # "The pokemon are strong enough to fight on their own." (Before, this switched.)
+    # Neutral both ways, ABSORB does ~4 of 20 HP: five turns alone, so the partner (one
+    # hit) is faster. (The old rule let it fight; David asked for faster training.)
     _shroomish_out_against(s, (TYPE_NORMAL, TYPE_NORMAL))
-    line = s.srv._switch_train_line(guidance)
-    assert line.startswith("SHROOMISH can beat SILCOON on its own (") and "1x" in line, line
-    # A foe resisting its best move still brings the partner in: Fire takes Grass at 0.5x.
-    _shroomish_out_against(s, (TYPE_FIRE, TYPE_FIRE))
     assert s.srv._switch_train_line(guidance).startswith("SWITCH-TRAINING: SHROOMISH")
-    # Under half HP it switches even with the advantage. RAM: SHROOMISH (battler 0) 11/23.
+    # A foe that hits back: Flying with GUST (2x on Grass).
+    _shroomish_out_against(s, (TYPE_FLYING, TYPE_FLYING))
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x0C, Move["GUST"].value)
+    _write(s, 8, BATTLE_MONS + 0x58 + 0x24, 20)
+    line = s.srv._switch_train_line(guidance)
+    assert line.startswith('SWITCH-TRAINING: SHROOMISH') and 'switch_pokemon("TORCHIC")' in line, line
+    # Two hits to win, but the foe's ROCK THROW knocks a 6-HP SHROOMISH out in two as well.
     _shroomish_out_against(s, (TYPE_ROCK, TYPE_GROUND))
-    _write(s, 16, BATTLE_MONS + 0x28, 11)
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x0C, Move["ROCK_THROW"].value)
+    _write(s, 8, BATTLE_MONS + 0x58 + 0x24, 15)
+    _write(s, 16, BATTLE_MONS + 0x28, 6)
     assert s.srv._switch_train_line(guidance).startswith("SWITCH-TRAINING: SHROOMISH")
 
 

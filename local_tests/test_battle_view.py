@@ -70,7 +70,9 @@ def test_battle_view_on_lyle_wurmple():
     assert list(by_name) == ["SCRATCH", "GROWL", "FOCUS ENERGY", "EMBER"], by_name
     ember = by_name["EMBER"]
     assert (ember["slot"], ember["type"], ember["power"], ember["pp"]) == (4, "FIRE", 40, 25), ember
-    assert ember["effectiveness"] == 2.0 and ember["stab"] and ember["expected"] == 120.0, ember
+    # "expected" is HP off the foe this turn (2026-11-04; it was power x multipliers, 120
+    # here): EMBER's hit is bigger than WURMPLE's 15 HP, so it counts as the 15 it can take.
+    assert ember["effectiveness"] == 2.0 and ember["stab"] and ember["damage"] > 15 and ember["expected"] == 15.0, ember
     assert by_name["SCRATCH"]["effectiveness"] == 1.0 and by_name["GROWL"]["expected"] == 0, by_name
     assert view["best_move"]["name"] == "EMBER", view["best_move"]
     assert 'Best move now: EMBER (slot 4) — call use_move("EMBER").' in lines, lines
@@ -255,6 +257,54 @@ def test_use_move_refuses_a_status_move_that_cannot_work():
         print("   ", r.get("error"))
         assert r["success"] is False and f"Not using {name}" in r["error"] and why in r["error"], r
         assert _view(s)["menu"] == menu_before  # nothing pressed
+
+
+def _sturdy_water_foe(s):
+    """RAM: Isaac's WHISMUR with 300 HP and WATER type, so hits land and nothing faints."""
+    _poke(s, 16, FOE + 0x28, 300)
+    _poke(s, 16, FOE + 0x2C, 300)
+    _poke(s, 8, FOE + 0x21, 11)
+    _poke(s, 8, FOE + 0x22, 11)
+
+
+def test_damage_estimates_match_the_game():
+    """Moves were scored by ROM power, and NIGHT SHADE / SEISMIC TOSS / SONIC BOOM /
+    DRAGON RAGE have power 1 there. The estimate is pret's CalculateBaseDamage (with the
+    Stone Badge's 1.1x Attack: without it SCRATCH hit 41-42, over the estimate's top).
+    Checked against the game: NIGHT SHADE takes exactly the level, SCRATCH lands in the
+    85-100% roll range (or twice it on a critical hit)."""
+    s = server()
+    for move in ("NIGHT SHADE", "SCRATCH"):
+        s.load(ISAAC)
+        _sturdy_water_foe(s)
+        m = next(x for x in _view(s)["moves"] if x["name"] == move)
+        r = s.call("mcp_use_move", {"move": move, "reasoning": "test"})
+        assert r["success"], r
+        with s.srv.memory_lock:
+            lost = 300 - s.srv.env.memory_reader._read_u16(FOE + 0x28)
+        low, high = m["damage"] / 0.925 * 0.85, m["damage"] / 0.925
+        print(f"    {move}: estimate {m['damage']}, roll {low:.1f}-{high:.1f}, the game took {lost}")
+        if move == "NIGHT SHADE":
+            assert m["damage"] == _view(s)["player"]["level"] == lost == 24, (m, lost)
+        else:
+            assert low - 1 <= lost <= high + 1 or 2 * low - 1 <= lost <= 2 * high + 1, (m, lost)
+
+
+def test_a_fixed_damage_move_is_best_when_it_does_more():
+    """RAM: SABLEYE's Attack at 10, so SCRATCH does a few HP and NIGHT SHADE's 24 is the
+    best move; power-1 scoring never picked NIGHT SHADE."""
+    s = server()
+    s.load(ISAAC)
+    _sturdy_water_foe(s)
+    _poke(s, 16, 0x02024084 + 0x02, 10)  # gBattleMons[0].attack
+    view = _view(s)
+    by_name = {m["name"]: m for m in view["moves"]}
+    print("   ", [(m["name"], m["damage"], m["expected"]) for m in view["moves"]])
+    assert by_name["NIGHT SHADE"]["damage"] == 24 and by_name["SCRATCH"]["damage"] < 24, by_name
+    assert view["best_move"]["name"] == "NIGHT SHADE", view["best_move"]
+    from utils.state_formatter import format_battle_view
+
+    assert any("NIGHT SHADE GHOST 1 PP" in line and "~24 HP" in line for line in format_battle_view(view))
 
 
 def _run_all():

@@ -164,13 +164,16 @@ def test_switch_training_says_switch_on_the_first_turn():
     line = s.srv._switch_train_line(trainee)
     assert line.startswith("TORCHIC can beat WURMPLE on its own (EMBER 2x"), line
     s.load(here / "test_wild_two_party.state")  # TORCHIC out, SHROOMISH in the party
-    # RAM: the wild SILCOON's battle types (gBattleMons[1] +0x21/+0x22) set to Water, a
-    # threat to Fire, so switch-training applies. (Normal was used before David's "they
-    # can fight on their own"; a neutral foe is now fought by the trainee.)
+    # RAM: the wild SILCOON made Water (gBattleMons[1] +0x21/+0x22, EMBER 0.5x) with 60 HP
+    # (+0x28/+0x2C), so TORCHIC would need ~6 hits: switch-training applies. (Since
+    # 2026-11-04 the trainee fights alone by the damage race, not by types: Water alone,
+    # at 20 HP, is EMBER 2 hits against a SILCOON that only knows HARDEN, so it fights.)
     with s.srv.memory_lock:
         memory = s.srv.env.core.memory
         memory.u8[0x02024084 + 0x58 + 0x21] = 11
         memory.u8[0x02024084 + 0x58 + 0x22] = 11
+        memory.u16[0x02024084 + 0x58 + 0x28] = 60
+        memory.u16[0x02024084 + 0x58 + 0x2C] = 60
         s.srv.env.memory_reader._invalidate_mem_cache()
     line = s.srv._switch_train_line(trainee)
     print("   ", line)

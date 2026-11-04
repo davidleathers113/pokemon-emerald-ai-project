@@ -1201,6 +1201,25 @@ prompt. That came to 1.1 tiles walked per minute.
   (the Route 110 gate door, the bike shop, Isaac's switch question at 05:56, the
   replacement menu at 06:49), and the 05:56 rows show the fingerprint holds battle HP.
 
+## Moves scored by estimated HP; the trainee fights alone only if it wins the race (2026-11-04, WEAKNESSES M50, M51)
+- `memory_reader.estimate_damage(attacker, defender, move_id)`: average HP one hit
+  takes, from pret CalculateBaseDamage with the battle structs' stats, stat stages and
+  abilities (`_read_battle_mon` now reads them), badge boosts (ShouldGetStatBadgeBoost),
+  then STAB, the ROM type chart, ability immunities (Levitate, Volt/Water Absorb, Flash
+  Fire, Wonder Guard) and the 92.5% average roll. Fixed damage: NIGHT SHADE / SEISMIC
+  TOSS and PSYWAVE = level, SONIC BOOM 20, DRAGON RAGE 40, SUPER FANG half the HP left.
+- Battle view: each move's `damage`; `expected` = min(damage, foe HP) × accuracy (a sure
+  knockout beats a bigger hit that may miss); ties go to the bigger hit. The moves list
+  shows "~N HP".
+- `_trainee_advantage`: the damage race (see WEAKNESSES M51), `TRAINEE_SOLO_HITS` = 2.
+- *Verified:* against the game on test_switch_question.state (foe HP raised in RAM):
+  NIGHT SHADE took exactly 24 (= level) every time; SCRATCH took 37-43 against an
+  estimate range of 37.4-44.0 (86 and 77 were critical hits). The first version left
+  out badge boosts and SCRATCH's 41-42 topped its range: that is how the Stone Badge
+  boost was found. Tests `test_damage_estimates_match_the_game`,
+  `test_a_fixed_damage_move_is_best_when_it_does_more`; the Lyle test's `expected == 120`
+  (power units) is now `15` (HP, capped at WURMPLE's 15) with a comment.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
