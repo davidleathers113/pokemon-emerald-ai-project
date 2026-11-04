@@ -5140,11 +5140,21 @@ def _usable_field_moves() -> set:
         }
 
 
+def _held_item_names() -> set:
+    """Names of everything in the bag, squashed (server.game_tools.items_reader): which
+    turn-back gates the player can pass (the Go-Goggles open Route 111's desert)."""
+    from server import game_tools
+
+    inventory = _mem(lambda r: r.read_full_inventory())
+    return {game_tools._squash_name(item["name"]) for pocket in inventory.values() for item in pocket}
+
+
 def _install_route_flag_reader() -> None:
     from server import game_tools
 
     game_tools.flag_reader = _route_flag_reader
     game_tools.field_moves_reader = _usable_field_moves
+    game_tools.items_reader = _held_item_names
 
 
 _install_route_flag_reader()
@@ -6667,6 +6677,10 @@ async def _walk_along(
     from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
 
     entered: List[str] = []
+    # (map, go_to_exit argument) of every step that left a map. Seen live: go_to("Route
+    # 113") crossed ROUTE 111 → ROUTE 112 → ROUTE 111 … fifteen times before its map budget
+    # ran out. Taking the same exit off the same map twice in one walk is a loop.
+    crossed = set()
     reads = waits = 0
     for _ in range(max_maps * 3):
         if _mem(lambda r: r.is_in_battle()):
@@ -6710,8 +6724,14 @@ async def _walk_along(
             return entered, f"{goal} can't be reached on foot from {location}"
         if len(entered) >= max_maps:
             return entered, f"{goal} is still {len(route)} maps away"
+        if (location, route[0][0]) in crossed:
+            return entered, (
+                f'the way loops: go_to_exit("{route[0][0]}") from {location} was taken once already on this walk. '
+                f"The way planned now is {' → '.join(name for _, name in route)}"
+            )
         step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
         if _location_name() != location:
+            crossed.add((location, route[0][0]))
             entered.append(_location_name())
         elif not _mem(lambda r: r.is_in_battle()) and _player_can_walk():
             return entered, f'go_to_exit("{route[0][0]}") did not get there ({step.get("summary") or step.get("error")})'

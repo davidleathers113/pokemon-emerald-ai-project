@@ -200,6 +200,70 @@ def test_go_to_walks_map_after_map():
     assert r["success"] is False and "Did not reach Nowhere Town" in r["error"], r
 
 
+def test_go_to_from_south_route111_goes_round_the_desert():
+    """Seen live (12:48-12:54 UTC): go_to("Route 113") from ROUTE 111 (0,66), south of the
+    desert, bounced ROUTE 111 → ROUTE 112 → ROUTE 111 … for fifteen maps. Route 111's west
+    side joins both ROUTE 113 (top) and ROUTE 112, and "west" took the nearest, 112; and
+    the desert between counted as walkable, though without Go-Goggles its sandstorm
+    pushes the player back (pret Route111_EventScript_ViciousSandstormTrigger). The way
+    on foot is round by Fiery Path. test_route111_south_to_113.state is that live save."""
+    s = server()
+    s.load(HERE / "test_route111_south_to_113.state", wild_encounters=False)
+    r = s.call("mcp_go_to", {"place": "Route 113", "reasoning": "test"})
+    print("   ", r.get("error") or r.get("summary"))
+    where = s.srv._location_name()
+    if r["success"]:
+        assert where == "ROUTE 113", (where, r)
+    else:
+        # The way passes unbeaten trainers; a battle with one is a fair stop.
+        assert "a trainer battle started on the way" in r["error"], r
+        assert _in_battle(s)
+    walked = r.get("summary") or r.get("error")
+    assert "ROUTE 112 → ROUTE 111 → ROUTE 112" not in walked and "ROUTE 111 → ROUTE 112 → ROUTE 111" not in walked, r
+
+
+def test_route_plans_know_which_part_of_route111_they_start_in():
+    """From ROUTE 111's north part (0,31) Route 113 is the west edge's top span, named by
+    its map because ROUTE 112 is on the west side too (seen live: "west" walked into 112
+    from there). From the south part the plan goes round by Fiery Path, unless the bag
+    holds the Go-Goggles, which open the desert (the gate's own checkitem)."""
+    from server import game_tools
+
+    s = server()
+    s.load(HERE / "test_route111_south_to_113.state", wild_encounters=False)
+    assert game_tools.place_route("ROUTE 111", (0, 31), "Route 113") == [("ROUTE 113", "ROUTE 113")]
+    south = [name for _, name in game_tools.place_route("ROUTE 111", (0, 66), "Route 113")]
+    print("    from the south:", " → ".join(south))
+    assert "FIERY PATH" in south and south[-1] == "ROUTE 113", south
+    real = game_tools.items_reader
+    try:
+        game_tools.items_reader = lambda: real() | {"GOGOGGLES"}
+        game_tools._items_cache[0] = 0.0
+        assert game_tools.place_route("ROUTE 111", (0, 66), "Route 113") == [("ROUTE 113", "ROUTE 113")]
+    finally:
+        game_tools.items_reader = real
+        game_tools._items_cache[0] = 0.0
+
+
+def test_a_walk_that_loops_between_two_maps_stops():
+    """Seen live: a wrong plan bounced ROUTE 111 ↔ ROUTE 112 until go_to's fifteen-map
+    budget ran out (six minutes). A plan that sends the walk off the same map by the same
+    exit twice stops there, saying so. The plan here is made to loop on purpose: north
+    from ROUTE 101, south from OLDALE TOWN, toward a goal never reached."""
+    import asyncio
+
+    s = server()
+    s.load(ROUTE101, wild_encounters=False)
+
+    def looping(location, position):
+        return [("north", "OLDALE TOWN")] if location == "ROUTE 101" else [("south", "ROUTE 101")]
+
+    entered, why = asyncio.run(s.srv._walk_along(looping, lambda: False, "Nowhere", "test", "go_to again", 15))
+    print("   ", entered, why)
+    assert entered == ["OLDALE TOWN", "ROUTE 101"], entered
+    assert why and "the way loops" in why and 'go_to_exit("north") from ROUTE 101' in why, why
+
+
 def test_heal_from_a_route_walks_to_the_next_town():
     """ROUTE 101 to OLDALE TOWN's center: a map edge, a door, and wild grass on the way
     (a wild battle there is run from)."""

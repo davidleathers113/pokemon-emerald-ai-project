@@ -930,10 +930,126 @@ def clearable_obstacles(map_dir: str) -> dict:
     return out
 
 
+# () -> squashed names of the items in the bag (_squash_name), installed by the server.
+# None: no item is held, so every gate below stays shut.
+items_reader = None
+
+
+_items_cache: list = [0.0, set()]
+
+
+def _held_items() -> set:
+    """items_reader's answer, kept for a second like _usable_field_moves."""
+    import time
+
+    if items_reader is None:
+        return set()
+    if time.monotonic() - _items_cache[0] < 1.0:
+        return _items_cache[1]
+    try:
+        items = set(items_reader())
+    except Exception as e:  # unreadable bag: gates stay shut
+        logger.debug(f"bag unreadable: {e}")
+        items = set()
+    _items_cache[:] = [time.monotonic(), items]
+    return items
+
+
+@lru_cache(maxsize=None)
+def _script_labels(map_dir: str) -> tuple:
+    """(label -> its lines, labels in file order) from data/maps/<dir>/scripts.inc."""
+    from pokemon_env.porymap_paths import get_porymap_root
+
+    root = get_porymap_root()
+    path = Path(root) / "data" / "maps" / map_dir / "scripts.inc" if root and map_dir else None
+    labels: dict = {}
+    order: list = []
+    if path is None or not path.exists():
+        return labels, order
+    current = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.split("@")[0].strip()
+        if not text:
+            continue
+        if not line[0].isspace() and text.endswith(":"):
+            current = text.rstrip(":")
+            labels[current] = []
+            order.append(current)
+        elif current is not None:
+            labels[current].append(text)
+    return labels, order
+
+
+def _script_lines(map_dir: str, label: str) -> List[str]:
+    """Every line a map script can run from label: its gotos, calls and the labels it
+    falls through into (a label without end/return/goto runs on into the next one)."""
+    labels, order = _script_labels(map_dir)
+    lines, seen, stack = [], set(), [label]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in labels:
+            continue  # shared scripts (data/scripts/*.inc) aren't read
+        seen.add(name)
+        body = labels[name]
+        lines.extend(body)
+        for line in body:
+            command, _, args = line.partition(" ")
+            if command in ("goto", "call") or command.startswith(("goto_if", "call_if")):
+                stack.append(args.split(",")[-1].strip())
+        last = body[-1].partition(" ")[0] if body else ""
+        if last not in ("end", "return", "goto") and order.index(name) + 1 < len(order):
+            stack.append(order[order.index(name) + 1])
+    return lines
+
+
+_PLAYER_IDS = ("LOCALID_PLAYER", "OBJ_EVENT_ID_PLAYER")
+
+
+@lru_cache(maxsize=None)
+def turn_back_gates(map_dir: str) -> tuple:
+    """((x, y), items that open it) for each trigger that turns the player back.
+
+    A coord trigger on a VAR_TEMP_* var fires on every visit (temp vars are cleared on
+    each map load, pret ClearTempFieldEventData), and one whose script moves the player
+    is a gate: pret Route111_EventScript_ViciousSandstormTrigger pushes the player back
+    out of the desert unless checkitem ITEM_GO_GOGGLES finds them; the Cycling Road
+    entrances push a player on foot back. The items are the ones its script checks for
+    (none: nothing in the bag opens it).
+
+    Seen live: go_to("Route 113") from ROUTE 111 (0,66), south of the desert, planned
+    straight north across it with no Go-Goggles; the real way is round by Fiery Path.
+    """
+    gates = []
+    for event in _raw_map_json(map_dir).get("coord_events") or []:
+        if event.get("type") != "trigger" or not str(event.get("var", "")).startswith("VAR_TEMP_"):
+            continue
+        lines = _script_lines(map_dir, str(event.get("script", "")))
+        moves_player = any(
+            line.partition(" ")[0] == "applymovement" and line.partition(" ")[2].split(",")[0].strip() in _PLAYER_IDS
+            for line in lines
+        )
+        if not moves_player:
+            continue
+        items = frozenset(
+            _squash_name(line.partition(" ")[2].split(",")[0].strip().removeprefix("ITEM_"))
+            for line in lines
+            if line.partition(" ")[0] == "checkitem"
+        )
+        gates.append(((int(event.get("x", -1)), int(event.get("y", -1))), items))
+    return tuple(gates)
+
+
+def _shut_gates(map_dir: str) -> set:
+    """turn_back_gates tiles the bag does not open now."""
+    held = _held_items()
+    return {tile for tile, items in turn_back_gates(map_dir) if not items or not items <= held}
+
+
 def _obstacle_tiles(map_dir: str) -> frozenset:
     """Tiles holding an obstacle object that is still there (its hide flag not set), less
-    the ones the party can clear now (clearable_obstacles: routes go through those)."""
-    blocked = set()
+    the ones the party can clear now (clearable_obstacles: routes go through those), and
+    the turn_back_gates the bag does not open."""
+    blocked = _shut_gates(map_dir)
     usable = _usable_field_moves()
     for obj in _raw_map_json(map_dir).get("object_events") or []:
         if obj.get("graphics_id") not in _OBSTACLE_GRAPHICS:
@@ -1079,7 +1195,14 @@ def _walk_exits(map_dir: str) -> tuple:
     here = _route_areas(map_dir)
     height, width = len(grid), max(len(row) for row in grid)
     out = set()
-    for conn in raw.get("connections") or []:
+    connections = raw.get("connections") or []
+    # Seen live: ROUTE 111's west side joins ROUTE 113 (top) and ROUTE 112 (lower down).
+    # go_to("Route 113") said go_to_exit("west"), which took the nearest west tile into
+    # ROUTE 112; from there the way back was "east", and the walk bounced between the two
+    # for six minutes. Where one side has several neighbours the argument names the map,
+    # which go_to_exit narrows to that connection's span.
+    sides = [conn.get("direction") for conn in connections]
+    for conn in connections:
         direction = conn.get("direction")
         dest = _map_dirs_by_const().get(str(conn.get("map", "")))
         dest_grid = _static_grid(dest) if dest else None
@@ -1097,9 +1220,10 @@ def _walk_exits(map_dir: str) -> tuple:
             pairs = [((width - 1, y), (0, y - offset)) for y in range(height)]
         there = _route_areas(dest)
         name = _readable_map_name(conn["map"])
+        exit_arg = name if sides.count(direction) > 1 else EDGE_NAMES[direction]
         for mine, theirs in pairs:
             if mine in here and theirs in there:
-                out.add((here[mine], EDGE_NAMES[direction], dest, there[theirs], name))
+                out.add((here[mine], exit_arg, dest, there[theirs], name))
     warps = raw.get("warp_events") or []
     # Seen live: GRANITE CAVE B1F has two ladders up to GRANITE CAVE 1F, one to the
     # entrance and one to the part with Steven's Room; go_to_exit("GRANITE CAVE 1F") took
@@ -1349,6 +1473,10 @@ def _exit_distance(map_dir: str, position: Tuple[int, int], exit_arg: str) -> in
     x, y = position
     grid = _static_grid(map_dir) or ()
     edges = {name: direction for direction, name in EDGE_NAMES.items()}
+    # An edge named by its map (a side with several neighbours, _walk_exits).
+    for conn in _raw_map_json(map_dir).get("connections") or []:
+        if conn.get("direction") in EDGE_NAMES:
+            edges.setdefault(_readable_map_name(str(conn.get("map", ""))), conn["direction"])
     if exit_arg in edges and grid:
         height, width = len(grid), max(len(row) for row in grid)
         return {"up": y, "down": height - 1 - y, "left": x, "right": width - 1 - x}[edges[exit_arg]]

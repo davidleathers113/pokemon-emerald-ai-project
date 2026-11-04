@@ -1379,6 +1379,25 @@ prompt. That came to 1.1 tiles walked per minute.
   (18,14) the trip could cross an unbeaten trainer at (8,12) depending on his facing, so
   that start was not used.
 
+## go_to no longer bounces between two maps (2026-11-04, WEAKNESSES R25)
+- Seen live 12:48-12:54 UTC: go_to("Route 113") from ROUTE 111 bounced ROUTE 111 ↔ ROUTE
+  112 for fifteen maps, from the south part and then from the north part too.
+- `_walk_exits`: where one side of a map has several neighbours (ROUTE 111's west: ROUTE
+  113 and ROUTE 112), the go_to_exit argument is the map's name, not "west".
+- `turn_back_gates`: triggers on VAR_TEMP_* vars whose script moves the player are walls
+  for route areas unless the bag holds what the script checks for (`items_reader`,
+  installed by the server). Route 111's desert splits the route in two without
+  Go-Goggles.
+- `_walk_along`: the same exit off the same map twice in one walk stops it ("the way
+  loops: …").
+- stall_watch WANDER: 5 minutes among 2-3 maps with at least 2 returns, no objective
+  completed and the party unchanged. Replayed over the last runs' rows (about 32 hours) it
+  fires 30 times, all back-and-forth loops (Oldale Mart, Verdanturf ↔ ROUTE 117, Mauville
+  bike shop, ROUTE 111 ↔ 112 from 12:28 UTC).
+- *Verified:* from test_route111_south_to_113.state (live save) go_to now walks Fiery Path
+  → ROUTE 112 → ROUTE 111 north and is stopped by trainer WILTON's battle; the old code
+  reproduces the live fifteen-map bounce. A forced looping plan stops after one round.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
