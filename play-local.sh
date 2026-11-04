@@ -6,9 +6,10 @@
 #   ./play-local.sh stop     checkpoint, then stop the running game
 #
 # Defaults to the local Ollama model. To use a cloud model instead, set e.g.
-#   BACKEND=gemini MODEL=gemini-2.5-flash GEMINI_API_KEY=... ./play-local.sh
+#   BACKEND=gemini MODEL=gemini-3.8-flash GEMINI_API_KEY=... ./play-local.sh
 # Gemini's free tier first, the local model when its daily quota is used up:
-#   BACKEND=gemini+ollama GEMINI_API_KEY=... [GEMINI_MODEL=gemini-2.5-flash] ./play-local.sh
+#   BACKEND=gemini+ollama GEMINI_API_KEY=... [GEMINI_MODEL=gemini-3.8-flash] ./play-local.sh
+# (gemini-2.5-flash is listed but answers new keys "no longer available to new users".)
 # Works with macOS /bin/bash 3.2 (empty arrays are expanded with ${a[@]+...}).
 set -euo pipefail
 

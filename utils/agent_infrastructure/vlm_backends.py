@@ -2398,9 +2398,9 @@ class GeminiBackend(VLMBackend):
         self.tools = tools or []
         self.system_instruction = system_instruction
         self._uses_cached_content_context = False
-        # Most seconds one call may spend waiting out rate limits and server errors before
-        # it raises (None = up to 5 tries, ~62 s). FallbackBackend sets it, then lets the
-        # local model play that step.
+        # Most seconds one call may take in all, Gemini's answer time and the waits for rate
+        # limits and server errors alike, before it raises (None = up to 5 tries at the
+        # model's own timeout). FallbackBackend sets it, then lets the local model play.
         self.max_retry_wait_s = kwargs.get("max_retry_wait_s")
         # Raise every error instead of the text-only retry and canned "press 'A'" reply.
         # FallbackBackend sets it: seen in a live check (2026-11-04), a 404 for the model
@@ -2547,11 +2547,20 @@ class GeminiBackend(VLMBackend):
         max_retries = 5
         base_delay = 2  # Start with 2 second delay
         waited = 0.0
+        # max_retry_wait_s bounds the whole call, Gemini's own time included. Seen in the
+        # live check (2026-11-04): gemini-3.8-flash under "high demand" timed out at 60 s
+        # three times while only the sleeps between were counted, ~4 minutes for a step.
+        started = time.monotonic()
+
+        def left() -> Optional[float]:
+            return None if self.max_retry_wait_s is None else self.max_retry_wait_s - (time.monotonic() - started)
 
         for attempt in range(max_retries):
             try:
                 # Configure tool calling to require function calls when tools are available
-                generation_kwargs = {"request_options": {"timeout": timeout}}
+                budget = left()
+                call_timeout = timeout if budget is None else max(1.0, min(timeout, budget))
+                generation_kwargs = {"request_options": {"timeout": call_timeout}}
 
                 if self.tools:
                     # Force function calling mode - require the model to call a function
@@ -2574,7 +2583,8 @@ class GeminiBackend(VLMBackend):
                     raise
                 # The server's own retry hint when it gives one, else 2s, 4s, 8s, 16s.
                 delay = hint if hint else base_delay * (2**attempt) + random.uniform(0, 1)
-                over_budget = self.max_retry_wait_s is not None and waited + delay > self.max_retry_wait_s
+                budget = left()
+                over_budget = budget is not None and delay >= budget
                 if attempt == max_retries - 1 or over_budget:
                     logger.error(
                         f"Gave up after {attempt + 1} tries ({waited:.0f} s waited; {kind}): {type(e).__name__}: {e}"
@@ -2844,7 +2854,9 @@ class GeminiBackend(VLMBackend):
             return "I encountered an error processing the request. I'll proceed with a basic action: press 'A' to continue."
 
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# David's choice (2026-11-04). gemini-2.5-flash, still in the model list, answered a new
+# key with "404 This model … is no longer available to new users".
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 # Gemini's free-tier daily quotas reset at midnight Pacific time.
 GEMINI_RESET_TZ = "America/Los_Angeles"
 # Seconds one step may wait on Gemini's per-minute limit or a server error before the

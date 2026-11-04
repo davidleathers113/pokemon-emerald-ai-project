@@ -125,6 +125,32 @@ def test_gemini_waits_out_a_per_minute_limit_only_within_its_cap():
     assert not slept.called and len(calls) == 1
 
 
+def test_the_cap_covers_gemini_s_own_time_not_only_the_waits():
+    """Seen in the live check (2026-11-04): gemini-3.8-flash under "high demand" timed out
+    at its 60 s request timeout three times; only the sleeps were counted against the
+    30 s cap, so the step took ~4 minutes before the local model could play it. Now each
+    request's timeout is what is left of the cap, and the clock includes the requests."""
+    backend, _ = _gemini([], cap=30)
+    timeouts = []
+    clock = [1000.0]
+
+    def slow(parts, **kwargs):
+        timeouts.append(kwargs["request_options"]["timeout"])
+        clock[0] += kwargs["request_options"]["timeout"]  # the request runs out its timeout
+        raise gx.DeadlineExceeded("Deadline expired before operation could complete.")
+
+    backend.model = SimpleNamespace(generate_content=slow)
+    with mock.patch.object(vb.time, "monotonic", side_effect=lambda: clock[0]), \
+            mock.patch.object(vb.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+        try:
+            backend._call_generate_content(["x"])
+            raise AssertionError("expected DeadlineExceeded")
+        except gx.DeadlineExceeded:
+            pass
+    assert timeouts == [30], timeouts  # no time left for a retry after a 30 s request
+    assert clock[0] - 1000.0 <= 30, clock
+
+
 def test_a_quota_error_is_not_hidden_behind_a_canned_reply():
     """GeminiBackend.get_query retried text-only on any error, and get_text_query turned
     errors into "I encountered an error… press 'A'": a used-up quota never reached the
@@ -172,8 +198,8 @@ def test_a_per_minute_limit_stays_on_gemini():
     assert backend.primary.kwargs["max_retry_wait_s"] == vb.FALLBACK_MAX_PRIMARY_WAIT_S
     backend.primary.errors.append(_quota(MINUTE_ID))
     assert backend.get_query(None, "step 1") == "qwen3-vl:8b-instruct: step 1"  # this step only
-    assert backend.get_query(None, "step 2") == "gemini-2.5-flash: step 2"
-    assert backend.current_model == "gemini-2.5-flash" and said == [] and backend.on_secondary_until is None
+    assert backend.get_query(None, "step 2") == f"{vb.DEFAULT_GEMINI_MODEL}: step 2"
+    assert backend.current_model == vb.DEFAULT_GEMINI_MODEL and said == [] and backend.on_secondary_until is None
     backend.primary.errors.append(gx.ServiceUnavailable("overloaded"))  # David: Qwen for that step
     assert backend.get_query(None, "step 3").startswith("qwen3-vl") and said == []
 
@@ -225,7 +251,7 @@ def test_a_rejected_key_switches_for_the_whole_run():
     backend, said = _fallback()
     backend.primary.errors.append(_bad_key())
     assert backend.get_query(None, "x").startswith("qwen3-vl")
-    assert said and "Gemini refused gemini-2.5-flash (InvalidArgument: API key not valid)" in said[0], said
+    assert said and f"Gemini refused {vb.DEFAULT_GEMINI_MODEL} (InvalidArgument: API key not valid)" in said[0], said
     assert "test-key" not in said[0], said
     with mock.patch.object(vb.time, "time", return_value=4_000_000_000):  # long after any reset
         backend.get_query(None, "y")
