@@ -1106,6 +1106,20 @@ prompt. That came to 1.1 tiles walked per minute.
 - *Verified:* `test_will_player_change_pokemon_is_answered_not_handed_back` fails on the
   old condition with the live message and passes now.
 
+## Stall watcher: judge a call by where it left the player; skip old rows (2026-11-04)
+- Seen live 06:14: "SAME_TILE … (12, 4) on VERDANTURF TOWN (navigate_to, navigate_to,
+  go_to_exit)" paused the agent though the go_to_exit had reached ROUTE 117. A row's
+  location is where its decision was made, so a call's end tile is the next row's.
+  `stall_reason` now counts a move call only when the next row is on the same tile; the
+  newest call waits for the next decision.
+- Seen live 01:17: after a restart the new run's trajectory file began with the previous
+  run's rows (timestamps kept), and the stall already handled paused the agent again.
+  The watcher now judges only rows after its start or the last unpause (`rows_after`).
+- *Verified:* `test_stall_watch.py` 6/6 (two new; the old three-walks test assumed a row
+  is where its call ended and now adds the next row). Replaying every run file from
+  2026-11-04: the Verdanturf report is gone; the real stalls (navigate_to ×3 at (0,6) on
+  ROUTE 117, 06:17) still fire.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

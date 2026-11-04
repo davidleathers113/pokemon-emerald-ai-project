@@ -7,8 +7,9 @@ the agent (POST /agent_pause), so no more time is spent until someone looks. It 
 again once the agent is running.
 
 Stuck means any of:
-  - SAME_TILE: the last 3 walking/training calls ended with the player on the same tile
-    and map (battles are left out: a battle keeps the player still on purpose);
+  - SAME_TILE: the last 3 walking/training calls each ended with the player on the tile
+    and map it started from (battles are left out: a battle keeps the player still on
+    purpose);
   - REPEAT: the same tool with the same arguments 4 times in a row;
   - DOWN: the game server did not answer 3 polls in a row.
 
@@ -81,27 +82,56 @@ def _took(rows: list, i: int) -> float:
 WORKED_S = 60.0
 
 
+def _spot(row: dict) -> tuple:
+    return row.get("location"), tuple(row.get("player_coords") or ())
+
+
 def stall_reason(rows: list) -> str:
-    """Why these decisions look stuck, or '' (pure: tested in local_tests)."""
+    """Why these decisions look stuck, or '' (pure: tested in local_tests).
+
+    A row's location and player_coords are where the player stood when that decision
+    was made, so where a call LEFT the player is the next row's. Seen live: navigate_to,
+    navigate_to, go_to_exit("east") from (12,4) in VERDANTURF TOWN was reported stuck
+    though the go_to_exit had reached ROUTE 117; each row's own (starting) tile was
+    compared. The newest call has no next row yet and is judged once it does.
+    """
     moves = []
-    for i, r in enumerate(rows):
+    for i, r in enumerate(rows[:-1]):
         if _call(r)[0] not in MOVE_TOOLS:
             continue
-        if _took(rows, i) > WORKED_S:
+        if _took(rows, i) > WORKED_S or _spot(rows[i + 1]) != _spot(r):
             moves = []  # progress: start counting again
             continue
         moves.append(r)
     tail = moves[-SAME_TILE_RUN:]
     if len(tail) == SAME_TILE_RUN:
-        spots = {(r.get("location"), tuple(r.get("player_coords") or ())) for r in tail}
-        if len(spots) == 1:
-            loc, xy = next(iter(spots))
-            names = ", ".join(_call(r)[0] for r in tail)
-            return f"SAME_TILE: {SAME_TILE_RUN} walk/train calls left the player at {xy} on {loc} ({names})"
+        loc, xy = _spot(tail[-1])
+        names = ", ".join(_call(r)[0] for r in tail)
+        return f"SAME_TILE: {SAME_TILE_RUN} walk/train calls left the player at {xy} on {loc} ({names})"
     calls = [_call(r) for r in rows[-REPEAT_RUN:]]
     if len(calls) == REPEAT_RUN and calls[0][0] and all(c == calls[0] for c in calls):
         return f"REPEAT: {calls[0][0]}({json.dumps(calls[0][1])}) {REPEAT_RUN} times in a row"
     return ""
+
+
+def rows_after(rows: list, watch_from: str) -> list:
+    """The rows decided after watch_from (an ISO time like the rows' timestamps).
+
+    Seen live: after ./play-local.sh restarted the game, the new run's trajectory file
+    began with the previous run's rows (their own timestamps kept), so the stall that
+    had just been reported and handled paused the agent again right after the unpause.
+    """
+    from datetime import datetime
+
+    start = datetime.fromisoformat(watch_from)
+    kept = []
+    for row in rows:
+        try:
+            if datetime.fromisoformat(row["timestamp"]) > start:
+                kept.append(row)
+        except (KeyError, ValueError, TypeError):
+            continue
+    return kept
 
 
 def main() -> int:
@@ -109,19 +139,28 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--no-pause", action="store_true", help="only report, never pause the agent")
     args = parser.parse_args()
+    from datetime import datetime
+
     last_seen = None  # timestamp of the decision a stall was reported on
+    # Only decisions made after this count: the watcher's start, then each unpause
+    # (whoever unpaused has dealt with what came before).
+    watch_from = datetime.now().isoformat()
+    was_paused = False
     down = 0
     while True:
         try:
             paused = bool(_get("/agent_pause").get("paused"))
             down = 0
+            if was_paused and not paused:
+                watch_from = datetime.now().isoformat()
+            was_paused = paused
         except Exception:
             down += 1
             if down == DOWN_RUN:
                 print(f"DOWN: the game server did not answer {DOWN_RUN} polls ({args.interval * DOWN_RUN:.0f} s)", flush=True)
             time.sleep(args.interval)
             continue
-        rows = _latest_decisions()
+        rows = rows_after(_latest_decisions(), watch_from)
         newest = rows[-1].get("timestamp") if rows else None
         if not paused and newest and newest != last_seen:
             why = stall_reason(rows)

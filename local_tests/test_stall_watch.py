@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "local_tools"))
-from stall_watch import stall_reason
+from stall_watch import rows_after, stall_reason
 
 
 def _row(tool, args=None, loc="ROUTE 117", xy=(47, 5), ts="t"):
@@ -16,8 +16,38 @@ def _row(tool, args=None, loc="ROUTE 117", xy=(47, 5), ts="t"):
 
 def test_three_walks_on_one_tile_are_a_stall():
     """Seen live: train / navigate_to / train, all from (47,5) on ROUTE 117."""
+    # A row is where its decision was made; the next row shows where the call left the
+    # player. (Before 2026-11-04 the third call's own row was taken as its end.)
     rows = [_row("train", {"trainee": "BRELOOM"}), _row("navigate_to", {"x": 47, "y": 4}), _row("train", {"trainee": "BRELOOM"})]
+    assert stall_reason(rows) == ""  # the third call hasn't finished yet
+    rows.append(_row("get_walkthrough", {"part": 1}))
     assert stall_reason(rows).startswith("SAME_TILE: 3 walk/train calls left the player at (47, 5) on ROUTE 117")
+
+
+def test_a_call_that_moved_the_player_is_not_stuck():
+    """Seen live: navigate_to, navigate_to (an unreachable door), then go_to_exit("east")
+    from (12,4) on VERDANTURF TOWN reached ROUTE 117 (0,6), and was reported as a stall."""
+    rows = [
+        _row("navigate_to", {"x": 12, "y": 2}, loc="VERDANTURF TOWN", xy=(12, 4)),
+        _row("navigate_to", {"x": 12, "y": 2}, loc="VERDANTURF TOWN", xy=(12, 4)),
+        _row("go_to_exit", {"exit": "east"}, loc="VERDANTURF TOWN", xy=(12, 4)),
+        _row("navigate_to", {"x": 11, "y": 1}, loc="ROUTE 117", xy=(0, 6)),
+    ]
+    assert stall_reason(rows) == ""
+    # The same three, all failing, are still a stall.
+    rows[-1] = _row("navigate_to", {"x": 11, "y": 1}, loc="VERDANTURF TOWN", xy=(12, 4))
+    assert stall_reason(rows).startswith("SAME_TILE: 3 walk/train calls left the player at (12, 4) on VERDANTURF TOWN"), stall_reason(rows)
+
+
+def test_rows_from_before_the_watch_started_are_not_judged():
+    """Seen live: a restart's new trajectory file began with the previous run's rows, and
+    the stall already reported and handled paused the agent again after the unpause."""
+    old = [_row("navigate_to", {"x": 11, "y": 1}, xy=(0, 6), ts=f"2026-11-04T06:1{i}:00") for i in range(5)]
+    assert stall_reason(old).startswith("SAME_TILE")
+    assert rows_after(old, "2026-11-04T06:17:36") == []
+    new = _row("go_to", {"place": "Route 117"}, xy=(0, 6), ts="2026-11-04T06:18:10")
+    assert rows_after(old + [new], "2026-11-04T06:17:36") == [new]
+    assert rows_after([{"timestamp": "garbled"}, new], "2026-11-04T06:17:36") == [new]
 
 
 def test_battles_and_progress_are_not_stalls():
