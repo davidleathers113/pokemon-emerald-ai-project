@@ -1234,6 +1234,21 @@ prompt. That came to 1.1 tiles walked per minute.
   the reading from gEnemyParty equals the game's gBattleMons ability (STURDY); the first
   check read the wrong enemy slot (gBattlerPartyIndexes names the one out).
 
+## COUNTER is not an attack (2026-11-04, WEAKNESSES M52)
+- Seen live 08:17 (the stall watcher's REPEAT): BRELOOM used COUNTER ×4 on an ILLUMISE
+  that only used status moves; the view had made it "Best move now" (~2 HP from its ROM
+  power 1), and it also counted as a damaging move with PP, so neither the switch hint
+  nor TEAM IS WEAK fired.
+- `memory_reader.is_attack(gBattleMoves entry)`: power > 0 and not COUNTER, MIRROR COAT,
+  BIDE or SPIT UP (`CONDITIONAL_DAMAGE_EFFECTS`, pret battle_move_effects.h). Used by
+  `estimate_damage`, `counter_score` (via `attack_type`), `_switch_hint` and
+  `assess_team_condition`. Battle-view moves carry `conditional`; both labels say "only
+  returns a hit taken". `status_move_failure` refuses COUNTER / MIRROR COAT when none of
+  the foe's moves (gBattleMons) is a physical / special attack.
+- *Verified:* `test_counter_is_not_an_attack`: no best move, `switch_pokemon("COMBUSKEN")`
+  named, the refusal; with POUND in the foe's moves COUNTER is allowed; a BRELOOM with
+  COUNTER 6 PP and HEADBUTT 0 PP is TEAM IS WEAK.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

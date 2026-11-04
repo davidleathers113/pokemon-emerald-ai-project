@@ -78,6 +78,24 @@ EFFECTS_MAJOR_STATUS = (EFFECT_SLEEP, EFFECT_TOXIC, EFFECT_POISON, EFFECT_PARALY
 # Damage estimate (estimate_damage): pret battle_move_effects.h, abilities.h and
 # pokemon.c gStatStageRatios (stage -6..+6 as numerator/denominator).
 G_ABILITY_NAMES = 0x0831B6DB  # gAbilityNames, pret symbols (78 x 13 bytes)
+# Moves that only do damage after something else happens: COUNTER and MIRROR COAT
+# return a physical/special hit taken that turn, BIDE stores two turns of hits, SPIT UP
+# needs STOCKPILE. Seen live: BRELOOM, out of attacks, used COUNTER four times on an
+# ILLUMISE that only used status moves ("But it failed!"); COUNTER's ROM power 1 had made
+# it the "best move" and an attack with PP. pret battle_move_effects.h.
+EFFECT_BIDE = 26
+EFFECT_COUNTER = 89
+EFFECT_MIRROR_COAT = 144
+EFFECT_SPIT_UP = 161
+CONDITIONAL_DAMAGE_EFFECTS = (EFFECT_BIDE, EFFECT_COUNTER, EFFECT_MIRROR_COAT, EFFECT_SPIT_UP)
+
+
+def is_attack(move_data: Optional[Dict[str, int]]) -> bool:
+    """A gBattleMoves entry that hits for damage on its own: power above 0 and not one of
+    CONDITIONAL_DAMAGE_EFFECTS."""
+    return bool(move_data) and move_data["power"] > 0 and move_data.get("effect") not in CONDITIONAL_DAMAGE_EFFECTS
+
+
 FLAG_BADGE01_GET = 0x867  # pret flags.h SYSTEM_FLAGS + 0x7; badges 2-8 follow
 EFFECT_EXPLOSION = 7
 EFFECT_SUPER_FANG = 40
@@ -127,7 +145,7 @@ def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]
         damaging = []
         for move, pp in zip(lead.moves, lead.move_pp):
             data = move_data(move)
-            if data and data["power"] > 0 and data["pp"] > 0:
+            if is_attack(data) and data["pp"] > 0:
                 damaging.append((move.replace("_", " "), pp, data["pp"]))
         if damaging and all(pp <= base * TEAM_LOW_PP_SHARE for _, pp, base in damaging):
             reasons.extend(f"{move} {pp}/{base} PP" for move, pp, base in damaging)
@@ -1570,6 +1588,15 @@ class PokemonEmeraldReader:
         data = self._rom_battle_move(move_id)
         return data["type"], data["power"]
 
+    def attack_type(self, move_name: str) -> Optional[int]:
+        """The move's TYPE_* id if it is an attack (is_attack), else None."""
+        try:
+            move_id = Move[str(move_name).upper().replace(" ", "_")].value
+        except KeyError:
+            return None
+        data = self._rom_battle_move(move_id)
+        return data["type"] if is_attack(data) else None
+
     def counter_score(self, mon: PokemonData, foe_types: List[int]) -> float:
         """How well a party Pokémon matches up against a foe of these types: its best
         damaging move with PP left (multiplier, with STAB) divided by the foe's worst
@@ -1580,10 +1607,9 @@ class PokemonEmeraldReader:
         ]
         offence = 0.0
         for move, pp in zip(mon.moves or [], mon.move_pp or []):
-            info = self.move_type_and_power(move) if move and pp else None
-            if not info or not info[1]:
+            move_type = self.attack_type(move) if move and pp else None
+            if move_type is None:
                 continue
-            move_type, _ = info
             offence = max(offence, self.type_effectiveness(move_type, foe_types) * (1.5 if move_type in own_types else 1.0))
         threat = max((self.type_effectiveness(t, own_types) for t in dict.fromkeys(foe_types)), default=1.0)
         return offence / max(threat, 0.25)
@@ -1603,6 +1629,8 @@ class PokemonEmeraldReader:
         """
         data = self._rom_battle_move(move_id)
         move_type, effect = data["type"], data["effect"]
+        if effect in CONDITIONAL_DAMAGE_EFFECTS:
+            return 0.0  # no damage of its own (COUNTER returns a hit taken, ...)
         effectiveness = self.type_effectiveness(move_type, defender["type_ids"])
         ability = defender.get("ability")
         absorbs = {ABILITY_VOLT_ABSORB: 13, ABILITY_WATER_ABSORB: 11, ABILITY_FLASH_FIRE: 10, ABILITY_LEVITATE: 4}
@@ -1693,6 +1721,16 @@ class PokemonEmeraldReader:
         if not target:
             return None
         data = self._rom_battle_move(move_id)
+        if data["effect"] in (EFFECT_COUNTER, EFFECT_MIRROR_COAT):
+            # pret Cmd_counterdamagecalculator / mirrorcoatdamagecalculator: it fails
+            # unless the foe hit with a physical (COUNTER) or special (MIRROR COAT) move
+            # this turn. A foe whose moves can't do that makes it fail every time.
+            physical = data["effect"] == EFFECT_COUNTER
+            foe_moves = [self._rom_battle_move(m) for m in target.get("move_ids") or [] if m]
+            if foe_moves and not any(is_attack(m) and (m["type"] < 9) == physical for m in foe_moves):
+                kind = "physical" if physical else "special"
+                return f"{str(target.get('name', 'the foe')).upper()} has no {kind} attack to return: it would fail"
+            return None
         if data["power"]:
             return None
         effect, types = data["effect"], set(target.get("type_ids") or [])
@@ -1738,7 +1776,7 @@ class PokemonEmeraldReader:
                 continue
             score = self.counter_score(mon, foe_types) if foe_types else 0.0
             has_attack = any(
-                pp and (self.move_type_and_power(move) or (0, 0))[1] for move, pp in zip(mon.moves or [], mon.move_pp or [])
+                pp and self.attack_type(move) is not None for move, pp in zip(mon.moves or [], mon.move_pp or [])
             )
             if has_attack and (best is None or score > best["score"]):
                 best = {"slot": index + 1, "name": mon.species_name.upper(), "score": score}
@@ -1886,6 +1924,7 @@ class PokemonEmeraldReader:
                     "pp": pp,
                     "effectiveness": effectiveness,
                     "stab": stab,
+                    "conditional": data["effect"] in CONDITIONAL_DAMAGE_EFFECTS,
                     "damage": round(damage, 1),
                     "expected": round(expected, 1),
                 })

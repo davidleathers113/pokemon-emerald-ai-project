@@ -345,6 +345,8 @@ def _battle_mon_line(mon):
 def _effectiveness_label(move):
     if not move['power']:
         return "status move"
+    if move.get('conditional'):
+        return "only returns a hit taken (no damage on its own)"
     eff = move['effectiveness']
     if eff == 0:
         return "no effect"

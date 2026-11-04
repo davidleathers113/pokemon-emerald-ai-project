@@ -332,6 +332,51 @@ def test_abilities_read_as_the_game_reads_them():
     assert mine == games, (mine, games)
 
 
+def test_counter_is_not_an_attack():
+    """Seen live: BRELOOM had COUNTER (PP 6) and its attacks at 0 PP against a wild
+    ILLUMISE that only used status moves; the view said "COUNTER ~2 HP, Best move now:
+    COUNTER", and four uses all failed. RAM: SABLEYE's slot 1 is COUNTER, its other moves
+    at 0 PP; the foe's moves are GROWL and SUPERSONIC."""
+    from pokemon_env.emerald_utils import ADDRESSES
+    from pokemon_env.enums import Move
+    from pokemon_env.memory_reader import assess_team_condition
+    from pokemon_env.types import PokemonData
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(ISAAC)
+    _poke(s, 16, 0x02024084 + 0x0C, Move["COUNTER"].value)
+    _poke(s, 8, PLAYER_PP, 6)
+    for slot in (2, 3, 4):
+        _poke(s, 8, PLAYER_PP + slot - 1, 0)
+    _poke(s, 16, FOE + 0x0C, Move["GROWL"].value)
+    _poke(s, 16, FOE + 0x0E, Move["SUPERSONIC"].value)
+    _poke(s, 16, FOE + 0x10, 0)
+    _poke(s, 16, FOE + 0x12, 0)
+    view = _view(s)
+    counter = next(m for m in view["moves"] if m["name"] == "COUNTER")
+    lines = format_battle_view(view)
+    print("    " + "\n    ".join(lines))
+    assert counter["damage"] == 0 and counter["conditional"], counter
+    assert view["best_move"] is None and view["switch_hint"] is not None, view["best_move"]
+    assert any('No damaging move with PP left: call switch_pokemon(' in line for line in lines), lines
+    assert any("COUNTER" in line and "only returns a hit taken" in line for line in lines), lines
+    r = s.call("mcp_use_move", {"move": "COUNTER", "reasoning": "test"})
+    assert r["success"] is False and "has no physical attack to return" in r["error"], r
+    _poke(s, 16, FOE + 0x0C, Move["POUND"].value)  # now it can hit physically: COUNTER may work
+    with s.srv.memory_lock:
+        assert s.srv.env.memory_reader.status_move_failure(Move["COUNTER"].value, _view(s)["target"]) is None
+        # The heal check counts COUNTER as no attack: only HEADBUTT (0 PP) counts.
+        reader = s.srv.env.memory_reader
+        breloom = PokemonData(
+            species_id=286, species_name="Breloom", current_hp=80, max_hp=80, level=29, status=None,
+            type1=None, type2=None, moves=["COUNTER", "HEADBUTT", "LEECH_SEED"], move_pp=[6, 0, 10], trainer_id=0,
+        )
+        condition = assess_team_condition([breloom], lambda name: reader._rom_battle_move(Move[name].value))
+    assert condition["weak"] and condition["reasons"] == ["HEADBUTT 0/15 PP"], condition
+    assert ADDRESSES  # imported for the reader's tables
+
+
 def _run_all():
     import test_movement_feedback as harness
 

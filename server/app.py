@@ -4840,6 +4840,8 @@ def _move_key(text: str) -> str:
 def _effect_text(move: Dict[str, Any], target: Optional[Dict[str, Any]]) -> str:
     if not move["power"]:
         return "status move"
+    if move.get("conditional"):
+        return "only returns a hit taken"
     against = f" vs {'/'.join(target['types'])}" if target else ""
     if move["effectiveness"] == 0:
         return f"no effect{against}"
