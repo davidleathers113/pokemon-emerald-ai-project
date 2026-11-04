@@ -305,6 +305,29 @@ def test_party_abilities_are_shown():
     assert f"Marill (Lv.13, {marill.ability})" in text, text
 
 
+def test_learn_move_advice():
+    """Seen live: at Lv28 BRELOOM learned COUNTER and the model forgot MACH PUNCH (its STAB
+    Fighting move); the learn-move prompt came with no advice. test_marill_in_party.state:
+    BRELOOM knows MACH PUNCH, HEADBUTT, MEGA DRAIN, LEECH SEED."""
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_marill_in_party.state")
+    texts = ["BRELOOM grew to LV. 28!", "BRELOOM is trying to learn COUNTER.",
+             "But BRELOOM can’t learn more than four moves.", "Delete a move to make room for COUNTER?"]
+    advice = s.srv._learn_move_advice(texts)
+    print("   ", advice)
+    assert advice.startswith("Advice: don't learn COUNTER (it does no damage of its own): press B (NO), then A (YES)"), advice
+    advice = s.srv._learn_move_advice(["BRELOOM is trying to learn SKY UPPERCUT."])
+    print("   ", advice)
+    assert advice.startswith("Advice: learn SKY UPPERCUT and forget LEECH SEED (move 4"), advice
+    assert s.srv._learn_move_advice(["Wild ZUBAT appeared!"]) == ""
+    # Party types come from the ROM (the party struct has none): counter_score's STAB.
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        breloom = reader.read_party_pokemon()[0]
+        assert reader.party_mon_types(breloom) == [12, 1], reader.party_mon_types(breloom)  # GRASS/FIGHTING
+        assert reader.move_worth("MACH_PUNCH", [12, 1]) == 60 and reader.move_worth("COUNTER", [12, 1]) == 0
+
+
 def test_insert_objective_goes_before_the_current_one_and_persists():
     from agents.objectives.direct_objectives import DirectObjectiveManager
 

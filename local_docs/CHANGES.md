@@ -1249,6 +1249,21 @@ prompt. That came to 1.1 tiles walked per minute.
   named, the refusal; with POUND in the foe's moves COUNTER is allowed; a BRELOOM with
   COUNTER 6 PP and HEADBUTT 0 PP is TEAM IS WEAK.
 
+## Learn-move advice; party types from the ROM (2026-11-04, WEAKNESSES M53)
+- Seen live: BRELOOM learned COUNTER at Lv28 and the model forgot MACH PUNCH.
+- `_learn_move_advice(texts)` reads "X is trying to learn Y." from the battle's texts,
+  finds X in the party (species or nickname), and compares Y with its four moves by
+  `memory_reader.move_worth` (power × accuracy × 1.5 for its own type; status and
+  conditional moves 0; power-1 attacks count as 60). Y worth no more than the weakest →
+  "don't learn Y: press B (NO), then A (YES) to stop learning it"; else "learn Y and
+  forget <weakest> (move N)". `_battle_end_text("learn_move")` appends it.
+- `memory_reader.party_mon_types`: parse_pokemon leaves type1/type2 unset (the party
+  struct has no types), so `counter_score` had never given party moves STAB; types now
+  come from gSpeciesInfo by species.
+- *Verified:* `test_learn_move_advice` on the live party (test_marill_in_party.state):
+  COUNTER → don't learn; SKY UPPERCUT → learn, forget LEECH SEED (move 4); BRELOOM's types
+  GRASS/FIGHTING; MACH PUNCH worth 60, COUNTER 0.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

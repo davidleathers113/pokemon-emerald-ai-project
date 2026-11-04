@@ -103,6 +103,7 @@ EFFECT_DRAGON_RAGE = 41
 EFFECT_LEVEL_DAMAGE = 87
 EFFECT_PSYWAVE = 88
 EFFECT_SONICBOOM = 130
+FIXED_DAMAGE_EFFECTS = (EFFECT_SUPER_FANG, EFFECT_DRAGON_RAGE, EFFECT_LEVEL_DAMAGE, EFFECT_PSYWAVE, EFFECT_SONICBOOM)
 ABILITY_VOLT_ABSORB = 10
 ABILITY_WATER_ABSORB = 11
 ABILITY_FLASH_FIRE = 18
@@ -1588,6 +1589,26 @@ class PokemonEmeraldReader:
         data = self._rom_battle_move(move_id)
         return data["type"], data["power"]
 
+    def party_mon_types(self, mon: PokemonData) -> List[int]:
+        """TYPE_* ids of a party Pokémon. parse_pokemon leaves type1/type2 unset (the party
+        struct holds no types), so they come from the ROM by species; found while adding
+        learn-move advice: counter_score had been scoring party moves without STAB."""
+        own = [t for t in (getattr(mon.type1, "value", mon.type1), getattr(mon.type2, "value", mon.type2)) if t is not None]
+        return own or self.species_types(mon.species_name)
+
+    def move_worth(self, move_name: str, own_types: List[int]) -> float:
+        """A move's worth in a fight with no particular foe: power x accuracy (x1.5 for its
+        own type) for an attack (is_attack), 0 for a status or conditional move. NIGHT
+        SHADE, RETURN, HIDDEN POWER and the other power-1 attacks count as 60, a typical hit."""
+        try:
+            data = self._rom_battle_move(Move[str(move_name).upper().replace(" ", "_")].value)
+        except KeyError:
+            return 0.0
+        if not is_attack(data):
+            return 0.0
+        power = 60 if data["power"] == 1 else data["power"]  # fixed and variable damage alike
+        return power * (data["accuracy"] or 100) / 100 * (1.5 if data["type"] in own_types else 1.0)
+
     def attack_type(self, move_name: str) -> Optional[int]:
         """The move's TYPE_* id if it is an attack (is_attack), else None."""
         try:
@@ -1602,9 +1623,7 @@ class PokemonEmeraldReader:
         damaging move with PP left (multiplier, with STAB) divided by the foe's worst
         threat to it, both from the ROM type chart (the foe's own types stand in for its
         moves). 0 when it has no damaging move with PP."""
-        own_types = [
-            t for t in (getattr(mon.type1, "value", mon.type1), getattr(mon.type2, "value", mon.type2)) if t is not None
-        ]
+        own_types = self.party_mon_types(mon)
         offence = 0.0
         for move, pp in zip(mon.moves or [], mon.move_pp or []):
             move_type = self.attack_type(move) if move and pp else None

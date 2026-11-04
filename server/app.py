@@ -5228,9 +5228,10 @@ def _battle_end_text(played: Dict[str, Any]) -> str:
             "(A = YES, B = NO)."
         )
     if end == "learn_move":
+        advice = _learn_move_advice(played["texts"])
         return (
             f"Your Pokémon wants to learn a new move ({asked}): decide with press_buttons "
-            "(A = YES picks a move to forget, B = NO keeps the old moves)."
+            f"(A = YES picks a move to forget, B = NO keeps the old moves).{f' {advice}' if advice else ''}"
         )
     if end == "menu":
         choice = _replacement() if _forced_party_menu() else None
@@ -5594,6 +5595,51 @@ async def _shift_from_party_menu(personality: int, name: str, source: str) -> Op
         said = _mem(read_field_text)
         return f"Chose {label} but the game kept the party menu open{f': {said}' if said else ''}."
     return None
+
+
+def _learn_move_advice(texts: List[str]) -> str:
+    """What to do at "X is trying to learn Y": keep the four moves (B) when Y is worth no
+    more than the weakest of them (reader.move_worth), else forget the weakest.
+
+    Seen live: at Lv28 BRELOOM learned COUNTER and the model forgot MACH PUNCH, its STAB
+    Fighting move and the counter to Wattson's MAGNETON; the prompt was handed over with
+    no advice. "" when the texts don't name the Pokémon and the move.
+    """
+    from server import menu_state as ms
+
+    marker = " is trying to learn "
+    line = next((t for t in reversed(texts) if marker in t), "")
+    if not line:
+        return ""
+    who, _, rest = line.partition(marker)
+    new_move = rest.split(".")[0].split("!")[0].strip()
+    who_key = ms.name_key(who.split("·")[-1].strip())
+    with memory_lock:
+        reader = env.memory_reader
+        party = reader.read_party_pokemon() or []
+        mon = next(
+            (p for p in party if who_key in (ms.name_key(p.species_name), ms.name_key(p.nickname or ""))), None
+        )
+        if mon is None or not new_move:
+            return ""
+        own = reader.party_mon_types(mon)
+        current = [(m, reader.move_worth(m, own)) for m in mon.moves if m and m != "NONE"]
+        new_worth = reader.move_worth(new_move, own)
+    if len(current) < 4:
+        return ""
+    weakest, weakest_worth = min(current, key=lambda t: t[1])
+    name = mon.species_name.upper()
+    if new_worth <= weakest_worth:
+        why = "it does no damage of its own" if new_worth == 0 else f"it is worth less than {weakest.replace('_', ' ')}"
+        return (
+            f"Advice: don't learn {new_move} ({why}): press B (NO), then A (YES) to stop learning it; "
+            f"{name} keeps its four moves."
+        )
+    slot = [m for m, _ in current].index(weakest) + 1
+    return (
+        f"Advice: learn {new_move} and forget {weakest.replace('_', ' ')} (move {slot}, the weakest of "
+        f"{name}'s four): press A, pick {weakest.replace('_', ' ')}, A."
+    )
 
 
 def _forced_party_menu() -> bool:
