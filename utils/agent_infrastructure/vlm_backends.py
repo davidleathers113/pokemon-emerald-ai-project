@@ -2854,9 +2854,12 @@ class GeminiBackend(VLMBackend):
             return "I encountered an error processing the request. I'll proceed with a basic action: press 'A' to continue."
 
 
-# David's choice (2026-11-04). gemini-2.5-flash, still in the model list, answered a new
-# key with "404 This model … is no longer available to new users".
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+# David's choice (2026-11-04), from direct tests with his new key: gemini-3.5-flash answered
+# the game's real prompt (9K system, 27 tools, a frame) in ~10 s. gemini-3.8-flash gave no
+# answer in 90 s (504 at every cap, then "high demand"), gemini-2.5-flash(-lite) answer
+# new keys "404 … no longer available to new users", and 3.7-flash / flash-latest gave
+# 429 on the first request.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 # Gemini's free-tier daily quotas reset at midnight Pacific time.
 GEMINI_RESET_TZ = "America/Los_Angeles"
 # Seconds one step may wait on Gemini's per-minute limit or a server error before the
