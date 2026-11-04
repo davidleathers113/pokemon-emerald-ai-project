@@ -200,6 +200,7 @@ class RunDataManager:
                       objective_context: Optional[str] = None,
                       timing: Optional[Dict[str, float]] = None,
                       prompt_sections: Optional[Dict[str, int]] = None,
+                      model: Optional[str] = None,
                       **kwargs):
         """Log a system-level trajectory entry.
 
@@ -228,6 +229,8 @@ class RunDataManager:
                   prompt_s, vlm_s, tools_s, settle_s, end_state_s, prev_post_s...),
                   read by local_tools/speed_report.py
                 - prompt_sections: characters per "### " section of the prompt
+                - model: the model that chose the step (with BACKEND=gemini+ollama it
+                  changes when Gemini's quota runs out; shown on the /play feed's rows)
             Legacy:
                 - post_state may exist in older run files but is not written
         """
@@ -253,6 +256,9 @@ class RunDataManager:
 
         if timing:
             trajectory_entry["timing"] = timing
+
+        if model:
+            trajectory_entry["model"] = model
 
         if prompt_sections:
             trajectory_entry["prompt_sections"] = prompt_sections

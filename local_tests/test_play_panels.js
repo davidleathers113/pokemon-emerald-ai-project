@@ -24,6 +24,30 @@ function slice(html, marker, until) {
 }
 
 const tests = {
+  // BACKEND=gemini+ollama (David, 2026-11-04): each switch of model is a 🔁 row, and each
+  // step row names the model that chose it.
+  test_backend_switches_and_models_show_in_the_feed() {
+    const feed = {
+      now: "2026-11-04T20:00:30", paused: false, in_flight: null,
+      steps: [
+        { step: 9, time: "2026-11-04T20:00:20", tool: "train", args: {}, reasoning: "", result: "ok",
+          success: true, duration_s: 9, model: "qwen3-vl:8b-instruct" },
+        { step: 8, time: "2026-11-04T20:00:00", tool: "train", args: {}, reasoning: "", result: "ok",
+          success: true, duration_s: 9, model: "gemini-2.5-flash" },
+      ],
+      events: [{ time: "2026-11-04T20:00:10", kind: "backend", source: "agent",
+                 text: "Switched to qwen3-vl:8b-instruct: Gemini's free daily quota for gemini-2.5-flash is used up" }],
+    };
+    const html = P.renderFeed(feed, P.parseUtc(feed.now), {});
+    assert.ok(html.includes("🔁 Switched to qwen3-vl:8b-instruct"), html);
+    assert.ok(!html.includes("backend by agent"), "not the generic event label");
+    assert.ok(html.includes('<span class="model">qwen3-vl:8b-instruct</span>'), html);
+    assert.ok(html.includes('<span class="model">gemini-2.5-flash</span>'), html);
+    // Newest first: the qwen step, then the switch, then the gemini step.
+    const at = (s) => html.indexOf(s);
+    assert.ok(at("qwen3-vl:8b-instruct</span>") < at("🔁") && at("🔁") < at("gemini-2.5-flash</span>"), html);
+  },
+
   // Seen on David's page: "55/55 HP · NONE" in red, which read like an error.
   test_no_status_shows_nothing() {
     const mon = { slot: 2, species: "NUMEL", level: 19, hp: 55, max_hp: 55, status: "NONE", moves: [] };

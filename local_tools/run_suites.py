@@ -31,7 +31,7 @@ DOCKER_SUITES = [
     "train_macro", "macros", "movement_exits", "objective_memory", "battle_flow", "battle_view",
     "use_item", "party_rule", "dialogue_agent", "dialogue_auto_advance", "phase4_agent",
     "movement_feedback", "prompt_cache", "play_endpoints", "phase4_backend", "phase23_health",
-    "phase23_save_persistence",
+    "phase23_save_persistence", "gemini_fallback",
 ]
 HOST_PYTHON_SUITES = ["stall_watch", "speed_report"]  # plain Python, no emulator
 NODE_SUITES = ["play_panels"]

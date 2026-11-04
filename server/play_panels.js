@@ -100,6 +100,7 @@ const PlayPanels = (() => {
       + `<div class="step-head"><span class="t">${fmtClock(parseUtc(s.time))}</span>`
       + `<span class="n">#${escapeHtml(s.step)}</span>`
       + `<code class="call">${escapeHtml(fmtCall(s.tool, s.args))}</code>`
+      + (s.model ? `<span class="model">${escapeHtml(s.model)}</span>` : "")
       + `<span class="dur">${dur}</span></div>${reasoning}${result}</div>`;
   }
 
@@ -111,6 +112,8 @@ const PlayPanels = (() => {
     if (e.kind === "resume") label = `▶ Resumed by ${source}${text}`;
     // David's party rule, applied by the harness ("Lead set to NUMEL (lowest level, Lv20)").
     if (e.kind === "party") label = `👥 ${escapeHtml(e.text || "")}`;
+    // The gemini+ollama backend changing model ("Switched to qwen3-vl:8b-instruct: …").
+    if (e.kind === "backend") label = `🔁 ${escapeHtml(e.text || "")}`;
     return `<div class="event ${e.kind === "pause" ? "ev-pause" : "ev-resume"}">`
       + `<span class="t">${fmtClock(parseUtc(e.time))}</span><span>${label}</span></div>`;
   }

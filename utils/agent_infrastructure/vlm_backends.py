@@ -2321,6 +2321,67 @@ class VertexBackend(VLMBackend):
             return "I encountered an error processing the request. I'll proceed with a basic action: press 'A' to continue."
 
 
+# classify_gemini_error kinds: what a failed Gemini call means for the next one.
+GEMINI_DAILY = "daily"          # the day's quota is used up: no use asking again before the reset
+GEMINI_MINUTE = "minute"        # a per-minute limit: a short wait helps
+GEMINI_AUTH = "auth"            # the key is wrong or not allowed: no use asking again at all
+GEMINI_TRANSIENT = "transient"  # the server had a problem (5xx, timeout): try again
+
+
+def _duration_s(value) -> Optional[float]:
+    """A google.rpc.RetryInfo retryDelay in seconds: '34s' (REST JSON) or a Duration (gRPC)."""
+    if value is None:
+        return None
+    if hasattr(value, "seconds"):
+        return float(value.seconds) + float(getattr(value, "nanos", 0) or 0) / 1e9
+    text = str(value).strip()
+    if text.endswith("s"):
+        try:
+            return float(text[:-1])
+        except ValueError:
+            return None
+    return None
+
+
+def classify_gemini_error(exc: BaseException):
+    """(kind, retry hint in seconds or None) for a failed Gemini call, read from the
+    error's own fields: its class (google.api_core.exceptions, by HTTP status), its
+    status details (google.rpc QuotaFailure violations' quotaId, RetryInfo retryDelay,
+    ErrorInfo reason), as dicts over REST or protobuf messages over gRPC. kind is None
+    for anything else (a bad request, a bug): that is raised, not retried.
+
+    The free tier's quotas are named by period, e.g. GenerateRequestsPerDayPerProject
+    PerModel-FreeTier and GenerateRequestsPerMinutePerProjectPerModel-FreeTier; how many
+    requests each allows differs by model and account, so no count is assumed here.
+    """
+    try:
+        from google.api_core import exceptions as gx
+    except ImportError:  # no Google client installed: nothing here can be a Gemini error
+        return None, None
+    quota_ids: List[str] = []
+    reasons = [str(getattr(exc, "reason", "") or "")]
+    delay = None
+    for detail in list(getattr(exc, "details", None) or []):
+        if isinstance(detail, dict):
+            violations = detail.get("violations") or []
+            quota_ids += [str(v.get("quotaId", "")) for v in violations if isinstance(v, dict)]
+            reasons.append(str(detail.get("reason", "") or ""))
+            delay = _duration_s(detail.get("retryDelay")) if delay is None else delay
+        else:
+            quota_ids += [str(getattr(v, "quota_id", "") or "") for v in getattr(detail, "violations", None) or []]
+            reasons.append(str(getattr(detail, "reason", "") or ""))
+            delay = _duration_s(getattr(detail, "retry_delay", None)) if delay is None else delay
+    if any("PerDay" in quota_id for quota_id in quota_ids):
+        return GEMINI_DAILY, delay
+    if isinstance(exc, (gx.Unauthenticated, gx.PermissionDenied)) or "API_KEY_INVALID" in reasons:
+        return GEMINI_AUTH, None
+    if isinstance(exc, gx.ResourceExhausted) or getattr(exc, "code", None) == 429:
+        return GEMINI_MINUTE, delay
+    if isinstance(exc, (gx.ServerError, gx.DeadlineExceeded, TimeoutError, ConnectionError)):
+        return GEMINI_TRANSIENT, delay
+    return None, None
+
+
 class GeminiBackend(VLMBackend):
     """Google Gemini API backend"""
 
@@ -2334,6 +2395,10 @@ class GeminiBackend(VLMBackend):
         self.tools = tools or []
         self.system_instruction = system_instruction
         self._uses_cached_content_context = False
+        # Most seconds one call may spend waiting out rate limits and server errors before
+        # it raises (None = up to 5 tries, ~62 s). FallbackBackend sets it, then lets the
+        # local model play that step.
+        self.max_retry_wait_s = kwargs.get("max_retry_wait_s")
         self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
         if not self.api_key:
@@ -2474,6 +2539,7 @@ class GeminiBackend(VLMBackend):
 
         max_retries = 5
         base_delay = 2  # Start with 2 second delay
+        waited = 0.0
 
         for attempt in range(max_retries):
             try:
@@ -2492,40 +2558,28 @@ class GeminiBackend(VLMBackend):
                 response = self.model.generate_content(content_parts, **generation_kwargs)
                 return response
             except Exception as e:
-                error_str = str(e).lower()
-
-                # Rate limit errors: retry with exponential backoff
-                is_rate_limit = "429" in error_str or "quota" in error_str or "rate" in error_str
-                # Transient server errors: deadline exceeded, unavailable, internal, 504/503/500
-                is_transient = (
-                    "504" in error_str
-                    or "503" in error_str
-                    or "500" in error_str
-                    or "deadline" in error_str
-                    or "unavailable" in error_str
-                    or "internal" in error_str
-                )
-
-                if is_rate_limit or is_transient:
-                    if attempt < max_retries - 1:
-                        # Exponential backoff: 2s, 4s, 8s, 16s, 32s
-                        delay = base_delay * (2**attempt) + random.uniform(0, 1)
-                        kind = "Rate limit" if is_rate_limit else "Transient server error"
-                        logger.warning(
-                            f"{kind} hit ({type(e).__name__}: {e}), "
-                            f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})..."
-                        )
-                        time.sleep(delay)
-                        continue
-                    else:
-                        logger.error(
-                            f"Failed after {max_retries} retries: {type(e).__name__}: {e}"
-                        )
-                        raise
-                else:
-                    # Unknown / non-transient error, raise immediately
-                    logger.error(f"Error in generate_content: {e}")
+                # By the error's own fields (classify_gemini_error). A used-up daily quota
+                # or a rejected key is raised at once: retrying can't help before the
+                # reset, and it held each step for ~62 s before.
+                kind, hint = classify_gemini_error(e)
+                if kind not in (GEMINI_MINUTE, GEMINI_TRANSIENT):
+                    logger.error(f"Error in generate_content ({kind or 'not retryable'}): {type(e).__name__}: {e}")
                     raise
+                # The server's own retry hint when it gives one, else 2s, 4s, 8s, 16s.
+                delay = hint if hint else base_delay * (2**attempt) + random.uniform(0, 1)
+                over_budget = self.max_retry_wait_s is not None and waited + delay > self.max_retry_wait_s
+                if attempt == max_retries - 1 or over_budget:
+                    logger.error(
+                        f"Gave up after {attempt + 1} tries ({waited:.0f} s waited; {kind}): {type(e).__name__}: {e}"
+                    )
+                    raise
+                label = "Rate limit" if kind == GEMINI_MINUTE else "Transient server error"
+                logger.warning(
+                    f"{label} hit ({type(e).__name__}: {e}), "
+                    f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})..."
+                )
+                time.sleep(delay)
+                waited += delay
 
         raise Exception("Max retries exceeded")
 
@@ -2659,7 +2713,12 @@ class GeminiBackend(VLMBackend):
 
         except Exception as e:
             logger.error(f"Error in Gemini image query: {e}")
-            # Try text-only fallback for any Gemini error
+            if classify_gemini_error(e)[0] is not None:
+                # A quota, key or server problem hits a text-only call the same way, and
+                # get_text_query would hide it behind a canned reply: the caller
+                # (FallbackBackend) needs the error itself.
+                raise
+            # Try text-only fallback for any other Gemini error
             try:
                 logger.info(f"[{module_name}] Attempting text-only fallback due to error: {e}")
                 return self.get_text_query(text, module_name)
@@ -2771,9 +2830,128 @@ class GeminiBackend(VLMBackend):
 
         except Exception as e:
             logger.error(f"Error in Gemini text query: {e}")
+            if classify_gemini_error(e)[0] is not None:
+                raise  # a quota, key or server problem: not a reply to act on (see get_query)
             # Return a safe default response
             logger.warning(f"[{module_name}] Returning default response due to error: {e}")
             return "I encountered an error processing the request. I'll proceed with a basic action: press 'A' to continue."
+
+
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# Gemini's free-tier daily quotas reset at midnight Pacific time.
+GEMINI_RESET_TZ = "America/Los_Angeles"
+# Seconds one step may wait on Gemini's per-minute limit or a server error before the
+# local model plays that step (emerald-new's design, 2026-11-04: "≤30 s").
+FALLBACK_MAX_PRIMARY_WAIT_S = 30.0
+# Per-minute limits that go on this long with no answer in between are taken as the day's
+# quota being used up (when the error doesn't name its quota).
+FALLBACK_ASSUME_DAILY_AFTER_S = 600.0
+
+
+def next_gemini_reset(now: float) -> float:
+    """Epoch seconds of the next midnight in GEMINI_RESET_TZ after `now`."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    local = _dt.fromtimestamp(now, ZoneInfo(GEMINI_RESET_TZ))
+    midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp()
+
+
+class FallbackBackend(VLMBackend):
+    """Gemini first, the local model (OpenAIBackend → Ollama) when Gemini can't answer.
+
+    David (2026-11-04): play on Gemini's free tier, and on the local Qwen when the day's
+    quota is used up. BACKEND=gemini+ollama; model_name is the local model (MODEL), the
+    Gemini model is GEMINI_MODEL (default DEFAULT_GEMINI_MODEL). By the error's kind
+    (classify_gemini_error):
+    - per-minute limit or server error: Gemini waits up to FALLBACK_MAX_PRIMARY_WAIT_S,
+      then the local model plays that one step; the next step asks Gemini again;
+    - the day's quota used up: the local model until the next midnight Pacific
+      (next_gemini_reset), then Gemini is asked once and kept if it answers;
+    - the key rejected, or no GEMINI_API_KEY at all: the local model for the whole run.
+    Each switch is logged and passed to the on_switch callbacks (the /play feed's 🔁 row).
+    Both backends take the same tool declarations and return the same Gemini-like reply.
+    """
+
+    def __init__(self, model_name: str, tools: list = None, system_instruction: str = None, **kwargs):
+        self.secondary_model = model_name
+        self.secondary = OpenAIBackend(model_name, tools=tools, system_instruction=system_instruction, **kwargs)
+        self.primary_model = os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+        self.primary = None
+        self.on_switch: List[Any] = []  # callables(text), e.g. a POST to the /play feed
+        self.on_secondary_until: Optional[float] = None  # epoch seconds; inf = for this run
+        self.current_model = model_name
+        self._limited_since: Optional[float] = None
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            # Never the key itself in a log line: only whether it is set.
+            logger.warning(f"🔁 gemini+ollama: GEMINI_API_KEY is not set, so {model_name} plays alone.")
+            self.on_secondary_until = float("inf")
+            return
+        try:
+            self.primary = GeminiBackend(
+                self.primary_model, tools=tools, system_instruction=system_instruction,
+                max_retry_wait_s=FALLBACK_MAX_PRIMARY_WAIT_S,
+            )
+            self.current_model = self.primary_model
+        except Exception as e:  # e.g. the Google client missing: play on locally
+            logger.error(f"🔁 gemini+ollama: Gemini could not start ({type(e).__name__}: {e}); {model_name} plays alone.")
+            self.on_secondary_until = float("inf")
+
+    def get_query(self, img, text: str, module_name: str = "Unknown"):
+        return self._ask(lambda backend: backend.get_query(img, text, module_name))
+
+    def get_text_query(self, text: str, module_name: str = "Unknown"):
+        return self._ask(lambda backend: backend.get_text_query(text, module_name))
+
+    def _announce(self, text: str) -> None:
+        logger.warning(f"🔁 {text}")
+        for callback in self.on_switch:
+            try:
+                callback(text)
+            except Exception as e:  # the feed is a nicety: a switch must never fail a step
+                logger.debug(f"on_switch callback failed: {e}")
+
+    def _ask(self, ask):
+        now = time.time()
+        if self.primary is not None and (self.on_secondary_until is None or now >= self.on_secondary_until):
+            probing = self.on_secondary_until is not None
+            try:
+                reply = ask(self.primary)
+            except Exception as e:
+                kind, _ = classify_gemini_error(e)
+                if kind == GEMINI_MINUTE:
+                    self._limited_since = self._limited_since or now
+                    if now - self._limited_since >= FALLBACK_ASSUME_DAILY_AFTER_S:
+                        kind = GEMINI_DAILY  # per-minute limits all along: the day's quota
+                if kind == GEMINI_DAILY:
+                    self._limited_since = None
+                    self.on_secondary_until = next_gemini_reset(now)
+                    self._announce(
+                        f"Switched to {self.secondary_model}: Gemini's free daily quota for {self.primary_model} "
+                        "is used up; back after 00:00 PT"
+                    )
+                elif kind == GEMINI_AUTH:
+                    self.on_secondary_until = float("inf")
+                    self._announce(
+                        f"Switched to {self.secondary_model} for this run: Gemini rejected the API key "
+                        f"({type(e).__name__}); check GEMINI_API_KEY"
+                    )
+                elif kind in (GEMINI_MINUTE, GEMINI_TRANSIENT):
+                    logger.warning(
+                        f"🔁 Gemini busy ({kind}: {type(e).__name__}); {self.secondary_model} plays this step"
+                    )
+                else:
+                    raise  # not a quota, key or server problem: a real error
+            else:
+                self._limited_since = None
+                self.current_model = self.primary_model
+                if probing:
+                    self.on_secondary_until = None
+                    self._announce(f"Switched back to {self.primary_model}: Gemini answers again after the reset")
+                return reply
+        self.current_model = self.secondary_model
+        return ask(self.secondary)
 
 
 class VLM:
@@ -2785,6 +2963,7 @@ class VLM:
         "openrouter": OpenRouterBackend,
         "gemini": GeminiBackend,
         "vertex": VertexBackend,
+        "gemini+ollama": FallbackBackend,
     }
 
     def __init__(

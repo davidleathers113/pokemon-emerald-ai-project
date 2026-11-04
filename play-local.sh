@@ -7,6 +7,8 @@
 #
 # Defaults to the local Ollama model. To use a cloud model instead, set e.g.
 #   BACKEND=gemini MODEL=gemini-2.5-flash GEMINI_API_KEY=... ./play-local.sh
+# Gemini's free tier first, the local model when its daily quota is used up:
+#   BACKEND=gemini+ollama GEMINI_API_KEY=... [GEMINI_MODEL=gemini-2.5-flash] ./play-local.sh
 # Works with macOS /bin/bash 3.2 (empty arrays are expanded with ${a[@]+...}).
 set -euo pipefail
 
@@ -147,9 +149,21 @@ start_ollama() {
 
 env_args=()
 harness_backend="$BACKEND"
-if [ "$BACKEND" = "ollama" ]; then
+if [ "$BACKEND" = "ollama" ] || [ "$BACKEND" = "gemini+ollama" ]; then
     command -v ollama >/dev/null || die "ollama is not installed (brew install ollama)"
-    harness_backend=openai
+    if [ "$BACKEND" = "ollama" ]; then
+        harness_backend=openai
+    else
+        # gemini+ollama (FallbackBackend): Gemini plays, and $MODEL on Ollama takes over
+        # when Gemini's daily quota is used up, so Ollama is set up and $MODEL loaded here
+        # just the same. The key is passed by name (-e VAR), never written out.
+        for var in GEMINI_API_KEY GOOGLE_API_KEY GEMINI_MODEL; do
+            if [ -n "${!var:-}" ]; then env_args+=(-e "$var"); fi
+        done
+        if [ -z "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]; then
+            echo "Note: GEMINI_API_KEY is not set, so $MODEL plays alone (BACKEND=gemini+ollama)."
+        fi
+    fi
     pid=$(ollama_pid)
     if [ -z "$pid" ]; then
         start_ollama

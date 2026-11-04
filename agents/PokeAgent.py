@@ -635,6 +635,9 @@ class PokeAgent:
             system_instruction=self.system_instructions
         )
         logger.info(f"✅ VLM initialized with {self.backend} backend using model: {self.model}")
+        # BACKEND=gemini+ollama: each switch of model goes to the /play feed (🔁 row).
+        if hasattr(self.vlm.backend, "on_switch"):
+            self.vlm.backend.on_switch.append(self._post_backend_switch)
         logger.info(f"✅ {len(self.tools)} tools available")
         logger.info(f"✅ System instructions loaded ({len(self.system_instructions)} chars)")
 
@@ -3482,7 +3485,14 @@ Step {step_count}"""
             logger.warning(f"Error checking for black frame: {e}")
             return False
 
-    def _log_trajectory_for_step(self, run_manager, step_num: int, pre_state: dict, 
+    def _post_backend_switch(self, text: str) -> None:
+        """A 🔁 row on the /play feed when gemini+ollama changes model (FallbackBackend)."""
+        try:
+            requests.post(f"{self.server_url}/feed_event", json={"kind": "backend", "text": text}, timeout=5)
+        except requests.RequestException as e:  # the log line is already written
+            logger.debug(f"feed_event not posted: {e}")
+
+    def _log_trajectory_for_step(self, run_manager, step_num: int, pre_state: dict,
                                   prompt: str, reasoning: str, tool_calls: list, response: str):
         """Log trajectory for a CLI agent step.
 
@@ -3516,6 +3526,8 @@ Step {step_count}"""
                 llm_prompt=prompt,
                 timing=dict(self._step_timing),
                 prompt_sections=_prompt_sections(prompt),
+                # Which model chose this step (gemini+ollama switches; else self.model).
+                model=getattr(self.vlm.backend, "current_model", None) or self.model,
             )
             logger.debug(f"Logged trajectory for step {step_num}")
         except Exception as e:

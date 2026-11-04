@@ -1434,6 +1434,28 @@ async def set_agent_pause(request: dict):
     return {"paused": now}
 
 
+# Event kinds the agent may add to the /play feed itself (/feed_event).
+AGENT_FEED_KINDS = ("backend",)
+
+
+@app.post("/feed_event")
+async def add_feed_event(request: dict):
+    """The agent's own feed rows: "backend" when the gemini+ollama backend switches model
+    ("Switched to qwen3-vl:8b-instruct: Gemini's free daily quota … is used up").
+    David (2026-11-04) wants to see which model plays."""
+    kind = str((request or {}).get("kind") or "")
+    if kind not in AGENT_FEED_KINDS:
+        return JSONResponse(status_code=400, content={"error": f"kind must be one of {list(AGENT_FEED_KINDS)}"})
+    _pause_events.append({
+        "time": datetime.datetime.utcnow().isoformat(),
+        "kind": kind,
+        "source": "agent",
+        "text": str(request.get("text") or "")[:300],
+    })
+    del _pause_events[:-PAUSE_EVENTS_KEPT]
+    return {"ok": True}
+
+
 # /ai_feed: steps shown, and how much of the trajectory file's end is read for them
 # (rows carry the whole prompt, ~12K characters each).
 AI_FEED_STEPS = 10
@@ -1515,6 +1537,7 @@ async def get_ai_feed():
             "result": result,
             "success": success,
             "duration_s": duration,
+            "model": row.get("model"),  # which model chose it (gemini+ollama switches)
         })
     paused = os.path.exists(AGENT_PAUSE_FLAG)
     in_flight = None
