@@ -313,7 +313,9 @@ def test_the_play_out_sends_in_a_replacement_itself():
     played = asyncio.run(s.srv._play_out_battle("test"))
     print("   ", played["end"], played["notes"])
     assert played["end"] == "action", played["end"]
-    assert played["notes"] == ["sent in SHROOMISH for the fainted Pokémon (the best of the rest here)"], played["notes"]
+    # The note says why, by the fighter rule (pick_fighter, 2026-11-04); until then it read
+    # "(the best of the rest here)". SHROOMISH is the only one left to send in.
+    assert len(played["notes"]) == 1 and played["notes"][0].startswith("sent in SHROOMISH for the fainted Pokémon (wins in "), played["notes"]
     assert "Answered for you: sent in SHROOMISH" in s.srv._battle_report(played)
     assert _view(s)["player"]["name"] == "Shroomish"
 

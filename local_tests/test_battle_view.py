@@ -425,6 +425,52 @@ def test_a_foe_that_wins_the_exchange_is_a_danger():
     assert view["better_switch"] is None and not any(l.startswith("Better matchup") for l in lines), lines
 
 
+def _machop_like_foe(s):
+    """RAM: Isaac's foe (gBattleMons[1]) made a wild-Jagged-Pass MACHOP: Fighting, Lv21,
+    pret-formula stats for base 70/80/50/35/35/35 (HP 60, Atk 38, Def 26, Spe 19, SpA 19,
+    SpD 19), KARATE CHOP only."""
+    from pokemon_env.enums import Move
+
+    for offset, value in ((0x2, 38), (0x4, 26), (0x6, 19), (0x8, 19), (0xA, 19), (0x28, 60), (0x2C, 60)):
+        _poke(s, 16, FOE + offset, value)
+    _poke(s, 8, FOE + 0x2A, 21)
+    _poke(s, 8, FOE + 0x21, 1)  # FIGHTING
+    _poke(s, 8, FOE + 0x22, 1)
+    _poke(s, 16, FOE + 0x0C, Move["KARATE_CHOP"].value)
+    for slot in (1, 2, 3):
+        _poke(s, 16, FOE + 0x0C + 2 * slot, 0)
+    _poke(s, 8, FOE + 0x24, 25)
+
+
+def test_the_lowest_level_teammate_that_wins_comfortably_comes_in():
+    """David (2026-11-04): "It keeps using breloom to train... it needs to diversify who it
+    uses based on the opponent and what other options I have available. In many cases,
+    Combusken is plenty strong." pick_fighter is the one rule for who comes in (a switch,
+    a replacement, train's partner, the "change POKéMON?" answer): the lowest level that
+    wins the exchange with ≥40% HP left, the strongest only when nobody lower does.
+    test_switch_question.state: SABLEYE out; COMBUSKEN Lv23, BRELOOM benched. RAM: BRELOOM's
+    level byte 38 (the party's strongest, as live), the foe a Lv21 MACHOP (_machop_like_foe)."""
+    party_base = 0x020244EC
+    s = server()
+    s.load(ISAAC)
+    _poke(s, 8, party_base + 2 * 100 + 0x54, 38)  # BRELOOM (slot 3)
+    _machop_like_foe(s)
+    view = _view(s)
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        out = reader._out_personalities([0])
+        pick = reader.pick_fighter(view["target"], out, switching_in=True)
+    print("   ", pick)
+    assert pick and pick["name"] == "COMBUSKEN" and pick["comfortable"], pick
+    assert pick["why"].startswith("wins in ") and pick["why"].endswith("BRELOOM not needed"), pick["why"]
+    # A foe only BRELOOM beats: RAM, COMBUSKEN at 1 HP can't take the hit coming in.
+    _poke(s, 16, party_base + 1 * 100 + 0x56, 1)
+    with s.srv.memory_lock:
+        pick = s.srv.env.memory_reader.pick_fighter(view["target"], out, switching_in=True)
+    print("   ", pick)
+    assert pick and pick["name"] == "BRELOOM" and "not needed" not in pick["why"], pick
+
+
 def test_a_battle_call_for_a_matchup_that_changed_is_refused():
     """Seen live (Maxie, 15:40 UTC): switch_pokemon("BRELOOM") was chosen for SABLEYE vs
     MIGHTYENA; presses from the /play page played two turns while the model thought, and

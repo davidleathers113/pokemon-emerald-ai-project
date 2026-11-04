@@ -5750,7 +5750,7 @@ async def _play_out_battle_steps(
                 if error:
                     end = "menu"
                 else:
-                    notes.append(f"sent in {choice['name']} for the fainted Pokémon (the best of the rest here)")
+                    notes.append(f"sent in {choice['name']} for the fainted Pokémon ({choice['why']})")
                     presses += 3
         elif flow.level_up_box and flow.in_battle_screen:
             # The stat panel after "X grew to LV. N!" waits for a key without a text
@@ -5796,7 +5796,7 @@ def _battle_end_text(played: Dict[str, Any]) -> str:
         if choice is not None:
             return (
                 "The game opened the party menu (a fainted Pokémon must be replaced): call "
-                f'switch_pokemon("{choice["name"]}") (the best of the rest here).'
+                f'switch_pokemon("{choice["name"]}") ({choice["why"]}).'
             )
         return "The game opened the party menu (a fainted Pokémon must be replaced): call switch_pokemon with one able to fight."
     if end == "evolution":
@@ -6212,18 +6212,26 @@ def _forced_party_menu() -> bool:
 
 
 def _replacement() -> Optional[Dict[str, Any]]:
-    """The teammate to send in for a fainted Pokémon: the battle view's switch hint (best
-    counter_score against the foe among those able to fight with damaging PP), with its
-    personality; None if nobody qualifies."""
+    """The teammate to send in for a fainted Pokémon, with its personality and why; None
+    if nobody can fight.
+
+    reader.pick_fighter, the one rule for who fights (David, 2026-11-04: not BRELOOM every
+    time; the lowest level that wins comfortably). A replacement takes no free hit coming
+    in. When nobody wins the exchange, the battle view's switch hint (best counter_score
+    among those with a damaging move with PP)."""
     from server import menu_state as ms
 
     with memory_lock:
         reader = env.memory_reader
         view = reader.read_battle_view() or {}
         battlers = [0, 2] if view.get("is_double") else [0]
-        hint = reader._switch_hint(view.get("target"), battlers)
+        target = view.get("target")
+        hint = reader.pick_fighter(target, reader._out_personalities(battlers), switching_in=False) if target else None
         if hint is None:
-            return None
+            hint = reader._switch_hint(target, battlers)
+            if hint is None:
+                return None
+            hint = {**hint, "why": "the best matchup left; nobody wins the exchange"}
         personalities = ms.party_personalities(reader)
     if hint["slot"] > len(personalities):
         return None
@@ -6268,23 +6276,56 @@ def _best_counter(next_foe: str) -> Optional[Tuple[Any, int, float, float]]:
     return (mon, pid, score, current)
 
 
+def _switch_answer(next_foe: str) -> Optional[Tuple[Optional[int], str, str]]:
+    """Who should face the trainer's next Pokémon, by reader.pick_fighter (the one rule
+    for who fights): (personality to send in, name, why), (None, name, why) to keep the
+    one out, or None when that Pokémon can't be read from gEnemyParty. No free hit: the
+    swap happens before it comes out. David (2026-11-04): a lower-level teammate that
+    wins comfortably goes before BRELOOM."""
+    from server import menu_state as ms
+
+    with memory_lock:
+        reader = env.memory_reader
+        target = reader.enemy_party_mon(next_foe)
+        if target is None:
+            return None
+        pick = reader.pick_fighter(target, set(), switching_in=False)
+        personalities = ms.party_personalities(reader)
+        active = ms.active_battler_personality(reader)
+    if pick is None or pick["slot"] > len(personalities):
+        return (None, "", f"nobody beats {next_foe}")
+    if personalities[pick["slot"] - 1] == active:
+        return (None, pick["name"], f"{pick['name']} faces {next_foe}: {pick['why']}")
+    return (personalities[pick["slot"] - 1], pick["name"], pick["why"])
+
+
 async def _answer_switch_question(texts: List[str], source: str) -> str:
     """Answer "Will DAVID change POKéMON?": YES and SHIFT in the clear counter to the
     trainer's next Pokémon (_best_counter), else NO. Returns a note for the turn report."""
     from server import menu_state as ms
 
     foe = _next_foe_from(texts)
-    choice = _best_counter(foe) if foe else None
-    if choice is None:
+    pick = _switch_answer(foe) if foe else None
+    if pick is not None and pick[0] is None:
         await _macro_press(["B"], source)
-        why = f"nobody counters {foe} clearly better" if foe else "the next Pokémon was not named"
-        return f"kept the same Pokémon in ({why})"
-    mon, personality, score, current = choice
-    name = str(mon.species_name).upper()
+        return f"kept the same Pokémon in ({pick[2]})"
+    if pick is not None:
+        personality, name, why = pick
+        reason = why
+    else:
+        # The trainer's Pokémon couldn't be read: the type matchup alone (_best_counter).
+        choice = _best_counter(foe) if foe else None
+        if choice is None:
+            await _macro_press(["B"], source)
+            why = f"nobody counters {foe} clearly better" if foe else "the next Pokémon was not named"
+            return f"kept the same Pokémon in ({why})"
+        mon, personality, score, current = choice
+        name = str(mon.species_name).upper()
+        reason = f"matchup {score:g} vs {current:g}"
     await _macro_press(["A"], source)  # YES
     error = await _shift_from_party_menu(personality, name, source)
     if error is None:
-        return f"switched to {name} to face {foe} (matchup {score:g} vs {current:g})"
+        return f"switched to {name} to face {foe} ({reason})"
     # Back out of the menu; the game then sends its Pokémon in against the one out now.
     for _ in range(3):
         if _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN):
@@ -6468,21 +6509,37 @@ def _train_partner(party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: O
     highest-level one (the partner _switch_train_line names). None when that Pokémon
     can't fight now. Seen live vs MAGNETON: the highest level isn't always the one that
     hurts it (EMBER 2x where MEGA DRAIN and SPARK were 0.5x)."""
+    return _train_partner_pick(party, trainee_pid, wanted_pid)[0]
+
+
+def _train_partner_pick(
+    party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: Optional[int]
+) -> Tuple[Optional[int], str]:
+    """_train_partner with why it was chosen. In a battle: reader.pick_fighter against the
+    foe out, the one rule for who fights (David, 2026-11-04: "It keeps using breloom to
+    train... In many cases, Combusken is plenty strong": the lowest level that wins
+    comfortably), among teammates above half HP; if none of them wins, the one that
+    knocks it out in the fewest hits. Outside a battle, the highest-level one."""
     able = [
         i for i, (pid, mon) in enumerate(party)
         if pid != trainee_pid and not mon.is_egg and mon.max_hp and mon.current_hp * 2 > mon.max_hp
     ]
     if wanted_pid is not None:
-        return next((i for i in able if party[i][0] == wanted_pid), None)
+        return next((i for i in able if party[i][0] == wanted_pid), None), "asked for"
     if not able:
-        return None
+        return None, ""
     with memory_lock:
         reader = env.memory_reader
         view = reader.read_battle_view() if reader.is_in_battle() else None
         target = (view or {}).get("target")
         if target and target.get("hp"):
-            return min(able, key=lambda i: (reader.turns_to_win(i, party[i][1], target), -party[i][1].level))
-    return max(able, key=lambda i: party[i][1].level)
+            out = {pid for i, (pid, _) in enumerate(party) if i not in able}
+            pick = reader.pick_fighter(target, out, switching_in=True)
+            if pick is not None and pick["slot"] - 1 in able:
+                return pick["slot"] - 1, pick["why"]
+            index = min(able, key=lambda i: (reader.turns_to_win(i, party[i][1], target), -party[i][1].level))
+            return index, "nobody wins the exchange; it knocks the foe out soonest"
+    return max(able, key=lambda i: party[i][1].level), "the highest level"
 
 
 def _train_weakness(partner_index: Optional[int]) -> List[str]:
@@ -6572,7 +6629,7 @@ async def _train_battle(
             record["turns"] += 1
             record["trainee_fought"] = True
         elif _mem(ms.active_battler_personality) == trainee_pid:
-            index = _train_partner(party, trainee_pid, wanted_partner_pid)
+            index, why = _train_partner_pick(party, trainee_pid, wanted_partner_pid)
             if index is None:
                 stop = (
                     "no_partner",
@@ -6581,6 +6638,7 @@ async def _train_battle(
                 )
                 break
             partner_pid = party[index][0]
+            record["partner_why"] = why
             result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {trainee_name} must not fight"})
             record["switched"] = record["switched"] or bool(result.get("success"))
         elif (
@@ -6752,6 +6810,13 @@ def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, wh
             start = partners.get(b["partner"], (b["partner_hp_before"],))[0]
             partners[b["partner"]] = (start, b["partner_hp"], b["partner_max_hp"])
     text += "".join(f", {name} {hp0}→{hp1}/{top}" for name, (hp0, hp1, top) in partners.items())
+    # Who came in and why, once per partner (David, 2026-11-04: not BRELOOM every time).
+    chosen: Dict[str, str] = {}
+    for b in battles:
+        if b.get("partner") and b.get("partner_why"):
+            chosen.setdefault(b["partner"], b["partner_why"])
+    if chosen:
+        text += ". Partners: " + "; ".join(f"{name} ({reason})" for name, reason in chosen.items())
     return f"{text}. Stopped: {why}"
 
 

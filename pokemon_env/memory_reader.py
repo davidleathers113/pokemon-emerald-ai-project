@@ -62,6 +62,11 @@ BATTLE_MENU_BY_CONTROLLER = {
 TEAM_LOW_HP_SHARE = 0.5
 # At a quarter of base PP the lead has only a few attacks left (EMBER 25 -> 6).
 TEAM_LOW_PP_SHARE = 0.25
+# pick_fighter: a teammate "wins comfortably" when it knocks the foe out first and
+# still has this share of its max HP at the expected knock-out (David, 2026-11-04,
+# via emerald-new: "≥40% HP left at the expected KO").
+COMFORT_HP_SHARE = 0.4
+G_ENEMY_PARTY = 0x02023BC0  # gEnemyParty: the trainer's Pokémon, struct Pokemon like the player's
 
 # Status moves that can't work (status_move_failure). pret include/constants/
 # battle_move_effects.h, include/constants/battle.h; gStatuses3 from pret's symbols
@@ -1774,11 +1779,12 @@ class PokemonEmeraldReader:
                 return f"{foe} is immune to Electric moves"
         return None
 
-    def _party_battle_mon(self, index: int, mon: PokemonData) -> Dict[str, Any]:
+    def _party_battle_mon(self, index: int, mon: PokemonData, party_base: Optional[int] = None) -> Dict[str, Any]:
         """A party Pokémon in the shape of _read_battle_mon, for estimate_damage: stats from
         its struct Pokemon (pret: level +0x54, hp +0x56, maxHP +0x58, attack +0x5A, defense
-        +0x5C, spAttack +0x60, spDefense +0x62), no stat stages yet, battler 0's side."""
-        base = self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE
+        +0x5C, spAttack +0x60, spDefense +0x62), no stat stages yet, battler 0's side.
+        party_base: gEnemyParty for a trainer's Pokémon (default gPlayerParty)."""
+        base = (self.addresses.PARTY_BASE if party_base is None else party_base) + index * self.addresses.PARTY_POKEMON_SIZE
         move_ids = []
         for name in mon.moves or []:
             try:
@@ -1815,6 +1821,109 @@ class PokemonEmeraldReader:
         ]
         return max(hits, default=(0.0, 0))
 
+    def enemy_party_mon(self, species_name: str) -> Optional[Dict[str, Any]]:
+        """The trainer's party Pokémon of this species (gEnemyParty), as _read_battle_mon
+        shapes it, or None. For "X is about to use Y. Will you change POKéMON?", before Y
+        is out: its real stats and moves, not only its types."""
+        want = str(species_name).strip().upper()
+        raw = self.read_memory(G_ENEMY_PARTY, 6 * self.addresses.PARTY_POKEMON_SIZE)
+        for index in range(6):
+            chunk = raw[index * self.addresses.PARTY_POKEMON_SIZE:(index + 1) * self.addresses.PARTY_POKEMON_SIZE]
+            try:
+                mon = parse_pokemon(chunk)
+            except Exception:  # an empty or unreadable slot
+                continue
+            name = mon.species_name
+            if name.startswith("Species_"):
+                name = self._battle_species_name(mon.species_id)
+            if mon.species_id and str(name).upper() == want and mon.current_hp > 0:
+                battle_mon = self._party_battle_mon(index, mon, G_ENEMY_PARTY)
+                battle_mon["battler"] = 1
+                return battle_mon
+        return None
+
+    def _exchange(self, cand: Dict[str, Any], target: Dict[str, Any], switching_in: bool) -> Optional[Dict[str, Any]]:
+        """How a fight between cand and target goes, both hitting with their best move
+        (estimate_damage): the hits cand needs, and the HP it has left when the last one
+        lands (the faster side hits first each turn; a speed tie goes to the foe). With
+        switching_in it first takes the foe's hit for free. None if cand can't hurt it or
+        doesn't survive the switch; left <= 0 means the foe wins."""
+        hit, move_id = self._best_hit(cand, target)
+        if not hit:
+            return None
+        taken = self._best_hit(target, cand)[0]
+        hp = cand["hp"] - (taken if switching_in else 0)
+        if hp <= 0:
+            return None
+        hits = math.ceil(target["hp"] / hit)
+        faster = cand["stats"].get("speed", 0) > target["stats"].get("speed", 0)
+        hits_taken = hits - 1 if faster else hits
+        return {"hit": hit, "move_id": move_id, "taken": taken, "hp": hp, "hits": hits, "left": hp - taken * hits_taken}
+
+    def pick_fighter(
+        self, target: Dict[str, Any], out: set, switching_in: bool, accept=None
+    ) -> Optional[Dict[str, Any]]:
+        """The teammate to send against target, by one rule for every choice of who comes
+        in (a switch, a replacement, train's partner), or None if none wins.
+
+        David (2026-11-04): "It keeps using breloom to train... it needs to diversify who it
+        uses based on the opponent and what other options I have available. In many cases,
+        Combusken is plenty strong." Among the teammates not out (personalities in `out`)
+        that win the exchange (_exchange), those that win comfortably (COMFORT_HP_SHARE of
+        their HP left at the knock-out) are preferred, the lowest level first, then the
+        bigger margin. Only when none does, the one that wins fastest, keeping the most HP.
+        accept(exchange) narrows the candidates further. The result says why ("wins in 2,
+        keeps 70% HP; BRELOOM not needed").
+        """
+        party = self.read_party_pokemon() or []
+        able = [
+            (i, mon) for i, mon in enumerate(party)
+            if not mon.is_egg and mon.current_hp > 0
+            and self._read_u32(self.addresses.PARTY_BASE + i * self.addresses.PARTY_POKEMON_SIZE) not in out
+        ]
+        if not able:
+            return None
+        # The strongest that could come in: "BRELOOM not needed" names it, never the one out.
+        top = max(able, key=lambda im: im[1].level)[1]
+        options = []
+        for index, mon in able:
+            cand = self._party_battle_mon(index, mon)
+            ex = self._exchange(cand, target, switching_in)
+            if ex is None or ex["left"] <= 0 or (accept is not None and not accept(ex)):
+                continue
+            share = ex["left"] / cand["max_hp"] if cand["max_hp"] else 0.0
+            options.append((index, mon, cand, ex, share))
+        if not options:
+            return None
+        comfortable = [o for o in options if o[4] >= COMFORT_HP_SHARE]
+        if comfortable:
+            index, mon, cand, ex, share = min(comfortable, key=lambda o: (o[1].level, -o[4], o[3]["hits"]))
+        else:
+            index, mon, cand, ex, share = min(options, key=lambda o: (o[3]["hits"], -o[4]))
+        why = f"wins in {ex['hits']}, keeps {round(share * 100)}% HP"
+        if not comfortable:
+            why += "; nobody wins comfortably"
+        elif top.level > mon.level:
+            why += f"; {top.species_name.upper()} not needed"
+        data = self._rom_battle_move(ex["move_id"])
+        try:
+            move_name = Move(ex["move_id"]).name.replace("_", " ")
+        except ValueError:
+            move_name = f"MOVE {ex['move_id']}"
+        return {
+            "slot": index + 1,
+            "name": mon.species_name.upper(),
+            "level": mon.level,
+            "move": move_name,
+            "effectiveness": self.type_effectiveness(data["type"], target["type_ids"]),
+            "damage": round(ex["hit"], 1),
+            "taken": round(ex["taken"], 1),
+            "hp": cand["hp"],
+            "hits": ex["hits"],
+            "comfortable": bool(comfortable),
+            "why": why,
+        }
+
     def turns_to_win(self, index: int, mon: PokemonData, target: Dict[str, Any]) -> float:
         """Hits party slot `index` needs to knock the target out with its best attack
         (estimate_damage); inf if it can't hurt it."""
@@ -1835,46 +1944,18 @@ class PokemonEmeraldReader:
         """
         if not best or best.get("damage", 0) >= target["hp"]:
             return None
-        party = self.read_party_pokemon() or []
-        out = {
+        # Which of those comes in: pick_fighter, the one rule for who fights.
+        return self.pick_fighter(
+            target, self._out_personalities(player_battlers), switching_in=True,
+            accept=lambda ex: ex["hit"] >= 2 * best["damage"],
+        )
+
+    def _out_personalities(self, player_battlers: List[int]) -> set:
+        """struct BattlePokemon +0x48 personality: the player's Pokémon out now (2 in doubles)."""
+        return {
             self._read_u32(self.addresses.BATTLE_MONS + b * self.addresses.BATTLE_MON_SIZE + 0x48)
             for b in player_battlers
         }
-        choice = None
-        for index, mon in enumerate(party):
-            personality = self._read_u32(self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE)
-            if mon.is_egg or mon.current_hp == 0 or personality in out:
-                continue
-            cand = self._party_battle_mon(index, mon)
-            hit, move_id = self._best_hit(cand, target)
-            if not hit or hit < 2 * best["damage"]:
-                continue
-            taken = self._best_hit(target, cand)[0]
-            left = cand["hp"] - taken  # after the hit it takes switching in
-            if left <= 0:
-                continue
-            turns_to_win = math.ceil(target["hp"] / hit)
-            turns_alive = math.ceil(left / taken) if taken else math.inf
-            if turns_to_win > turns_alive:
-                continue
-            key = (turns_to_win, -left)
-            if choice is None or key < choice["key"]:
-                data = self._rom_battle_move(move_id)
-                try:
-                    move_name = Move(move_id).name.replace("_", " ")
-                except ValueError:
-                    move_name = f"MOVE {move_id}"
-                choice = {
-                    "key": key,
-                    "slot": index + 1,
-                    "name": mon.species_name.upper(),
-                    "move": move_name,
-                    "effectiveness": self.type_effectiveness(data["type"], target["type_ids"]),
-                    "damage": round(hit, 1),
-                }
-        if choice:
-            choice.pop("key")
-        return choice
 
     def _switch_hint(self, target: Optional[Dict[str, Any]], player_battlers: List[int]) -> Optional[Dict[str, Any]]:
         """The party Pokémon to send in when the one battling has no damaging move with PP:
@@ -1931,47 +2012,8 @@ class PokemonEmeraldReader:
         foe_speed = target["stats"].get("speed", 0)
         if not self._loses_race(our_hits, foe_hits, player["stats"].get("speed", 0), foe_speed):
             return None
-        party = self.read_party_pokemon() or []
-        out = {
-            self._read_u32(self.addresses.BATTLE_MONS + b * self.addresses.BATTLE_MON_SIZE + 0x48)
-            for b in player_battlers
-        }
-        choice = None
-        for index, mon in enumerate(party):
-            personality = self._read_u32(self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE)
-            if mon.is_egg or mon.current_hp == 0 or personality in out:
-                continue
-            cand = self._party_battle_mon(index, mon)
-            hit, move_id = self._best_hit(cand, target)
-            if not hit:
-                continue
-            taken = self._best_hit(target, cand)[0]
-            left = cand["hp"] - taken  # after the hit it takes switching in
-            if left <= 0:
-                continue
-            cand_hits = math.ceil(target["hp"] / hit)
-            alive = math.ceil(left / taken) if taken else math.inf
-            if self._loses_race(cand_hits, alive, cand["stats"].get("speed", 0), foe_speed):
-                continue
-            key = (cand_hits, -left)
-            if choice is None or key < choice["key"]:
-                data = self._rom_battle_move(move_id)
-                try:
-                    move_name = Move(move_id).name.replace("_", " ")
-                except ValueError:
-                    move_name = f"MOVE {move_id}"
-                choice = {
-                    "key": key,
-                    "slot": index + 1,
-                    "name": mon.species_name.upper(),
-                    "move": move_name,
-                    "effectiveness": self.type_effectiveness(data["type"], target["type_ids"]),
-                    "damage": round(hit, 1),
-                    "taken": round(taken, 1),
-                    "hp": cand["hp"],
-                }
-        if choice:
-            choice.pop("key")
+        # The teammate that wins it instead, by pick_fighter (the one rule for who fights).
+        choice = self.pick_fighter(target, self._out_personalities(player_battlers), switching_in=True)
         foe_data = self._rom_battle_move(foe_move)
         try:
             foe_move_name = Move(foe_move).name.replace("_", " ")

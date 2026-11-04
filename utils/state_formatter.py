@@ -408,7 +408,8 @@ def format_battle_view(view):
             lines.append(
                 f"Better matchup: call switch_pokemon(\"{better['name']}\") instead "
                 f"({better['move']} {better['effectiveness']:g}x, ~{round(better['damage'])} HP a hit vs "
-                f"~{round(best.get('damage') or 0)} for {best['name']}; it takes one hit coming in)."
+                f"~{round(best.get('damage') or 0)} for {best['name']}; it takes one hit coming in"
+                + (f"; {better['why']}" if better.get('why') else "") + ")."
             )
         danger = view.get('danger')
         if danger:
@@ -427,7 +428,7 @@ def format_battle_view(view):
                 line += (
                     f" Switch: call switch_pokemon(\"{safe['name']}\") ({safe['move']} {safe['effectiveness']:g}x, "
                     f"~{round(safe['damage'])} HP a hit; it takes ~{round(safe['taken'])} of its {safe['hp']} HP "
-                    "coming in and still wins)."
+                    "coming in and still wins" + (f": {safe['why']}" if safe.get('why') else "") + ")."
                 )
             else:
                 line += " No teammate wins this exchange either: attack, heal, or switch to the one that lasts longest."
