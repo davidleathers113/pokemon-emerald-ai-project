@@ -582,6 +582,9 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None) -> 
             "kind": "edge",
             "direction": direction,
             "open_span": connection_open_span(conn),
+            "dead_ends": _edge_dead_ends(
+                porymap_map_name or "", str(conn.get("map", "")), direction, int(conn.get("offset", 0) or 0)
+            ),
             "name": name,
             "label": f"{EDGE_NAMES[direction]} edge -> {name}",
         })
@@ -905,6 +908,33 @@ def _areas_at(map_dir: str, x: int, y: int, areas: Optional[dict] = None) -> set
     return {areas[c] for c in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)) if c in areas}
 
 
+@lru_cache(maxsize=256)
+def _edge_dead_ends(map_dir: str, dest_const: str, direction: str, offset: int) -> frozenset:
+    """Positions along this map's edge (x for up/down, y for left/right, this map's frame)
+    whose arrival tile next door is in an area with no way on but back here.
+
+    Seen live: go_to_exit("east") from VERDANTURF TOWN (19,6) took the nearest edge tile,
+    y=6, and landed on ROUTE 117 (0,6): a one-tile notch walled in on three sides, so
+    every walk and train call from there failed. Route 117 goes on from y=8.
+    """
+    from utils.mapping.porymap_state import _map_dirs_by_const, _static_grid
+
+    dest = _map_dirs_by_const().get(dest_const)
+    grid = _static_grid(dest) if dest else None
+    if not grid or direction not in ("up", "down", "left", "right"):
+        return frozenset()
+    height, width = len(grid), max(len(row) for row in grid)
+    areas = _route_areas(dest)
+    leads_on = {area for area, _, to_map, _, _ in _walk_exits(dest) if to_map != map_dir}
+    if direction in ("up", "down"):
+        arrivals = {i: (i, height - 1 if direction == "up" else 0) for i in range(width)}
+    else:
+        arrivals = {i: (width - 1 if direction == "left" else 0, i) for i in range(height)}
+    return frozenset(
+        i + offset for i, tile in arrivals.items() if tile in areas and areas[tile] not in leads_on
+    )
+
+
 def _walk_exits(map_dir: str) -> tuple:
     """Ways off a map on foot: (from area, go_to_exit argument, to map dir, to area, to name).
 
@@ -1110,12 +1140,18 @@ def _far_map_hint(map_dir: str, matches, position: Optional[Tuple[int, int]] = N
     return " ".join(lines)
 
 
-def _walk_paths(map_dir: str, matches, position: Optional[Tuple[int, int]] = None) -> List[List[Tuple[str, str]]]:
+def _walk_paths(
+    map_dir: str, matches, position: Optional[Tuple[int, int]] = None, other_parts_of_here: bool = False
+) -> List[List[Tuple[str, str]]]:
     """Ways on foot to every map `matches(readable map name)` accepts, nearest first.
 
     Each way is [(go_to_exit argument, name of the map entered), ...]; "nearest" counts
     maps walked through (a breadth-first walk over walkable areas joined by edges and
     doors, starting from the player's area).
+
+    other_parts_of_here: the player's own map counts too, entered again into another
+    area (from ROUTE 117's walled-in notch at (0,6), Route 117's grass is west to
+    VERDANTURF TOWN and back east).
     """
     if not map_dir:
         return []
@@ -1142,7 +1178,7 @@ def _walk_paths(map_dir: str, matches, position: Optional[Tuple[int, int]] = Non
                     stack.append(below)
         return out
 
-    frontier, hits, seen_maps = with_jumps(start), [], {map_dir}
+    frontier, hits, seen_maps = with_jumps(start), [], set() if other_parts_of_here else {map_dir}
     for _ in range(_FAR_MAP_MAX_STEPS):
         nxt = []
         for node in frontier:
@@ -1333,6 +1369,11 @@ def encounter_pairs(
     return pairs
 
 
+# wild_encounter_spots: pairs handed to train, and how many candidates it may path-check.
+ENCOUNTER_PAIRS = 6
+ENCOUNTER_CANDIDATES = 40
+
+
 def wild_encounter_spots(env) -> dict:
     """The nearest encounter-tile pairs on the player's map, in navigate_to's frame.
 
@@ -1350,8 +1391,26 @@ def wild_encounter_spots(env) -> dict:
     occupied = frozenset(
         (int(o["current_x"]) - ox, int(o["current_y"]) - oy) for o in porymap.get("runtime_objects") or []
     ) - {start}
+    # The grid walk in encounter_pairs knows neither ledges nor elevation, and lists
+    # pairs it can't reach last "for the pathfinder to try". Seen live from ROUTE 117
+    # (0,6), a walled-in notch: all 6 were unreachable and every train call stopped in
+    # 0.2 s ("No path found from (0, 6) to (11, 1)"). Keep only pairs the pathfinder
+    # reaches; "unreachable" says grass exists but none of it can be walked to.
+    from server.field_control import end_of_path
+
+    candidates = encounter_pairs(tiles, start, grid, limit=ENCOUNTER_CANDIDATES, occupied=occupied)
+    pairs = []
+    for tile, other in candidates:
+        if tile != start:
+            path = pathfinder.find_path(start, tile, state, consider_npcs=True, allow_partial=False)
+            if not path or end_of_path(start, path) != tile:
+                continue
+        pairs.append((tile, other))
+        if len(pairs) == ENCOUNTER_PAIRS:
+            break
     return {
-        "pairs": encounter_pairs(tiles, start, grid, occupied=occupied),
+        "pairs": pairs,
+        "unreachable": bool(candidates) and not pairs,
         "coord_offset": coord_offset,
         "map_dir": map_dir,
     }
@@ -1390,10 +1449,13 @@ def way_to_wild_encounters(location_name: str, position: Optional[Tuple[int, int
         ROM_TO_PORYMAP_MAP.get(location_name, ""),
         lambda name: map_has_wild_encounters(_map_dirs_by_name().get(name, "")),
         position,
+        other_parts_of_here=True,
     )
     if not paths:
         return "no tall grass or cave can be reached on foot from here."
-    path = paths[0]
+    # Equally near, the player's own map wins: its Pokémon are the ones an objective
+    # there wants (Marill on Route 117, not Rusturf Tunnel's Whismur).
+    path = min(paths, key=lambda p: (len(p), p[-1][1] != location_name))
     place = path[-1][1]
     if len(path) == 1:
         return f'{place} has wild Pokémon: go_to_exit("{path[0][0]}"), then call train again.'
@@ -1575,7 +1637,12 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 # Only where the neighbouring map is walkable too (span is in full-map coords).
                 along, shift = (0, ox) if exit_entry["direction"] in ("up", "down") else (1, oy)
                 candidates = [c for c in candidates if c[along] + shift in span]
-            candidates.sort(key=lambda c: abs(c[0] - start[0]) + abs(c[1] - start[1]))
+            # Tiles that arrive in a dead-end pocket next door go last (_edge_dead_ends).
+            along, shift = (0, ox) if exit_entry["direction"] in ("up", "down") else (1, oy)
+            dead = exit_entry.get("dead_ends") or frozenset()
+            candidates.sort(
+                key=lambda c: (c[along] + shift in dead, abs(c[0] - start[0]) + abs(c[1] - start[1]))
+            )
             if not candidates:
                 tried.append(f"{exit_entry['label']}: no standable tile on that edge (water or wall)")
                 continue

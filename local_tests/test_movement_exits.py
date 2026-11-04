@@ -144,6 +144,27 @@ def test_navigate_to_a_door_reports_the_new_map():
     assert r["summary"].startswith("Went through a door/warp: now at") and "POKEMON CENTER 1F" in r["summary"], r
 
 
+def test_an_edge_exit_never_lands_in_a_dead_end_pocket():
+    """Seen live: go_to_exit("east") from VERDANTURF TOWN (19,6) took the nearest edge tile
+    and landed on ROUTE 117 (0,6), a one-tile notch walled in on three sides; every walk
+    and train call from there failed until the player was walked out by hand. Route 117
+    goes on from y=8. test_verdanturf_east.state is the player at (19,6)."""
+    from server.game_tools import _edge_dead_ends
+
+    assert 6 in _edge_dead_ends("VerdanturfTown", "MAP_ROUTE117", "right", 0)
+    assert 8 not in _edge_dead_ends("VerdanturfTown", "MAP_ROUTE117", "right", 0)
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_verdanturf_east.state", wild_encounters=False)
+    r = s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "to Route 117"})
+    print("   ", r.get("summary") or r)
+    snap = s.snapshot()
+    assert r["success"] is True and _location(s) == "ROUTE 117", r
+    assert (snap.x, snap.y) != (0, 6), snap
+    # From where it landed, Route 117 goes on east.
+    r = s.call("mcp_press_buttons", {"buttons": ["RIGHT"], "reasoning": "on east"})
+    assert r.get("status") == "DONE" and s.snapshot().x == snap.x + 1, r
+
+
 def test_walks_never_step_on_a_door_they_are_not_going_to():
     """Seen live: from ROUTE 110 (16,89), right below the Cycling Road gate's door at
     (16,88), every navigate_to north ended inside ROUTE 110 SEASIDE CYCLING ROAD SOUTH

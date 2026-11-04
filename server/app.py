@@ -6082,6 +6082,12 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             way = await run_in_threadpool(
                 game_tools.way_to_wild_encounters, location, (snap.x, snap.y) if snap is not None else None
             )
+            if spots.get("unreachable"):
+                where = _position_text(snap) if snap is not None else location
+                return _refusal(
+                    f"{location} has tall grass, but none of it can be walked to from {where}: {way}",
+                    stopped_because="no_grass",
+                )
             return _refusal(f"No tall grass here ({location}), and it isn't a cave: {way}", stopped_because="no_grass")
     partner_index = _train_partner(party, trainee_pid, partner_pid)
     weak = _train_weakness(partner_index)

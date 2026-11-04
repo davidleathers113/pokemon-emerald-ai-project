@@ -111,6 +111,37 @@ def test_train_refuses_without_grass_and_names_the_way():
     assert (after.x, after.y) == (before.x, before.y), (before, after)
 
 
+def test_train_only_picks_grass_it_can_walk_to():
+    """Seen live from ROUTE 117 (0,6), a notch walled in on three sides: every train call
+    stopped in 0.2 s, "could not get to the tall grass: No path found from (0, 6) to
+    (11, 1)". The grid walk offered 6 pairs it could not reach "for the pathfinder to
+    try"; all failed. test_route117_notch.state is that tile; test_verdanturf_east.state
+    plus go_to_exit("east") lands at (0,8), on the open part of Route 117."""
+    from server import game_tools
+
+    s = server()
+    s.load(HERE / "test_route117_notch.state", wild_encounters=False)
+    with s.srv.memory_lock:
+        spots = game_tools.wild_encounter_spots(s.srv.env)
+    assert spots["pairs"] == [] and spots["unreachable"] is True, spots
+    r = s.call("mcp_train", {"trainee": "MARILL", "until_level": 14, "reasoning": "test"})
+    print("   ", r)
+    assert r["success"] is False and r["stopped_because"] == "no_grass", r
+    assert "ROUTE 117 has tall grass, but none of it can be walked to from (0,6)" in r["error"], r
+    assert 'go_to_exit("west")' in r["error"] and "VERDANTURF TOWN → ROUTE 117" in r["error"], r
+    s.load(HERE / "test_verdanturf_east.state", wild_encounters=False)
+    assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
+    with s.srv.memory_lock:
+        spots = game_tools.wild_encounter_spots(s.srv.env)
+        state, _, _ = game_tools.load_pathfinding_state(s.srv.env)
+    assert spots["pairs"] and not spots["unreachable"], spots
+    snap = s.snapshot()
+    ox, oy = spots["coord_offset"] or (0, 0)
+    start = (snap.x - ox, snap.y - oy)
+    for tile, _ in spots["pairs"]:
+        assert game_tools.pathfinder.find_path(start, tile, state, consider_npcs=True, allow_partial=False), tile
+
+
 def test_train_refuses_a_weak_team_and_says_where_to_heal():
     s = server()
     s.load(WOODS)

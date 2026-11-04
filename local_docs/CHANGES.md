@@ -1138,6 +1138,24 @@ prompt. That came to 1.1 tiles walked per minute.
   prompt says Marill. Without the fix the party reads 'Species_183'. Objective-memory
   22/22.
 
+## Edge exits avoid dead-end pockets; train only picks grass it can reach (2026-11-04, WEAKNESSES R19, R20)
+- Seen live: go_to_exit("east") from VERDANTURF TOWN (19,6) took the nearest edge tile
+  and landed on ROUTE 117 (0,6), walled in on three sides. `_edge_dead_ends(map, next
+  map, direction, offset)` lists the edge positions whose arrival tile next door is in an
+  area (`_route_areas`) with no exit (`_walk_exits`) except back; `list_map_exits` adds
+  them to each edge exit and `plan_exit_route` tries those tiles last.
+- Seen live from that notch: train stopped in 0.2 s on every call. `wild_encounter_spots`
+  path-checks up to 40 candidate pairs (`find_path`, NPCs considered, no partial paths)
+  and keeps 6 reachable ones; `"unreachable"` marks grass that exists but can't be walked
+  to. train then refuses with the way round: `way_to_wild_encounters` counts other parts
+  of the player's own map (`_walk_paths(other_parts_of_here=True)`) and prefers that map
+  on a tie, so from the notch it says VERDANTURF TOWN → ROUTE 117, go_to_exit("west").
+- Fixtures from test_marill_in_party.state: `test_verdanturf_east.state` (VERDANTURF TOWN
+  (19,6)) and `test_route117_notch.state` (ROUTE 117 (0,6)).
+- *Verified:* `test_an_edge_exit_never_lands_in_a_dead_end_pocket` lands at (0,8); with
+  the ordering off it lands at (0,6). `test_train_only_picks_grass_it_can_walk_to`: with
+  the path check off the notch gets the six unreachable pairs from the live log.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
