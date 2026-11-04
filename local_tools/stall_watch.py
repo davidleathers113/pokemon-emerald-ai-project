@@ -11,6 +11,9 @@ Stuck means any of:
     and map it started from (battles are left out: a battle keeps the player still on
     purpose);
   - REPEAT: the same tool with the same arguments 4 times in a row;
+  - CYCLE: the last 6 calls repeat a 2- or 3-call pattern while nothing changes;
+  - NO_PROGRESS: 8 decisions in a row with nothing changing (tile, battle and party
+    lines of the prompt);
   - DOWN: the game server did not answer 3 polls in a row.
 
   python3 local_tools/stall_watch.py [--interval 15] [--no-pause]
@@ -27,6 +30,8 @@ SERVER = "http://127.0.0.1:8000"
 MOVE_TOOLS = {"navigate_to", "go_to_exit", "go_to", "train", "talk_to"}
 SAME_TILE_RUN = 3
 REPEAT_RUN = 4
+CYCLE_RUN = 6
+NO_PROGRESS_RUN = 8
 DOWN_RUN = 3
 
 
@@ -111,7 +116,43 @@ def stall_reason(rows: list) -> str:
     calls = [_call(r) for r in rows[-REPEAT_RUN:]]
     if len(calls) == REPEAT_RUN and calls[0][0] and all(c == calls[0] for c in calls):
         return f"REPEAT: {calls[0][0]}({json.dumps(calls[0][1])}) {REPEAT_RUN} times in a row"
+    # Seen live 07:06-07:36: press_buttons(A) and switch_pokemon(...) in turn for 30
+    # minutes in the game's replacement menu; neither SAME_TILE (no walking) nor REPEAT
+    # (two different calls) saw it.
+    tail = rows[-CYCLE_RUN:]
+    if len(tail) == CYCLE_RUN and _unchanged(tail):
+        calls = [_call(r) for r in tail]
+        for period in (2, 3):
+            if all(calls[i] == calls[i - period] for i in range(period, CYCLE_RUN)):
+                names = " / ".join(f"{name}({json.dumps(args)})" for name, args in calls[:period])
+                return f"CYCLE: {names} in turn, {CYCLE_RUN} calls with nothing changing"
+    tail = rows[-NO_PROGRESS_RUN:]
+    if len(tail) == NO_PROGRESS_RUN and _unchanged(tail):
+        loc, xy = _spot(tail[-1])
+        return f"NO_PROGRESS: {NO_PROGRESS_RUN} decisions at {xy} on {loc} with no change to the battle or party"
     return ""
+
+
+def _fingerprint(row: dict):
+    """What a decision saw that progress would change: the tile, in battle or not, and
+    the prompt's party lines ("1. Breloom (Lv.27) HP: 72/75") and battle lines ("…battle
+    vs WINGULL Lv12 (WATER/FLYING), HP 30/30", "You: BRELOOM …"). None without a prompt."""
+    prompt = row.get("llm_prompt")
+    if not prompt:
+        return None
+    lines = []
+    for line in str(prompt).splitlines():
+        s = line.strip()
+        party = s[:1].isdigit() and ". " in s[:4] and "(Lv." in s and "HP" in s
+        if party or "battle vs " in s or s.startswith("You: "):
+            lines.append(s)
+    pre = row.get("pre_state") or {}
+    return _spot(row), bool(pre.get("is_in_battle")), tuple(dict.fromkeys(lines))
+
+
+def _unchanged(rows: list) -> bool:
+    prints = [_fingerprint(r) for r in rows]
+    return prints[0] is not None and all(p == prints[0] for p in prints)
 
 
 def rows_after(rows: list, watch_from: str) -> list:

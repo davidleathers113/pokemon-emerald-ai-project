@@ -1177,6 +1177,30 @@ prompt. That came to 1.1 tiles walked per minute.
   `test_no_damaging_pp_names_the_switch`, `test_use_move_refuses_a_status_move_that_cannot_work`
   (five cases, RAM writes on test_switch_question.state).
 
+## The game's replacement menu, and loops that don't walk (2026-11-04, WEAKNESSES M49)
+- Seen live 07:06-07:36: MARILL fainted in a wild battle; the game opened its party
+  menu to replace it (cursor on MARILL, action SEND OUT). The model alternated
+  press_buttons(A) and switch_pokemon for 30 minutes; switch_pokemon refused ("pick one
+  with press_buttons"); the stall watcher saw neither SAME_TILE nor REPEAT.
+- `_shift_from_party_menu` picks SHIFT or SEND OUT (menu_state.MENU_SEND_OUT, pret
+  party_menu.c). switch_pokemon, with that menu open (`_forced_party_menu`), skips the
+  POKEMON step. `_play_out_battle` sends in the replacement itself: `_replacement()`,
+  the battle view's `_switch_hint` (best counter_score among teammates able to fight
+  with damaging PP), at most twice per play-out; the note reads "sent in X for the
+  fainted Pokémon". If nobody qualifies, the report names switch_pokemon instead of
+  press_buttons.
+- stall_watch: CYCLE (the last 6 calls repeat a 2- or 3-call pattern) and NO_PROGRESS
+  (8 decisions), both only while nothing changes: the tile, in battle or not, and the
+  prompt's party lines and battle lines (`_fingerprint`), so an alternation in a battle
+  that is moving on is not a stall.
+- *Verified:* fixture route: test_wild_two_party.state, Torchic fainted (RAM), YES to
+  "Use next POKéMON?" → the replacement menu on the fainted TORCHIC.
+  `test_switch_pokemon_works_in_the_replacement_menu` (old code: the live refusal),
+  `test_the_play_out_sends_in_a_replacement_itself` (old code: ends at "menu").
+  stall-watch 9/9; replaying today's run file the new rules fire on the known stalls
+  (the Route 110 gate door, the bike shop, Isaac's switch question at 05:56, the
+  replacement menu at 06:49), and the 05:56 rows show the fingerprint holds battle HP.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

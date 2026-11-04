@@ -272,6 +272,52 @@ def test_question_stops_the_turn_and_is_quoted():
     assert _asking(s), _flow(s)  # memory: the script's yesnobox is still up, unanswered
 
 
+def _to_the_replacement_menu(s):
+    """WILD_TWO with Torchic fainted and YES to "Use next POKéMON?": the game's own party
+    menu, cursor on the fainted TORCHIC, offering SEND OUT."""
+    from server import menu_state as ms
+
+    _faint_torchic_this_turn(s)
+    s.call("mcp_use_move", {"move": "GROWL", "reasoning": "test"})
+    assert _asking(s), _flow(s)
+    s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "test: YES"})
+    deadline = time.time() + 10
+    while time.time() < deadline and not s.srv._forced_party_menu():
+        time.sleep(0.1)
+    assert s.srv._forced_party_menu(), _flow(s)
+    assert _read(s, ms.party_menu_slot) == 0  # on the fainted TORCHIC, as seen live
+
+
+def test_switch_pokemon_works_in_the_replacement_menu():
+    """Seen live: MARILL fainted in a wild battle; for 30 minutes switch_pokemon said "pick
+    one with press_buttons" and A on the fainted one said "no energy left to battle". The
+    game's menu offers SEND OUT, not SHIFT."""
+    s = server()
+    s.load(WILD_TWO)
+    _to_the_replacement_menu(s)
+    r = s.call("mcp_switch_pokemon", {"pokemon": "SHROOMISH", "reasoning": "test"})
+    print("   ", r)
+    assert r["success"] is True and r["status"] == "SWITCHED", r
+    assert "TORCHIC fainted and SHROOMISH is in battle now" in r["summary"], r
+    assert _view(s)["player"]["name"] == "Shroomish", _view(s)["player"]
+
+
+def test_the_play_out_sends_in_a_replacement_itself():
+    """Any Pokémon able to fight is a right answer to the replacement menu, so the
+    play-out (use_move, train, ...) sends in the best counter and says so."""
+    import asyncio
+
+    s = server()
+    s.load(WILD_TWO)
+    _to_the_replacement_menu(s)
+    played = asyncio.run(s.srv._play_out_battle("test"))
+    print("   ", played["end"], played["notes"])
+    assert played["end"] == "action", played["end"]
+    assert played["notes"] == ["sent in SHROOMISH for the fainted Pokémon (the best of the rest here)"], played["notes"]
+    assert "Answered for you: sent in SHROOMISH" in s.srv._battle_report(played)
+    assert _view(s)["player"]["name"] == "Shroomish"
+
+
 # -- the agent's auto-advance ----------------------------------------------------
 
 

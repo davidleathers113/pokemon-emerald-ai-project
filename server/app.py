@@ -5110,7 +5110,7 @@ async def _play_out_battle_steps(
 
     texts: List[str] = []
     notes: List[str] = []
-    presses = 0
+    presses = replaced = 0
     start = _game_frame()
     deadline = time.monotonic() + (max_wall_s if max_wall_s is not None else max(30.0, frames / 20))
     seen = _frames_run
@@ -5165,7 +5165,21 @@ async def _play_out_battle_steps(
         elif not flow.in_battle_screen and any(
             _mem(ms.callback2_is, cb) for cb in (ms.CB2_UPDATE_PARTY_MENU, ms.CB2_BAG_MENU_RUN)
         ):
-            end = "menu"  # the game opened the party menu itself (a fainted Pokémon must be replaced)
+            # The game opened the party menu itself: a fainted Pokémon must be replaced.
+            # Seen live: MARILL fainted while training and the model spent 30 minutes
+            # in this menu (press A on the fainted one, switch_pokemon refused). Any
+            # Pokémon able to fight is a valid answer, so the best counter is sent in.
+            choice = _replacement() if replaced < 2 and _forced_party_menu() else None
+            if choice is None:
+                end = "menu"
+            else:
+                replaced += 1
+                error = await _shift_from_party_menu(choice["personality"], choice["name"], source)
+                if error:
+                    end = "menu"
+                else:
+                    notes.append(f"sent in {choice['name']} for the fainted Pokémon (the best of the rest here)")
+                    presses += 3
         elif flow.level_up_box and flow.in_battle_screen:
             # The stat panel after "X grew to LV. N!" waits for a key without a text
             # printer; A while it is still drawing is ignored, so pressing until the
@@ -5205,7 +5219,13 @@ def _battle_end_text(played: Dict[str, Any]) -> str:
             "(A = YES picks a move to forget, B = NO keeps the old moves)."
         )
     if end == "menu":
-        return "The game opened the party menu (a fainted Pokémon must be replaced): pick one with press_buttons."
+        choice = _replacement() if _forced_party_menu() else None
+        if choice is not None:
+            return (
+                "The game opened the party menu (a fainted Pokémon must be replaced): call "
+                f'switch_pokemon("{choice["name"]}") (the best of the rest here).'
+            )
+        return "The game opened the party menu (a fainted Pokémon must be replaced): call switch_pokemon with one able to fight."
     if end == "evolution":
         said = _quote([_mem(read_field_text)]) or said
         return f"Your Pokémon is evolving ({said}): press A to let it evolve (B stops it)."
@@ -5515,9 +5535,10 @@ async def mcp_throw_ball(request: dict = None):
 
 
 async def _shift_from_party_menu(personality: int, name: str, source: str) -> Optional[str]:
-    """With the battle's party menu opening (from POKEMON, or from YES to "Will DAVID
-    change POKéMON?"), pick the Pokémon with this personality and choose SHIFT. Returns
-    None once back on the battle screen, else why not (the menu may still be open)."""
+    """With the battle's party menu opening (from POKEMON, from YES to "Will DAVID change
+    POKéMON?", or opened by the game to replace a fainted Pokémon), pick the Pokémon with
+    this personality and choose SHIFT, or SEND OUT in the replacement menu. Returns None
+    once back on the battle screen, else why not (the menu may still be open)."""
     from server import menu_state as ms
 
     def party_menu_ready():
@@ -5543,18 +5564,49 @@ async def _shift_from_party_menu(personality: int, name: str, source: str) -> Op
         said = _mem(read_field_text)
         return f"Pressed A on {name} but no SHIFT menu opened{f' ({said})' if said else ''}."
     actions = _mem(ms.party_menu_actions)
-    if ms.MENU_SHIFT not in actions:
-        return f"{name}'s menu has no SHIFT option."
-    await _macro_press(ms.list_presses(_mem(ms.read_menu_cursor).cursor, actions.index(ms.MENU_SHIFT)), source)
+    # Seen live: MARILL fainted in a wild battle and the game's replacement menu offers
+    # SEND OUT, not SHIFT; the model spent 30 minutes on press_buttons there.
+    action = next((a for a in (ms.MENU_SHIFT, ms.MENU_SEND_OUT) if a in actions), None)
+    if action is None:
+        return f"{name}'s menu has no SHIFT or SEND OUT option."
+    label = "SHIFT" if action == ms.MENU_SHIFT else "SEND OUT"
+    await _macro_press(ms.list_presses(_mem(ms.read_menu_cursor).cursor, actions.index(action)), source)
     cursor = _mem(ms.read_menu_cursor)
-    if cursor.cursor >= len(actions) or actions[cursor.cursor] != ms.MENU_SHIFT:
-        return f"Could not put the cursor on SHIFT (it is on entry {cursor.cursor + 1})."
-    await _macro_press(["A"], source)  # SHIFT
+    if cursor.cursor >= len(actions) or actions[cursor.cursor] != action:
+        return f"Could not put the cursor on {label} (it is on entry {cursor.cursor + 1})."
+    await _macro_press(["A"], source)
     if not await _await_game(lambda: _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN), MACRO_MENU_FRAMES * 2):
         # Still in the party menu: the game refused (e.g. a trapping move) and says why.
         said = _mem(read_field_text)
-        return f"Chose SHIFT but the game kept the party menu open{f': {said}' if said else ''}."
+        return f"Chose {label} but the game kept the party menu open{f': {said}' if said else ''}."
     return None
+
+
+def _forced_party_menu() -> bool:
+    """In a battle with the party menu up that the player did not open: the game asks
+    for a replacement for a fainted Pokémon."""
+    from server import menu_state as ms
+
+    return bool(_mem(lambda r: r.is_in_battle())) and _mem(ms.callback2_is, ms.CB2_UPDATE_PARTY_MENU)
+
+
+def _replacement() -> Optional[Dict[str, Any]]:
+    """The teammate to send in for a fainted Pokémon: the battle view's switch hint (best
+    counter_score against the foe among those able to fight with damaging PP), with its
+    personality; None if nobody qualifies."""
+    from server import menu_state as ms
+
+    with memory_lock:
+        reader = env.memory_reader
+        view = reader.read_battle_view() or {}
+        battlers = [0, 2] if view.get("is_double") else [0]
+        hint = reader._switch_hint(view.get("target"), battlers)
+        if hint is None:
+            return None
+        personalities = ms.party_personalities(reader)
+    if hint["slot"] > len(personalities):
+        return None
+    return {**hint, "personality": personalities[hint["slot"] - 1]}
 
 
 def _counter_score(reader, mon, foe_types: List[int]) -> float:
@@ -5682,12 +5734,19 @@ async def mcp_switch_pokemon(request: dict = None):
             return _refusal(f"{mon['name']} has fainted (HP 0/{mon['max_hp']}) and can't battle. Your party: {listing}.")
         outgoing = view["player"]["name"].upper() if view.get("player") else "your Pokémon"
 
-        view, refusal = await _ready_for_battle_action("switch_pokemon", source)
-        if refusal:
-            return refusal
-        error = await _choose_battle_action(ms.ACTION_POKEMON, source)
-        if error:
-            return _refusal(error)
+        # Seen live: the game's own replacement menu (a fainted MARILL) was open, and
+        # switch_pokemon said "pick one with press_buttons" for 30 minutes. There the
+        # POKEMON step is already done: pick the Pokémon and SEND OUT.
+        forced = _forced_party_menu()
+        if not forced:
+            view, refusal = await _ready_for_battle_action("switch_pokemon", source)
+            if refusal and not _forced_party_menu():
+                return refusal
+            forced = refusal is not None
+        if not forced:
+            error = await _choose_battle_action(ms.ACTION_POKEMON, source)
+            if error:
+                return _refusal(error)
         error = await _shift_from_party_menu(personalities[index], mon["name"], source)
         if error:
             back = await _back_to_battle_menu(source)
@@ -5701,7 +5760,8 @@ async def mcp_switch_pokemon(request: dict = None):
                 f"Chose SHIFT to {mon['name']}, but it is not the Pokémon in battle now. {_battle_report(played)}",
                 status="STOPPED",
             )
-        summary = f"Switched: {outgoing} came back and {mon['name']} is in battle now. {_battle_report(played)}"
+        came_back = f"{outgoing} fainted" if forced else f"{outgoing} came back"
+        summary = f"Switched: {came_back} and {mon['name']} is in battle now. {_battle_report(played)}"
         return {"success": True, "status": "SWITCHED", "pokemon": mon["name"], "summary": summary, "end": played["end"]}
     except Exception as e:
         logger.error(f"Error in switch_pokemon: {e}", exc_info=True)

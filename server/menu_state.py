@@ -145,6 +145,8 @@ G_SPECIAL_VAR_ITEM_ID = 0x0203CE7C       # set to the chosen item when its conte
 G_PARTY_MENU = 0x0203CEC8
 S_PARTY_MENU_INTERNAL = 0x0203CEC4
 MENU_SHIFT = 10  # party_menu.c MENU_SHIFT, the battle selection menu's first entry
+# party_menu.c MENU_SEND_OUT: the same menu when a fainted Pokémon must be replaced.
+MENU_SEND_OUT = 11
 
 # Mart: sMartInfo +8 itemList (u16 *), +0xC itemCount; sShopData (pointer)
 # +0x2006 selectedRow, +0x2008 scrollOffset, +0x200A maxQuantity (what money and bag

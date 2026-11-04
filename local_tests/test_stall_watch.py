@@ -14,6 +14,47 @@ def _row(tool, args=None, loc="ROUTE 117", xy=(47, 5), ts="t"):
             "action": {"tool_calls": [{"name": tool, "args": {**(args or {}), "reasoning": "x"}}]}}
 
 
+def _prompt(foe_hp=30, lead="1. Combusken (Lv.24) HP: 68/69 Status: OK"):
+    return (
+        "=== PARTY STATUS ===\nPokemon Party (2 pokemon):\n  1. Marill (Lv.13) HP: 0/44 Status: OK\n"
+        f"  2. {lead[3:]}\n"
+        f"Wild battle vs ZIGZAGOON Lv13 (NORMAL), HP {foe_hp}/40\nYou: MARILL Lv13 (WATER), HP 0/44\n"
+    )
+
+
+def test_two_calls_in_turn_with_nothing_changing_are_a_stall():
+    """Seen live 07:06-07:36: MARILL fainted and the game's replacement menu was up; the
+    model alternated press_buttons(A) and switch_pokemon for 30 minutes at (17,14). Neither
+    SAME_TILE nor REPEAT fired."""
+    rows = []
+    for i in range(8):
+        call = ("press_buttons", {"buttons": ["A"]}) if i % 2 == 0 else ("switch_pokemon", {"pokemon": "COMBUSKEN"})
+        row = _row(call[0], call[1], xy=(17, 14), ts=f"2026-11-04T07:0{i}:00")
+        row["llm_prompt"] = _prompt()
+        rows.append(row)
+    assert stall_reason(rows[:5]) == ""  # not yet
+    assert stall_reason(rows[:6]).startswith('CYCLE: press_buttons({"buttons": ["A"]}) / switch_pokemon('), stall_reason(rows[:6])
+    # The same alternation while the battle moves on (foe HP falls) is a fight, not a stall.
+    for i, row in enumerate(rows):
+        row["llm_prompt"] = _prompt(foe_hp=40 - 4 * i)
+    assert stall_reason(rows) == ""
+
+
+def test_eight_decisions_with_nothing_changing_are_a_stall():
+    calls = [("press_buttons", {"buttons": ["A"]}), ("press_buttons", {"buttons": ["B"]}), ("use_move", {"move": "1"}),
+             ("switch_pokemon", {"pokemon": "2"}), ("press_buttons", {"buttons": ["RIGHT"]}), ("use_move", {"move": "2"}),
+             ("press_buttons", {"buttons": ["START"]}), ("auto_advance_dialogue", {})]
+    rows = []
+    for i, (name, args) in enumerate(calls):
+        row = _row(name, args, xy=(17, 14), ts=f"2026-11-04T07:1{i}:00")
+        row["llm_prompt"] = _prompt()
+        rows.append(row)
+    assert stall_reason(rows[:7]) == ""
+    assert stall_reason(rows).startswith("NO_PROGRESS: 8 decisions at (17, 14) on ROUTE 117"), stall_reason(rows)
+    rows[3]["llm_prompt"] = _prompt(foe_hp=12)
+    assert stall_reason(rows) == ""
+
+
 def test_three_walks_on_one_tile_are_a_stall():
     """Seen live: train / navigate_to / train, all from (47,5) on ROUTE 117."""
     # A row is where its decision was made; the next row shows where the call left the
