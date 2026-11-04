@@ -147,13 +147,15 @@ def test_talk_to_walks_up_faces_and_starts_the_battle():
     assert "A choice (YES/NO or a menu) is open now" in r["summary"], r
     assert s.srv._field_status() == "choice"
     s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "test: YES"})
-    # His lines after YES are read the way the agent's auto-dialogue reads them.
-    for _ in range(6):
-        if _in_battle(s):
-            break
-        s.call("mcp_auto_advance_dialogue", {})
+    # His lines after YES are read the way the agent's auto-dialogue reads them. A
+    # deadline, not a count of calls: 6 calls 0.5 s apart failed 2 of 3 full macros runs
+    # on 2026-11-04 (L13) and never alone or after the same earlier tests; the failure now
+    # says what the screen showed.
+    deadline, reads = time.time() + 20, []
+    while not _in_battle(s) and time.time() < deadline:
+        reads.append(s.call("mcp_auto_advance_dialogue", {}).get("final_status"))
         time.sleep(0.5)
-    assert _in_battle(s), "YES to Wally starts the battle"
+    assert _in_battle(s), f"YES to Wally starts the battle; auto-advance said {reads}, now {s.srv._field_status()}"
     s.load(HERE / "test_mauville_wally.state")
     r = s.call("mcp_talk_to", {"x": "eight", "y": 6})
     assert r["success"] is False and "x and y are required" in r["error"], r
