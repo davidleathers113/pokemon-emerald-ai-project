@@ -3349,16 +3349,48 @@ def _catch_plan(view: Dict[str, Any], foe: Dict[str, Any]) -> str:
         )
     with memory_lock:
         pockets = env.memory_reader.read_full_inventory() or {}
+        weaken = _catch_weaken_move(env.memory_reader, view, foe)
     have = {i.get("name"): i.get("quantity", 0) for pocket in pockets.values() for i in (pocket or [])}
     ball = next((b for b in ("Ultra Ball", "Great Ball", "Poke Ball") if have.get(b)), "Poke Ball")
     first = (
         f'First call use_move("{helper}"): a sleeping or paralyzed Pokémon is much easier to catch. Then '
         if helper else "Call "
     )
+    if weaken:
+        # Seen live: seven GREAT BALLs at a full-HP ELECTRIKE, which left one GREAT BALL
+        # and four POKé BALLs for the NUMEL still to catch.
+        return (
+            f'It is above half HP: first use_move("{weaken["name"]}") once to weaken it (at most '
+            f'~{weaken["max"]} of its {foe["hp"]} HP, never a knockout). '
+            f'{first.replace("First call", "Next call") if helper else "Then call "}'
+            f'throw_ball("{ball}") and keep throwing if it breaks free. No other damaging moves.'
+        )
     return (
         f"Do NOT use damaging moves (you could knock it out). {first}throw_ball(\"{ball}\") and keep "
         "throwing if it breaks free. Ignore the 'Best move' line below."
     )
+
+
+EFFECT_FALSE_SWIPE = 101  # pret battle_move_effects.h: leaves the foe at 1 HP at worst
+
+
+def _catch_weaken_move(reader, view: Dict[str, Any], foe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """An attack of the Pokémon out that weakens a foe above half HP but can't knock it
+    out: FALSE SWIPE if it has it, else the weakest attack whose highest roll (the
+    estimate / 0.925, critical hits aside) leaves it at 1 HP or more. None otherwise:
+    go straight to balls. David: "Just catch the sableye. It's not that hard." (kept to
+    one line and one move)."""
+    if not foe.get("max_hp") or foe["hp"] * 2 <= foe["max_hp"]:
+        return None
+    usable = [m for m in view.get("moves") or [] if m.get("pp") and m.get("damage")]
+    swipe = next((m for m in usable if reader._rom_battle_move(m["id"])["effect"] == EFFECT_FALSE_SWIPE), None)
+    if swipe is not None:
+        return {"name": swipe["name"], "max": min(foe["hp"] - 1, math.ceil(swipe["damage"] / 0.925))}
+    safe = [m for m in usable if math.ceil(m["damage"] / 0.925) < foe["hp"]]
+    if not safe:
+        return None
+    move = min(safe, key=lambda m: m["damage"])
+    return {"name": move["name"], "max": math.ceil(move["damage"] / 0.925)}
 
 
 def _party_condition(condition: str) -> Optional[Tuple[bool, str]]:

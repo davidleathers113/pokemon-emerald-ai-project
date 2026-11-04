@@ -226,6 +226,34 @@ def test_battle_against_the_wanted_pokemon_says_catch_it():
     assert s.srv._catch_target_line({"story": {"id": "c", "completion_condition": "party_has_wurmple"}}) == ""
 
 
+def test_catch_plan_weakens_a_healthy_foe_without_risking_a_knockout():
+    """Seen live: seven GREAT BALLs at a full-HP ELECTRIKE, leaving one GREAT BALL and four
+    POKé BALLs for the NUMEL still to catch. Above half HP, the plan names one attack
+    whose highest roll can't knock it out (here SCRATCH, not EMBER); else balls at once.
+    RAM: the wild SHROOMISH's HP in gBattleMons[1] (+0x28 hp, +0x2C max)."""
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_wild_shroomish.state")
+    want = {"story": {"id": "c", "completion_condition": "party_has_shroomish: not yet"}}
+    line = s.srv._catch_target_line(want)
+    print("   ", line)
+    assert 'first use_move("SCRATCH") once to weaken it' in line and "never a knockout" in line, line
+    with s.srv.memory_lock:
+        view = s.srv.env.memory_reader.read_battle_view()
+        scratch = next(m for m in view["moves"] if m["name"] == "SCRATCH")
+    assert scratch["damage"] / 0.925 < view["target"]["hp"], (scratch, view["target"])
+
+    def foe_hp(hp, max_hp):
+        with s.srv.memory_lock:
+            s.srv.env.core.memory.u16[0x02024084 + 0x58 + 0x28] = hp
+            s.srv.env.core.memory.u16[0x02024084 + 0x58 + 0x2C] = max_hp
+            s.srv.env.memory_reader._invalidate_mem_cache()
+
+    foe_hp(10, 23)  # under half: straight to balls
+    assert "weaken" not in s.srv._catch_target_line(want) and "Do NOT use damaging moves" in s.srv._catch_target_line(want)
+    foe_hp(6, 6)  # full HP, but every attack could knock it out
+    assert "weaken" not in s.srv._catch_target_line(want)
+
+
 def test_catch_at_a_level_names_the_one_and_turns_down_the_rest():
     """"Catch a level 10+ Sableye" (David): level_<species>_<n> with none in the party.
     test_wild_shroomish.state is a wild SHROOMISH Lv6 against TORCHIC alone."""

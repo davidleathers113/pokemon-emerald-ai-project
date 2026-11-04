@@ -1264,6 +1264,18 @@ prompt. That came to 1.1 tiles walked per minute.
   COUNTER → don't learn; SKY UPPERCUT → learn, forget LEECH SEED (move 4); BRELOOM's types
   GRASS/FIGHTING; MACH PUNCH worth 60, COUNTER 0.
 
+## Catch plan: weaken a healthy foe first, without risking a knockout (2026-11-04, WEAKNESSES M54)
+- Seen live 08:41-08:43: seven GREAT BALLs at a full-HP ELECTRIKE.
+- `_catch_weaken_move(reader, view, foe)`: only while the foe is above half HP; FALSE
+  SWIPE (EFFECT_FALSE_SWIPE 101) if the Pokémon out has it, else its weakest attack
+  whose highest roll (`damage` / 0.925, critical hits aside) is below the foe's HP.
+  `_catch_plan` then says "first use_move(X) once to weaken it … Then call throw_ball".
+  Kept to one move and one line (David: "Just catch the sableye. It's not that hard.").
+- *Verified:* `test_catch_plan_weakens_a_healthy_foe_without_risking_a_knockout`
+  (test_wild_shroomish.state: SCRATCH at most ~8 of 23 HP; RAM 10/23 → balls at once;
+  6/6 → balls at once). Objective-memory 25/25, train-macro 18/18 (its catch stop now
+  reads "…use_move("SCRATCH") once…" against SILCOON), battle-view 17/17.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
