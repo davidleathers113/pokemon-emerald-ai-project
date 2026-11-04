@@ -43,10 +43,38 @@ def _names(s):
     return [p.species_name.upper() for p in _party(s)]
 
 
-def _maintain(s):
-    r = asyncio.run(s.srv.maintain_party({}))
+def _maintain(s, training=True):
+    # David (2026-11-04): "The party rule is only for training." Until then these tests
+    # called it with {}, when it set the lead at every step; the lead half now needs a
+    # training objective (or train's {"training": True}), which these tests are about.
+    r = asyncio.run(s.srv.maintain_party({"training": True} if training else {}))
     print("   ", r)
     return r
+
+
+def test_outside_training_the_lead_is_the_ai_s_choice():
+    """David (2026-11-04, verbatim): "The party rule is only for training. Not for gym
+    battles." Seen live: before Flannery the AI led with AZUMARILL (Water vs Fire) and the
+    next step put MANECTRIC (lowest) back in front. With no training objective current,
+    the lead is left alone; the Exp. Share still goes to the lowest (it costs nothing in
+    a fight)."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(CHIMNEY, wild_encounters=False)
+    s.srv._training_objective_current = False
+    r = _maintain(s, training=False)
+    assert r["changed"] is False and r["why"].startswith("not training"), r
+    assert _names(s)[0] == "BRELOOM"
+    s.srv._training_objective_current = True  # a training objective is current again
+    try:
+        assert _maintain(s, training=False)["summary"].startswith("Lead set to AZUMARILL"), _names(s)
+    finally:
+        s.srv._training_objective_current = False
+    s.load(CHIMNEY, wild_encounters=False)
+    _put_in_bag(s, ms.ITEM_EXP_SHARE)
+    r = _maintain(s, training=False)
+    assert r["changed"] and r["summary"].startswith("Exp. Share given to AZUMARILL"), r
 
 
 def _bag_ids(s, pocket=0):

@@ -557,8 +557,13 @@ def test_train_lowest_follows_the_party_rule_battle_by_battle():
         print("      ", battle)
     assert r["success"], r
     trainees = [b["trainee"] for b in r["battles"]]
-    assert set(trainees[:2]) == {"NUMEL", "AZUMARILL"}, trainees  # one battle each, then the other
-    assert f"{trainees[0]} then {trainees[1]} trained" in r["summary"], r["summary"]
+    # The lowest trains first; whether the other needs a battle of its own depends on the
+    # partner. Since the fighter rule (2026-11-04) the partner is the lowest teammate that
+    # wins comfortably, often the other low one here, which then earns EXP in the same
+    # battle. Until then this asserted one battle per trainee.
+    assert trainees and trainees[0] in ("NUMEL", "AZUMARILL") and set(trainees) <= {"NUMEL", "AZUMARILL"}, trainees
+    if len(set(trainees)) > 1:
+        assert f"{trainees[0]} then {trainees[1]} trained" in r["summary"], r["summary"]
     assert r["stopped_because"] == "until_level", r
     assert "every Pokémon able to battle is Lv19 or higher" in r["summary"], r["summary"]
     assert "Levels: " in r["summary"] and "NUMEL Lv18→19" in r["summary"] and "AZUMARILL Lv18→" in r["summary"], r["summary"]

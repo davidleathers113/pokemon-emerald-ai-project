@@ -3436,10 +3436,17 @@ def _set_grass_cost_for(guidance: Dict[str, Any]) -> None:
     from server import game_tools
     from utils.mapping.pathfinding import GRASS_TILE_COST_MULTIPLIER
 
+    global _training_objective_current
     story = guidance.get("story") or {}
     condition = str(story.get("completion_condition") or "")
     training = condition.startswith(("level_", "lead_level_")) and "ALREADY TRUE" not in condition
     game_tools.pathfinder.grass_cost = 1.0 if training else GRASS_TILE_COST_MULTIPLIER
+    _training_objective_current = training  # maintain_party's lead rule holds only then
+
+
+# Whether the current story objective is a training one (_set_grass_cost_for, on every state
+# read). False until the first state read after a start: no lead is forced before that.
+_training_objective_current = False
 
 
 # _trainee_advantage: the trainee fights alone only if it knocks the foe out in this many
@@ -7009,7 +7016,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
         EXP. Not when it holds the Exp. Share: then it earns from the bench. With LOWEST
         the party rule itself (maintain_party) does it, the Exp. Share included."""
         if lowest:
-            kept = await maintain_party({})
+            kept = await maintain_party({"training": True})
             if kept.get("changed"):
                 heal_notes.append(kept["summary"].rstrip("."))
             return
@@ -8255,6 +8262,13 @@ async def maintain_party(request: dict = None):
     menu or scene). Before the Exp. Share (in the bag or held) it puts the lowest-level
     eligible Pokémon in slot 1 (set_lead); after, it has that Pokémon hold the Exp. Share
     (give_item). Returns {"changed", "summary"}.
+
+    David (2026-11-04, verbatim): "The party rule is only for training. Not for gym
+    battles." Seen live: before Flannery the AI set AZUMARILL (Water vs her Fire team) as
+    lead, and the next step put MANECTRIC (lowest) back in front. The lead is set only
+    while a training objective is current (_training_objective_current); train() leads
+    with its own trainee either way. The Exp. Share half stays on: holding it changes
+    nothing about who fights.
     """
     from server import menu_state as ms
     from server.field_control import DIALOGUE_NONE
@@ -8286,6 +8300,9 @@ async def maintain_party(request: dict = None):
         result = await mcp_give_item({"item": _item_name(ms.ITEM_EXP_SHARE), "pokemon": str(target + 1)})
         summary = f"Exp. Share given to {who}" + (f", from {party[holder].species_name.upper()}" if holder is not None else "")
     else:
+        # train() passes {"training": True}: it is training whatever the objective says.
+        if not (_training_objective_current or (request or {}).get("training")):
+            return nothing("not training: the lead is the AI's choice (the party rule is only for training)")
         if target == 0:
             return nothing(f"{who} already leads (fainted ones and eggs don't count)")
         result = await mcp_set_lead({"pokemon": str(target + 1)})
