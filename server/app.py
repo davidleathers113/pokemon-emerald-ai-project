@@ -1336,6 +1336,20 @@ async def get_config():
     }
 
 
+@app.get("/player_position")
+@app.post("/player_position")  # the agent's MCP adapter posts
+async def get_player_position():
+    """Read-only: where the player stands, {"location", "x", "y"} (null x/y if unreadable).
+
+    Speed plan, Phase 5: the agent fetched the whole game state (the formatted state, a
+    screenshot, objectives; ~1 s) after every step only to note where the step ended.
+    """
+    if env is None:
+        return {"location": None, "x": None, "y": None}
+    snap = _field_snapshot()
+    return {"location": _location_name(), "x": snap.x if snap else None, "y": snap.y if snap else None}
+
+
 @app.get("/health")
 async def get_health():
     """Health check: healthy only while the game loop is emulating frames.

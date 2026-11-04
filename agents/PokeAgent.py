@@ -263,6 +263,10 @@ STORE_CONTEXT_REFRESH_STEPS = 10
 # needed sends the frame only when the text state can't describe the screen (anything
 # but the overworld or a battle menu, dialogue, the first step on a new map or of a
 # battle) and every FRAME_REFRESH_STEPS steps; "always" (the default) sends it every step.
+# Seconds paused after each step (speed plan, Phase 5: was a fixed 1 s; see run()).
+POST_STEP_PAUSE_S = 0.0
+# How often the agent looks at the server's action queue while waiting for it to empty.
+QUEUE_POLL_S = 0.1
 SCREENSHOT_POLICY_ENV = "SCREENSHOT_POLICY"
 FRAME_REFRESH_STEPS = 5
 TEXT_DESCRIBED_SCREENS = ("overworld", "battle")
@@ -441,6 +445,7 @@ class MCPToolAdapter:
             endpoint_map = {
                 # Pokemon MCP tools
                 "get_game_state": "/mcp/get_game_state",
+                "player_position": "/player_position",
                 "get_map_data": "/mcp/get_map_data",
                 "press_buttons": "/mcp/press_buttons",
                 "navigate_to": "/mcp/navigate_to",
@@ -2423,15 +2428,9 @@ class PokeAgent:
                     target_x = last_tool_call["args"]["x"]
                     target_y = last_tool_call["args"]["y"]
                     self._wait_for_actions_complete()
-                    final_pos = None
                     nav_state_start = time.time()
-                    final_state_result = self._execute_function_call_by_name("get_game_state", {})
+                    _, final_pos = self._end_position()
                     self._step_timing["nav_state_s"] = round(time.time() - nav_state_start, 2)
-                    final_state_data = json_module.loads(final_state_result)
-                    if final_state_data.get("success"):
-                        player_pos = final_state_data.get("player_position", {})
-                        if player_pos:
-                            final_pos = (player_pos.get("x"), player_pos.get("y"))
 
                     variance = last_tool_call.get('args', {}).get('variance', 'none')
                     if final_pos:
@@ -2475,17 +2474,10 @@ class PokeAgent:
                     self._wait_for_actions_complete()
                 self._step_timing["settle_s"] = round(time.time() - settle_start, 2)
                 end_state_start = time.time()
-                try:
-                    final_state_result = self._execute_function_call_by_name("get_game_state", {})
-                    self._step_timing["end_state_s"] = round(time.time() - end_state_start, 2)
-                    final_state_data = json_module.loads(final_state_result)
-                    if final_state_data.get("success"):
-                        player_pos = final_state_data.get("player_position", {})
-                        if player_pos and "x" in player_pos and "y" in player_pos:
-                            end_coords = (player_pos.get("x"), player_pos.get("y"))
-                        self._last_end_location = final_state_data.get("location")
-                except Exception as e:
-                    logger.debug(f"Could not capture post-step coordinates for history: {e}")
+                end_location, end_coords = self._end_position()
+                self._step_timing["end_state_s"] = round(time.time() - end_state_start, 2)
+                if end_location:
+                    self._last_end_location = end_location
 
                 # Store function result for next step's context
                 if tool_calls_made:
@@ -2663,74 +2655,31 @@ class PokeAgent:
             self._pending_dialogue_note = summary
 
     def _wait_for_actions_complete(self, timeout: int = 30) -> None:
-        """Wait for all queued actions to complete before proceeding.
+        """Wait until the server's action queue is empty (polled every QUEUE_POLL_S).
 
-        Optimization: For single actions, just wait a fixed time instead of polling.
-        This avoids timeout errors when the queue_status endpoint is slow.
-
-        Wait time is 1.0s to allow game state to stabilize after action completes.
-        Actions execute faster (0.09-0.32s) but game state updates take additional time.
+        PRESSING_TOOLS answer only after their presses ran, so the queue is usually
+        empty at the first look. Speed plan, Phase 5: this used to sleep a fixed 1 s or
+        more whenever 1-3 actions were queued, and poll once a second otherwise.
         """
-        # First, check initial queue length
-        try:
-            response = requests.get(f"{self.server_url}/queue_status", timeout=5)  # Increased from 2s to 5s
-            if response.status_code == 200:
-                status = response.json()
-                initial_queue_len = status.get("queue_length", 0)
-
-                # PRESSING_TOOLS (press_buttons, navigate_to, go_to_exit, use_move, the
-                # macros) answer only after their presses ran, so the queue is usually
-                # empty already: don't sleep.
-                if status.get("queue_empty"):
-                    return
-
-                # If only 1-3 actions, use fixed wait instead of polling
-                # Avoids timeout errors when server is under load
-                if initial_queue_len <= 3:
-                    wait_time = max(1.0, initial_queue_len * 0.5)  # 0.5s per action + 0.5s buffer
-                    logger.info(f"⏳ {initial_queue_len} action(s) queued, waiting {wait_time:.1f}s (fixed wait)...")
-                    time.sleep(wait_time)
-                    logger.info("✅ Actions completed (fixed wait)")
-                    return
-
-                logger.info(f"⏳ Waiting for {initial_queue_len} actions to complete...")
-        except Exception as e:
-            # If we can't check queue, fall back to fixed wait
-            logger.debug(f"Could not check queue length: {e}, using fixed wait")
-            time.sleep(1.0)
-            return
-
-        # For 4+ actions, poll the queue with longer intervals
         start_time = time.time()
         consecutive_errors = 0
         max_consecutive_errors = 3
-
         while time.time() - start_time < timeout:
             try:
-                response = requests.get(f"{self.server_url}/queue_status", timeout=5)  # Increased from 2s to 5s
+                response = requests.get(f"{self.server_url}/queue_status", timeout=5)
                 if response.status_code == 200:
-                    consecutive_errors = 0  # Reset error counter on success
-                    status = response.json()
-                    if status.get("queue_empty", False):
-                        logger.info("✅ All actions completed")
+                    consecutive_errors = 0
+                    if response.json().get("queue_empty", False):
                         return
-                    else:
-                        queue_len = status.get("queue_length", 0)
-                        logger.debug(f"   Queue: {queue_len} actions remaining...")
-                        time.sleep(1.0)  # Increased from 0.5s to 1.0s to reduce polling frequency
                 else:
                     logger.warning(f"Failed to get queue status: {response.status_code}")
-                    time.sleep(1.0)
             except Exception as e:
                 consecutive_errors += 1
                 logger.warning(f"Error checking queue status ({consecutive_errors}/{max_consecutive_errors}): {e}")
-
-                # If we get too many consecutive errors, assume actions completed
                 if consecutive_errors >= max_consecutive_errors:
-                    logger.warning(f"⚠️ Too many errors, assuming actions completed")
+                    logger.warning("⚠️ Too many errors, assuming actions completed")
                     return
-
-                time.sleep(1.0)
+            time.sleep(QUEUE_POLL_S)
 
         logger.warning(f"⚠️ Timeout waiting for actions to complete after {timeout}s")
 
@@ -2924,6 +2873,22 @@ class PokeAgent:
         """Drop the cached overviews after a call that may have written a store."""
         if function_name in STORE_WRITING_TOOLS:
             self._store_ctx_cache = None
+
+    def _end_position(self) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+        """(location, (x, y)) where the step left the player, from the server's light
+        /player_position; (None, None) if it can't be read.
+
+        Speed plan, Phase 5: this used to be a whole get_game_state (formatted state,
+        screenshot, objectives) after every step, only to read these three values.
+        """
+        try:
+            pos = self.mcp_adapter.call_tool("player_position", {})
+        except Exception as e:
+            logger.debug(f"Could not capture post-step coordinates for history: {e}")
+            return None, None
+        if not isinstance(pos, dict) or pos.get("x") is None or pos.get("y") is None:
+            return pos.get("location") if isinstance(pos, dict) else None, None
+        return pos.get("location"), (pos["x"], pos["y"])
 
     def _apply_screenshot_policy(self, game_state_data: Dict[str, Any], screenshot_b64: Optional[str], step: int) -> Optional[str]:
         """The frame to send this step: always under the default policy; under
@@ -3712,9 +3677,11 @@ Step {step_count}"""
                 except requests.exceptions.RequestException as e:
                     logger.debug(f"⚠️ Checkpoint/history save error: {e}")
 
-                # Brief pause
-                logger.info("⏸️  Waiting 1 second before next step...")
-                time.sleep(1)
+                # Speed plan, Phase 5: this was a fixed 1 s pause after every step. The
+                # tools answer once their presses have run and the step waits for the
+                # action queue (settle_s), so nothing is left to wait for here.
+                if POST_STEP_PAUSE_S:
+                    time.sleep(POST_STEP_PAUSE_S)
                 self._post_step_s = round(time.time() - post_start, 2)
 
         except KeyboardInterrupt:

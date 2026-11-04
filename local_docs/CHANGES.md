@@ -1557,6 +1557,20 @@ prompt. That came to 1.1 tiles walked per minute.
 - *Verified:* test_prompt_cache.py: each rule of frame_needed; "always" sends every
   step; "needed" on one map sends steps 1 and 6 of 7.
 
+## Speed plan, Phase 5: harness waits (2026-11-04)
+- After every step the agent fetched the whole game state (formatted state, screenshot,
+  objectives; ~1 s) only to note where the step ended, twice after a navigate_to: now
+  the light `/player_position` ({location, x, y}, one snapshot read).
+- The fixed 1 s pause after every step is gone (`POST_STEP_PAUSE_S` 0): tools answer
+  after their presses and the step waits for the action queue.
+- `_wait_for_actions_complete` polls every 0.1 s (`QUEUE_POLL_S`) instead of sleeping a
+  fixed ≥1 s with 1-3 actions queued and polling once a second otherwise.
+- Already done in Phase 1: the 3 overview MCP calls a step.
+- *Verified:* test_prompt_cache.py (the end position comes from player_position only;
+  the queue wait returns after 3 quick polls, the old one slept 1.0 s),
+  test_play_endpoints.py (/player_position on MT CHIMNEY: right tile, <0.2 s). Each
+  fails on the old code.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

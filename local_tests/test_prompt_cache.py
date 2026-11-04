@@ -248,6 +248,41 @@ def test_the_screenshot_policy_is_always_unless_switched():
     assert agent._step_timing["frame"] == 0
 
 
+def test_the_end_of_a_step_reads_only_the_position():
+    """Speed plan, Phase 5: where a step ended comes from the light /player_position, not
+    a whole get_game_state (formatted state, screenshot, objectives)."""
+    agent = _bare_agent()
+    agent.mcp_adapter.call_tool.side_effect = lambda name, args: (
+        {"location": "ROUTE 101", "x": 3, "y": 4} if name == "player_position" else {"success": True}
+    )
+    assert agent._end_position() == ("ROUTE 101", (3, 4))
+    assert [c.args[0] for c in agent.mcp_adapter.call_tool.call_args_list] == ["player_position"]
+    agent.mcp_adapter.call_tool.side_effect = lambda name, args: {"location": None, "x": None, "y": None}
+    assert agent._end_position() == (None, None)
+
+
+def test_waiting_for_the_queue_polls_instead_of_sleeping_a_second():
+    """Speed plan, Phase 5: with 1-3 actions queued the agent slept a fixed 1 s or more;
+    it now looks every QUEUE_POLL_S and goes on as soon as the queue is empty."""
+    from unittest import mock
+
+    from test_phase4_agent import pa
+
+    agent = pa.PokeAgent.__new__(pa.PokeAgent)
+    agent.server_url = "http://server"
+    replies = iter([{"queue_empty": False, "queue_length": 2}, {"queue_empty": False, "queue_length": 1},
+                    {"queue_empty": True, "queue_length": 0}])
+
+    def get(url, timeout):
+        return mock.MagicMock(status_code=200, json=lambda: next(replies))
+
+    started = time.time()
+    with mock.patch.object(pa.requests, "get", side_effect=get) as calls:
+        agent._wait_for_actions_complete()
+    took = time.time() - started
+    assert calls.call_count == 3 and took < 0.6, (calls.call_count, took)
+
+
 def test_a_store_write_refreshes_the_overviews():
     agent = _agent()
     agent._gather_store_context()

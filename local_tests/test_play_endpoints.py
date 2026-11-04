@@ -114,6 +114,19 @@ def test_ai_feed_reads_the_trajectory_and_pause_events():
             path.write_bytes(saved)
 
 
+def test_player_position_is_light():
+    """Speed plan, Phase 5: the agent reads where a step ended from /player_position (it
+    fetched the whole game state for that before)."""
+    s = server()
+    s.load(HERE / "test_mt_chimney_busy_grunt.state", wild_encounters=False)
+    started = time.time()
+    r = asyncio.run(s.srv.get_player_position())
+    took = time.time() - started
+    print("   ", r, f"{took:.3f}s")
+    assert r == {"location": "MT CHIMNEY", "x": 23, "y": 16}, r
+    assert took < 0.2, took
+
+
 def test_the_page_and_its_renderers_are_served():
     s = server()
     page = asyncio.run(s.srv.get_play()).body.decode()
