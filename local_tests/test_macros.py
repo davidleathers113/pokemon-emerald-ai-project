@@ -175,6 +175,9 @@ def test_go_to_walks_map_after_map():
     assert r["success"] is True and s.srv._location_name() == "ROUTE 117", (s.srv._location_name(), r)
     r = s.call("mcp_go_to", {"place": "Route 117", "reasoning": "test"})
     assert r["status"] == "ARRIVED" and "already" in r["summary"], r
+    # Seen live from ROUTE 117: "Mauville City Poke Mart can't be reached on foot".
+    r = s.call("mcp_go_to", {"place": "Mauville City Poke Mart", "reasoning": "test"})
+    assert r["success"] is True and s.srv._location_name() == "MAUVILLE CITY MART", (s.srv._location_name(), r)
     r = s.call("mcp_go_to", {"place": "Nowhere Town", "reasoning": "test"})
     assert r["success"] is False and "Did not reach Nowhere Town" in r["error"], r
 

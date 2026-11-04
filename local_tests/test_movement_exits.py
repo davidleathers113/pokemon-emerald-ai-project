@@ -379,6 +379,18 @@ def test_loose_target_names_match_their_map():
     assert not arrived_at("MT CHIMNEY", None, "Mt. Pyre")  # short words never stretch
     # Seen live: "Mr. Briney's Cottage" is ROUTE 104 MR BRINEYS HOUSE.
     assert arrived_at("ROUTE 104 MR BRINEYS HOUSE", None, "Mr. Briney's Cottage")
+    # Seen live: go_to("Mauville City Poke Mart") "can't be reached on foot"; the map is
+    # MAUVILLE CITY MART. Every spelling of the sign names it, and only it.
+    for mart in ("Mauville City Poke Mart", "Mauville City PokéMart", "Mauville City Pokemart",
+                 "Mauville City Poké Mart", "Mauville City Pokemon Mart", "Mauville Mart"):
+        assert arrived_at("MAUVILLE CITY MART", None, mart), mart
+    assert not arrived_at("MAUVILLE CITY", None, "Mauville City Poke Mart")
+    for center in ("Oldale Poke Center", "Oldale PokéCenter", "Oldale Pokémon Center", "Oldale Town Pokemon Center"):
+        assert arrived_at("OLDALE TOWN POKEMON CENTER 1F", None, center), center
+    from server.game_tools import place_route
+
+    route = place_route("ROUTE 117", (17, 9), "Mauville City Poke Mart")
+    assert route and route[-1][1] == "MAUVILLE CITY MART", route
     from server.game_tools import way_to_place
 
     briney = way_to_place("RUSTBORO CITY", (12, 17), "Mr. Briney's Cottage")

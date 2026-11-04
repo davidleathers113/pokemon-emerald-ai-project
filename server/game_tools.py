@@ -9,6 +9,7 @@ tool calls to app.py over HTTP instead.
 
 import logging
 import os
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -972,8 +973,13 @@ def _walk_exits(map_dir: str) -> tuple:
 
 
 def _squash_name(text: str) -> str:
-    """'Birch's Lab' -> 'BIRCHSLAB': letters and digits only, upper case."""
-    return "".join(ch for ch in str(text).upper() if ch.isalnum())
+    """'Birch's Lab' -> 'BIRCHSLAB': letters and digits only, upper case, accents dropped.
+
+    Map names are plain ASCII (POKEMON CENTER); objectives write "PokéMart"/"Pokémon
+    Center", and 'É'.isalnum() is True, so the accent has to go, not just the apostrophe.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(text).upper())
+    return "".join(ch for ch in decomposed if ch.isalnum() and not unicodedata.combining(ch))
 
 
 _HALVES = {"NORTH": (1, -1), "SOUTH": (1, 1), "WEST": (0, -1), "EAST": (0, 1)}
@@ -1401,18 +1407,35 @@ def way_to_wild_encounters(location_name: str, position: Optional[Tuple[int, int
 # Places the walkthrough calls by the name on their sign, not their map name.
 # Seen live: "Get free Bicycle from Rydel's Cycles" inside MAUVILLE CITY BIKE SHOP; the
 # model walked out to look for "Rydel's Cycles" five times.
-_PLACE_ALIASES = {("RYDELS", "CYCLES"): ["BIKE", "SHOP"]}
+# Seen live: go_to("Mauville City Poke Mart") said it "can't be reached on foot"; the
+# map is MAUVILLE CITY MART, and the objectives write "Oldale Poke Mart", "Rustboro Poke
+# Mart"... The game's own maps say MART and POKEMON CENTER, however the sign is spelled.
+_PLACE_ALIASES = {
+    ("RYDELS", "CYCLES"): ["BIKE", "SHOP"],
+    ("POKE", "MART"): ["MART"],
+    ("POKEMON", "MART"): ["MART"],
+    ("POKEMART",): ["MART"],
+    ("POKE", "CENTER"): ["POKEMON", "CENTER"],
+    ("POKECENTER",): ["POKEMON", "CENTER"],
+    ("POKEMONCENTER",): ["POKEMON", "CENTER"],
+}
 
 
 def _place_words(text: str) -> List[str]:
-    """'Birch's Lab' -> ['BIRCHS', 'LAB']: upper-case words, letters and digits only."""
+    """'Birch's Lab' -> ['BIRCHS', 'LAB']: upper-case words, letters and digits only,
+    with every _PLACE_ALIASES phrase replaced by the words the map names use."""
     words = [w for w in (_squash_name(word) for word in str(text).split()) if w]
-    for alias, words_instead in _PLACE_ALIASES.items():
-        n = len(alias)
-        for at in range(len(words) - n + 1):
-            if tuple(words[at:at + n]) == alias:
-                return words[:at] + words_instead + words[at + n:]
-    return words
+    out, at = [], 0
+    while at < len(words):
+        for alias, words_instead in sorted(_PLACE_ALIASES.items(), key=lambda item: -len(item[0])):
+            if tuple(words[at:at + len(alias)]) == alias:
+                out.extend(words_instead)
+                at += len(alias)
+                break
+        else:
+            out.append(words[at])
+            at += 1
+    return out
 
 
 def way_to_place(location_name: str, position: Optional[Tuple[int, int]], target: str) -> str:

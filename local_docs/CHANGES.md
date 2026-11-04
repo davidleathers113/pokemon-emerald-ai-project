@@ -1078,6 +1078,18 @@ prompt. That came to 1.1 tiles walked per minute.
   `test_harness_can_turn_wild_encounters_off` checks the counter and that no battle starts.
   Movement suites 7/7 and 26/26 in two back-to-back rounds.
 
+## "Poke Mart" and "Poke Center" name their maps (2026-11-04, WEAKNESSES R17)
+- Seen live: go_to("Mauville City Poke Mart") → "can't be reached on foot from ROUTE 117";
+  the map is MAUVILLE CITY MART.
+- `game_tools._PLACE_ALIASES`: Poke Mart / Pokemon Mart / Pokemart → MART; Poke Center /
+  Pokecenter / Pokemoncenter → POKEMON CENTER. `_place_words` now applies every alias in a
+  name (it stopped at the first). `_squash_name` drops accents (NFKD): "PokéMart" kept its
+  É before, since `'É'.isalnum()` is True, so "Oldale Pokémon Center" never matched either.
+- *Verified:* A/B with the old table and `_squash_name`: all five probe names and the
+  ROUTE 117 → MAUVILLE CITY MART route fail before, pass after. Tests in
+  `test_loose_target_names_match_their_map` and `test_go_to_walks_map_after_map` (the live
+  call, walked from the Day Care).
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
