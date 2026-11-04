@@ -1090,6 +1090,22 @@ prompt. That came to 1.1 tiles walked per minute.
   `test_loose_target_names_match_their_map` and `test_go_to_walks_map_after_map` (the live
   call, walked from the Day Care).
 
+## "Will DAVID change POKéMON?" is answered, not handed back (2026-11-04, WEAKNESSES R16)
+- Seen live on Route 117 vs Breeder Isaac: use_move returned "The battle asks a YES/NO
+  question … answer it yourself"; the model opened the START menu. M46's counter-switch
+  never ran: the question is the battle script's yesnobox (pret
+  `BattleScript_HandleFaintedMon`), read as `script_question`, and the branch checked only
+  `yes_no_prompt`. It now takes either, and reads "X is about to use Y" from the
+  question's own text as well (they share one message).
+- `_battle_report` adds the play-out's notes: "Answered for you: switched to COMBUSKEN to
+  face ARON (matchup 4 vs 0.5)". Before, the quote showed "SABLEYE, good! Come back!" and
+  nothing said why.
+- Fixture `local_tests/test_switch_question.state`: Isaac's battle (6 Pokémon) at the first
+  FIGHT menu, made from test_route117_blocked.state (walked to (33,10) with
+  wild_encounters=False, so a Repel is running in it).
+- *Verified:* `test_will_player_change_pokemon_is_answered_not_handed_back` fails on the
+  old condition with the live message and passes now.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

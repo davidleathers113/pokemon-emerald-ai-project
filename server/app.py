@@ -5079,10 +5079,10 @@ async def _play_out_battle(
 
     A is pressed only while a text box shows its down arrow and no YES/NO is up; the
     nickname question is answered NO with B (B always means NO there) when
-    `answer_nickname`, and the caught Pokémon's Pokédex page is closed with B. Any
-    other question ("Use next POKéMON?", "Will DAVID change POKéMON?", deleting a move
-    to learn a new one), a party menu the game opens itself, or an evolution ends the
-    loop: those are the model's decisions.
+    `answer_nickname`, the caught Pokémon's Pokédex page is closed with B, and "Will
+    DAVID change POKéMON?" is answered by _answer_switch_question. Any other question
+    ("Use next POKéMON?", deleting a move to learn a new one), a party menu the game
+    opens itself, or an evolution ends the loop: those are the model's decisions.
 
     `texts` are the battle messages in the order they showed: the string buffer is read
     while the message window prints (BattleFlow.message_printing), so the FIGHT/BAG
@@ -5134,14 +5134,19 @@ async def _play_out_battle_steps(
         elif flow.dex_page:
             await _macro_press(["B"], source)
             presses += 1
-        elif flow.yes_no_prompt and "CHANGE POK" in str(flow.text).upper():
+        elif (flow.yes_no_prompt or flow.script_question) and "CHANGE POK" in str(flow.text).upper():
             # "Will DAVID change POKéMON?" after a trainer's Pokémon faints: a free switch
             # before the next one comes in. Seen live against the Route 110 rival: the
             # model answered YES, picked the Pokémon already battling, and pressed A on
             # SHIFT for two minutes. David: "think about who the next pokemon is and then
             # send out the pokemon that best counters that pokemon." The trainer's line
             # before it names the next one ("MAY is about to use SLUGMA.").
-            notes.append(await _answer_switch_question(texts, source))
+            # It is the battle script's yesnobox (pret BattleScript_HandleFaintedMon), so
+            # it reads as script_question. Seen live on Route 117 vs Breeder Isaac: with
+            # only yes_no_prompt checked, the question was handed to the model, which
+            # opened the START menu. The question shares its text with the "about to use"
+            # line, which may not be in `texts` yet.
+            notes.append(await _answer_switch_question(texts + [str(flow.text)], source))
             presses += 1
         elif flow.yes_no_prompt:
             end = "question"
@@ -5234,6 +5239,10 @@ def _battle_report(played: Dict[str, Any]) -> str:
         texts = texts[:-1]  # the question itself is quoted where the report asks it
     said = _turn_text(texts)
     happened = f"What happened: {said}. " if said else ""
+    # Questions the play-out answered itself. Without this the quote showed "SABLEYE,
+    # good! Come back! · Go! COMBUSKEN!" and nothing said why the Pokémon changed.
+    if played.get("notes"):
+        happened += f"Answered for you: {'; '.join(played['notes'])}. "
     if end == "action":
         hp = _battle_hp_text(_read_battle_view())
         return (

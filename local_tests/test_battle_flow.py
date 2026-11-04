@@ -21,12 +21,16 @@ Fixtures (see test_macros.py for how they were made):
   test_wild_two_party.state        wild Silcoon at the action menu; Torchic + Shroomish
   test_rustboro_pokecenter.state   RUSTBORO CITY POKEMON CENTER 1F, Torchic 35/35
   test_rustboro_gym.state          RUSTBORO CITY GYM, mid-battle with Josh
+  test_switch_question.state       ROUTE 117, Breeder Isaac (6 Pokémon) at the first
+                                   FIGHT menu: SABLEYE, COMBUSKEN, BRELOOM vs WHISMUR Lv11.
+                                   Made from test_route117_blocked.state; a Repel is
+                                   running in it (the walk there used wild_encounters=False)
 
 RAM writes (documented where used): the battle Torchic's HP 1 and poison, so the end of
 the turn makes it faint (that reaches "Use next POKéMON?" with a second Pokémon in the
-party; no fixture reaches a battle question naturally); party HP for a weak team.
-Not covered by a fixture: a trainer's "Will DAVID change POKéMON?" (needs a trainer with
-two Pokémon), the learn-a-move question and evolution.
+party); party HP for a weak team.
+
+Not covered by a fixture: the learn-a-move question and evolution.
 
   docker run --rm --entrypoint /opt/venv/bin/python -v ~/continual-harness:/app -w /app \
       emerald-harness:local local_tests/test_battle_flow.py
@@ -191,6 +195,25 @@ def test_the_counter_to_the_next_trainer_pokemon_is_chosen():
     slugma = s.srv._best_counter("SLUGMA")
     assert slugma is None or slugma[0].species_name.upper() != "BRELOOM", slugma  # Fire hits Grass 2x
     assert s.srv._best_counter("NOT A POKEMON") is None
+
+
+def test_will_player_change_pokemon_is_answered_not_handed_back():
+    """Seen live on Route 117: use_move returned 'The battle asks a YES/NO question
+    ("PkMn BREEDER ISAAC is about to use POOCHYENA. Will DAVID change POKéMON?"): answer
+    it yourself'; the model opened the START menu instead. The question is the battle
+    script's yesnobox (script_question), not the controller's YES/NO. test_switch_question
+    .state is that battle: SABLEYE Lv24 at the first menu vs ISAAC's WHISMUR Lv11 (of 6)."""
+    s = server()
+    s.load(HERE / "test_switch_question.state")
+    best = _view(s)["best_move"]["name"]
+    r = s.call("mcp_use_move", {"move": best, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r.get("end") == "action", r
+    summary = r["summary"]
+    assert "about to use" in summary and "answer it yourself" not in summary, summary
+    assert "kept the same Pokémon in" in summary or "switched to" in summary, summary
+    view = _view(s)
+    assert view["menu"] == "action" and view["target"]["name"] != "Whismur", view["target"]
 
 
 def test_double_battle_turns_are_played_through():
