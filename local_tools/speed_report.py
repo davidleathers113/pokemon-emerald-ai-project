@@ -119,9 +119,12 @@ def _failure_cause(prompt):
     if at != -1:
         tool = block[at + len("Function: "):].split()[0] if block[at + len("Function: "):].split() else "?"
     error = ""
-    at = block.find('"error": "')
-    if at != -1:
-        error = block[at + len('"error": "'):].split('",')[0]
+    # Prompts since Phase 2 leave out an "error" that only repeats "summary".
+    for key in ('"error": "', '"summary": "'):
+        at = block.find(key)
+        if at != -1:
+            error = block[at + len(key):].split('",')[0]
+            break
     first = error.split(". ")[0].split(": ")[0][:70]
     return f"{tool}: " + "".join("#" if ch.isdigit() else ch for ch in first)
 

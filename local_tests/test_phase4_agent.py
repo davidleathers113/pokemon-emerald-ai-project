@@ -125,10 +125,11 @@ def test_fit_prompt_drops_oldest_history_until_under_budget():
 
     full_estimate = agent._estimate_prompt_tokens(build(), has_image=True)
     agent.recent_function_results = [{"function_name": "press_buttons", "result": "{\"success\": true}", "timestamp": 0}]
-    # The compact history replays each reply capped at HISTORY_WHY_MAX_CHARS (~70
-    # tokens an entry here), so a 500-token cut still forces several drops. (It was
-    # 3000 with the verbose layout, which replayed every 1400-char reply in full.)
-    budget = full_estimate - 500
+    # Since speed-plan Phase 2 only the newest entry replays its reply ("why"); older
+    # ones are one short line (~8 tokens here), so a 50-token cut forces several drops.
+    # (It was 500 when every entry kept a ~70-token "why", and 3000 with the verbose
+    # layout, which replayed every 1400-char reply in full.)
+    budget = full_estimate - 50
     with mock.patch.object(pa, "PROMPT_TOKEN_BUDGET", budget):
         prompt = agent._fit_prompt_to_budget(build, has_image=True)
     assert agent._estimate_prompt_tokens(prompt, has_image=True) <= budget

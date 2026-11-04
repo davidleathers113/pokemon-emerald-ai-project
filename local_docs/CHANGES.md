@@ -1513,6 +1513,22 @@ prompt. That came to 1.1 tiles walked per minute.
   player one tile on) share every byte up to `<last_result>`; the overviews are fetched
   once; a memory write refreshes them. The old builder fails both.
 
+## Speed plan, Phase 2: leave out what the prompt repeats (2026-11-04)
+- Map Data JSON (median 5.7K characters) out of the prompt: its warps/connections are
+  EXITS and its walls the ASCII map; who and what stands where becomes one
+  "PEOPLE & THINGS" line in <map_info> (`_map_things`). The JSON stays for tools.
+- The state's own RECENT ACTION HISTORY is dropped (<recent_steps> covers it).
+- <recent_steps>: older steps one line each (outcome ≤140 chars); only the newest keeps
+  its "why" and dialogue (its full result is in <last_result>). Was 5.4K chars live.
+- A refusal's "error" is left out when it repeats "summary".
+- Battling objectives: one line of clipped goals unless the story objective recommends
+  some (then the full list); no PROGRESS counts; no empty skill/subagent stubs; no
+  dynamics "None" line. The party was already shown once.
+- *Verified:* test_prompt_cache.py golden test on ROUTE 112, MT CHIMNEY and Isaac's
+  battle: per-step tail 9,043 → 3,938 and 4,203 → 3,395 characters (battle 922); none
+  of the removed parts present; plus _map_things, the single error, one-line history.
+  test_phase4_agent's history-budget cut (500 → 50 tokens) follows the shorter entries.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

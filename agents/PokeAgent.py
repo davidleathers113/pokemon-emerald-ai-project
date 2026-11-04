@@ -112,6 +112,10 @@ HISTORY_RESPONSE_MAX_CHARS = 1500
 #   reasoning once, capped.
 HISTORY_WHY_MAX_CHARS = 200
 HISTORY_OUTCOME_MAX_CHARS = 300
+# Speed plan, Phase 2: older steps are one short line each (the newest keeps its "why"
+# and dialogue, and its full result is in <last_result>). Seen in a live prompt: 20
+# entries with a "why" each were 5.4K characters read again every step.
+HISTORY_OLDER_OUTCOME_MAX_CHARS = 140
 HISTORY_ARGS_MAX_CHARS = 120
 # Keys holding the model's reasoning; shown once as "why", never inside args.
 _REASONING_ARG_KEYS = ("reasoning", "reason")
@@ -255,27 +259,80 @@ STORE_WRITING_TOOLS = frozenset({
 STORE_CONTEXT_REFRESH_STEPS = 10
 
 
+# Speed plan, Phase 2: what the state repeats. Its own action history (the prompt's
+# <recent_steps> covers it), and the map's JSON (median 5.7K characters): its warps and
+# connections are the EXITS list, its walls the ASCII map; only who and what stands where
+# is not shown elsewhere, and that becomes one PEOPLE & THINGS line (_map_things).
+STATE_HISTORY_MARKER = "RECENT ACTION HISTORY:"
+# A side goal's description in the one-line list of battling objectives.
+BATTLING_GOAL_MAX_CHARS = 50
+# Store overviews that only say the store is empty: left out of the prompt.
+EMPTY_STORE_OVERVIEWS = ("No skills learned yet.", "No subagents registered yet.")
+MAP_JSON_MARKER = "Map Data (JSON):"
+
+
+def _map_things(map_json_line: str) -> str:
+    """'PEOPLE & THINGS: OLD WOMAN at (19, 39); ITEM BALL at (2, 4); sign at (14, 6)' from
+    the Map Data JSON line, or "" when there is nothing (or it can't be read)."""
+    try:
+        data = json.loads(map_json_line)
+    except ValueError:
+        return ""
+    things = []
+    for obj in data.get("objects") or []:
+        name = str(obj.get("graphics_id") or "someone").replace("OBJ_EVENT_GFX_", "").replace("_", " ")
+        trainer = " (trainer)" if str(obj.get("trainer_type") or "").endswith(("NORMAL", "BURIED")) else ""
+        things.append(f"{name}{trainer} at ({obj.get('x')}, {obj.get('y')})")
+    for event in data.get("bg_events") or []:
+        kind = str(event.get("type") or "").replace("_", " ")
+        if kind:
+            things.append(f"{kind} at ({event.get('x')}, {event.get('y')})")
+    return "PEOPLE & THINGS (from the map file): " + "; ".join(things) if things else ""
+
+
 def _split_state_text(state_text: str) -> Tuple[str, str]:
-    """(map_info, the rest of the state): the EXITS and TRAINERS blocks moved out, and the
-    static legend line dropped."""
+    """(map_info, the rest of the state): the EXITS and TRAINERS blocks and the map's
+    people and things moved out; the static legend, the state's own action history and
+    the Map Data JSON dropped."""
     lines = str(state_text or "").splitlines()
     info: List[str] = []
     rest: List[str] = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.strip() in MAP_INFO_MARKERS:
+        bare = line.strip()
+        if bare in MAP_INFO_MARKERS or bare == STATE_HISTORY_MARKER:
             block = [line]
             i += 1
-            while i < len(lines) and lines[i].strip():
+            while i < len(lines) and lines[i].strip() and not lines[i].startswith("==="):
                 block.append(lines[i])
                 i += 1
-            info.append("\n".join(block))
+            if bare != STATE_HISTORY_MARKER:
+                info.append("\n".join(block))
+            continue
+        if bare == MAP_JSON_MARKER:
+            things = _map_things(lines[i + 1]) if i + 1 < len(lines) else ""
+            if things:
+                info.append(things)
+            i += 2
             continue
         if not line.startswith(MAP_LEGEND_PREFIX):
             rest.append(line)
         i += 1
     return "\n\n".join(info), "\n".join(rest)
+
+
+def _without_repeated_error(result: str) -> str:
+    """A tool result with its "error" left out when it only repeats "summary" (server
+    refusals set both to the same text: it was sent twice every failed step)."""
+    try:
+        data = json.loads(result)
+    except ValueError:
+        return result
+    if isinstance(data, dict) and data.get("error") and data.get("error") == data.get("summary"):
+        data = {k: v for k, v in data.items() if k != "error"}
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    return result
 
 
 def _tagged(tag: str, body: str) -> str:
@@ -2725,7 +2782,7 @@ class PokeAgent:
             remaining -= min(len(str(entries[i]["result"])), caps[i])
         for entry, cap in zip(entries, caps):
             func_name = entry["function_name"]
-            result = str(entry["result"])
+            result = _without_repeated_error(str(entry["result"]))
 
             lines.append(f"\n🔧 Function: {func_name}")
             lines.append(f"Result:")
@@ -3160,7 +3217,18 @@ Step {step_count}"""
 
                 def format_battling_group(group_list):
                     if not group_list:
-                        return "⚔️  BATTLING OBJECTIVES: None"
+                        return ""
+                    # Speed plan, Phase 2: the full list with hints (~800 characters a
+                    # step) only when the story objective asks for some of them first;
+                    # otherwise one line, each goal clipped.
+                    if not recommended_battling:
+                        goals = "; ".join(
+                            f"{o.get('id', '')}: {_clip(o.get('description', ''), BATTLING_GOAL_MAX_CHARS)}" for o in group_list
+                        )
+                        return (
+                            f"⚔️  SIDE GOALS (not needed for the story objective now): {goals}. When you have "
+                            "done one, call complete_direct_objective(objective_id=\"<its ID>\")."
+                        )
                     formatted = f"⚔️  BATTLING OBJECTIVES ({len(group_list)} in current group):"
                     for i, obj_dict in enumerate(group_list, 1):
                         obj_id = obj_dict.get("id", "")
@@ -3180,21 +3248,19 @@ Step {step_count}"""
                 if recommended_battling:
                     recommended_text = f"\n\n💡 RECOMMENDED PREPARATION:\n  Complete these battling objectives before the story objective:\n  → {', '.join(recommended_battling)}"
 
-                direct_objective = f"""{format_objective(story_obj, "📖", "story")}{recommended_text}
+                direct_objective = "\n\n".join(part for part in (
+                    format_objective(story_obj, "📖", "story") + recommended_text,
+                    format_battling_group(battling_group),
+                    format_objective(dynamics_obj, "🎯", "dynamics") if dynamics_obj else "",
+                ) if part)
 
-{format_battling_group(battling_group)}
-
-{format_objective(dynamics_obj, "🎯", "dynamics")}"""
-
+                # Speed plan, Phase 2: the PROGRESS counts (three lines a step) are left
+                # out of the prompt; the log keeps them.
                 if categorized_status:
                     story_status = categorized_status.get("story", {})
                     battling_status = categorized_status.get("battling", {})
                     dynamics_status = categorized_status.get("dynamics", {})
-                    direct_objective_status = f"""📊 PROGRESS (3 Categories):
-  📖 Story: {story_status.get('current_index', 0) + 1}/{story_status.get('total', 0)} ({story_status.get('completed', 0)} completed)
-  ⚔️  Battling: {battling_status.get('current_index', 0) + 1}/{battling_status.get('total', 0)} ({battling_status.get('completed', 0)} completed)
-  🎯 Dynamics: {dynamics_status.get('current_index', 0) + 1}/{dynamics_status.get('total', 0)} ({dynamics_status.get('completed', 0)} completed)"""
-                    logger.info(f"📊 PROGRESS (3 Categories) in prompt: Story {story_status.get('current_index', 0) + 1}/{story_status.get('total', 0)}, Battling {battling_status.get('current_index', 0) + 1}/{battling_status.get('total', 0)}, Dynamics {dynamics_status.get('current_index', 0) + 1}/{dynamics_status.get('total', 0)}")
+                    logger.info(f"📊 PROGRESS (3 Categories): Story {story_status.get('current_index', 0) + 1}/{story_status.get('total', 0)}, Battling {battling_status.get('current_index', 0) + 1}/{battling_status.get('total', 0)}, Dynamics {dynamics_status.get('current_index', 0) + 1}/{dynamics_status.get('total', 0)}")
 
             else:
                 direct_objective = game_state_data.get("direct_objective", "")
@@ -3252,7 +3318,9 @@ Step {step_count}"""
         lasting = "" if is_simplest else _tagged("objectives", objectives)
         lasting += _tagged("long_term_memory", memory_context)
         if not is_simplest:
-            lasting += _tagged("skill_library", skill_context) + _tagged("subagent_registry", subagent_context)
+            for tag, body in (("skill_library", skill_context), ("subagent_registry", subagent_context)):
+                if str(body or "").strip() not in EMPTY_STORE_OVERVIEWS:
+                    lasting += _tagged(tag, body)
         lasting += _tagged("map_info", map_info)
         changing = (
             _tagged("last_result", function_results_context)
@@ -3389,8 +3457,10 @@ Step {step_count}"""
             logger.error(traceback.format_exc())
 
     def _format_action_history(self) -> str:
-        """Short-term memory (last ACTION_HISTORY_WINDOW steps), one compact entry each:
+        """Short-term memory (last ACTION_HISTORY_WINDOW steps), one line per step; the
+        newest also keeps its reasoning and dialogue (HISTORY_OLDER_OUTCOME_MAX_CHARS):
 
+        [15] (12,4)->(12,2) ROUTE 101 | navigate_to (12,2) | Reached (12,2) …
         [16] (12,2)->(13,2) ROUTE 101 | press_buttons RIGHT,UP,UP,UP | BLOCKED moving UP ...
           why: <the call's reasoning, once, capped>
           dialogue: <text the harness advanced through before this step>
@@ -3401,7 +3471,8 @@ Step {step_count}"""
         recent_entries = self.conversation_history[-ACTION_HISTORY_WINDOW:]
 
         history_lines = []
-        for entry in recent_entries:
+        for position, entry in enumerate(recent_entries):
+            newest = position == len(recent_entries) - 1
             step = entry.get("step", "?")
             start_coords = entry.get("start_coords")
             end_coords = entry.get("end_coords")
@@ -3430,6 +3501,8 @@ Step {step_count}"""
                     if outcome is None:
                         outcome = summarize_tool_result(tool_call.get("result", ""))
                     call = format_tool_call_brief(tool_call.get("name", "unknown"), args)
+                    if outcome and not newest:
+                        outcome = _clip(outcome, HISTORY_OLDER_OUTCOME_MAX_CHARS)
                     segments.append(f"{call} | {outcome}" if outcome else call)
                 history_lines.append(f"[{step}] {where} | {segments[-1]}")
                 for earlier in segments[:-1]:
@@ -3441,9 +3514,9 @@ Step {step_count}"""
                 # No reasoning argument: fall back to the model's own text, minus the
                 # "Action executed: ..." trailer run_step appends.
                 why = entry.get("llm_response", "").split("\n\nAction executed:")[0]
-            if why.strip():
+            if why.strip() and newest:
                 history_lines.append(f"  why: {_clip(why, HISTORY_WHY_MAX_CHARS)}")
-            if entry.get("dialogue"):
+            if entry.get("dialogue") and newest:
                 history_lines.append(f"  dialogue: {_clip(entry['dialogue'], HISTORY_OUTCOME_MAX_CHARS)}")
 
         return "\n".join(history_lines).strip()

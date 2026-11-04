@@ -90,6 +90,78 @@ def test_two_steps_on_one_map_share_everything_before_the_tail():
     assert fetched.count("get_memory_overview") == 1, fetched
 
 
+# Speed plan, Phase 2: characters from the first per-step section to the end, by fixture.
+# Measured when it was written: ROUTE 112 9,043 → 3,938 (its Map Data JSON was ~5K),
+# MT CHIMNEY 4,203 → 3,395, Isaac's battle 922 (no map). The ceilings leave ~15% room.
+TAIL_CEILINGS = {
+    "test_route111_south_to_113.state": 4600,
+    "test_mt_chimney_busy_grunt.state": 3900,
+    "test_switch_question.state": 1100,
+}
+
+
+def test_the_prompt_leaves_out_what_it_repeats():
+    """Speed plan, Phase 2 (golden test on 3 fixtures: overworld, overworld with people,
+    battle): no Map Data JSON (its people and things become one line in <map_info>), no
+    second action history, no PROGRESS counts, no empty skill/subagent stubs, and the
+    per-step tail under its ceiling."""
+    s = server()
+    for fixture, ceiling in TAIL_CEILINGS.items():
+        s.load(Path(__file__).resolve().parent / fixture, wild_encounters=False)
+        prompt = _agent()._build_structured_prompt(_state(s), 5)
+        tail = len(prompt) - min(prompt.index(t) for t in CHANGING if t in prompt)
+        print(f"    {fixture}: prompt {len(prompt)}, per-step tail {tail} (ceiling {ceiling})")
+        for gone in ("Map Data (JSON)", "RECENT ACTION HISTORY", "📊 PROGRESS", "No skills learned yet",
+                     "No subagents registered yet", "(Legend: "):
+            assert gone not in prompt, (fixture, gone)
+        assert tail <= ceiling, (fixture, tail)
+        if fixture == "test_mt_chimney_busy_grunt.state":
+            info = prompt[prompt.index("<map_info>"):prompt.index("</map_info>")]
+            # In this save the map JSON's objects are filtered out by story flags; its
+            # two signs (the meteorite machine, the route sign) remain.
+            assert "PEOPLE & THINGS" in info and "sign at (14, 6)" in info, info
+
+
+def test_people_and_things_come_from_the_map_json():
+    """The map JSON's objects (as the live MT CHIMNEY prompt had them) and its signs
+    become one line; the rest of the JSON is in EXITS and the ASCII map already."""
+    from test_phase4_agent import pa  # the agents.PokeAgent module
+
+    line = json.dumps({
+        "objects": [
+            {"x": 19, "y": 39, "graphics_id": "OBJ_EVENT_GFX_OLD_WOMAN", "trainer_type": "TRAINER_TYPE_NONE"},
+            {"x": 16, "y": 18, "graphics_id": "OBJ_EVENT_GFX_EXPERT_F", "trainer_type": "TRAINER_TYPE_NORMAL"},
+            {"x": 2, "y": 4, "graphics_id": "OBJ_EVENT_GFX_ITEM_BALL", "trainer_type": "TRAINER_TYPE_NONE"},
+        ],
+        "bg_events": [{"type": "sign", "x": 14, "y": 6}, {"type": "hidden_item", "x": 3, "y": 9}],
+        "warps": [{"x": 1, "y": 1}],
+    })
+    assert pa._map_things(line) == (
+        "PEOPLE & THINGS (from the map file): OLD WOMAN at (19, 39); EXPERT F (trainer) at (16, 18); "
+        "ITEM BALL at (2, 4); sign at (14, 6); hidden item at (3, 9)"
+    ), pa._map_things(line)
+    assert pa._map_things('{"objects": [], "bg_events": []}') == "" and pa._map_things("not json") == ""
+
+
+def test_a_failed_result_is_sent_once():
+    """Server refusals set "error" and "summary" to the same text: only one goes in."""
+    agent = _agent()
+    refusal = {"success": False, "error": "No exit matches 'west'.", "summary": "No exit matches 'west'."}
+    agent._store_function_result_for_context("go_to_exit", json.dumps(refusal))
+    block = agent._get_function_results_context()
+    assert block.count("No exit matches 'west'.") == 1 and '"summary"' in block, block
+
+
+def test_older_steps_are_one_line_each():
+    """Only the newest step keeps its reasoning ("why"); older steps are one line."""
+    agent = _agent()
+    for step in range(1, 6):
+        agent._add_to_history("p", f"I go north because step {step}", step_number=step)
+    history = agent._format_action_history()
+    print("    " + history.replace("\n", "\n    "))
+    assert history.count("why:") == 1 and "step 5" in history.split("why:")[1], history
+
+
 def test_a_store_write_refreshes_the_overviews():
     agent = _agent()
     agent._gather_store_context()
