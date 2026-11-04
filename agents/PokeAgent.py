@@ -88,7 +88,7 @@ from agents.prompts.paths import (
 # with only press_buttons + process_memory.
 _NO_BUILTINS_SCAFFOLDS = {"simple", "continualharness"}
 _SIMPLEST_SCAFFOLD = "simplest"
-from agents.tools.registry import build_tools_for_scaffold
+from agents.tools.registry import BRIEF_REASONING_SYSTEM_NOTE, brief_reasoning_enabled, build_tools_for_scaffold
 from utils.json_utils import convert_protobuf_value, convert_protobuf_args, normalize_replan_edits
 
 # Configure logging
@@ -549,6 +549,10 @@ class PokeAgent:
 
         # Load system instructions
         self.system_instructions = self._load_system_instructions(system_instructions_file)
+        # Speed plan, Phase 3: BRIEF_REASONING=1 asks for a one-line rationale (the tool
+        # schemas say the same, agents/tools/registry.py).
+        if brief_reasoning_enabled():
+            self.system_instructions += BRIEF_REASONING_SYSTEM_NOTE
 
         # Initialize MCP tool adapter
         self.mcp_adapter = MCPToolAdapter(server_url)

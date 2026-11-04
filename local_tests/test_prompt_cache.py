@@ -162,6 +162,41 @@ def test_older_steps_are_one_line_each():
     assert history.count("why:") == 1 and "step 5" in history.split("why:")[1], history
 
 
+def test_brief_reasoning_is_opt_in_and_reaches_every_rationale_field():
+    """Speed plan, Phase 3: BRIEF_REASONING=1 asks every tool's rationale for one line; off
+    (the default) the ANALYZE/PLAN format stays, byte for byte. The registry itself is
+    not changed (a copy per build)."""
+    import os
+    from unittest import mock
+
+    from agents.tools import registry
+
+    def rationale_fields(tools):
+        return {
+            (t["name"], name): spec["description"]
+            for t in tools for name, spec in ((t.get("parameters") or {}).get("properties") or {}).items()
+            if name in registry.REASONING_PARAMETER_NAMES
+        }
+
+    with mock.patch.dict(os.environ, {"BRIEF_REASONING": ""}):
+        default = registry.build_tools_for_scaffold("simple")
+    with mock.patch.dict(os.environ, {"BRIEF_REASONING": "1"}):
+        brief = registry.build_tools_for_scaffold("simple")
+    before, after = rationale_fields(default), rationale_fields(brief)
+    print(f"    {len(after)} rationale fields; press_buttons default: {before[('press_buttons', 'reasoning')][:40]}…")
+    assert before.keys() == after.keys() and len(after) > 10, len(after)
+    assert "ANALYZE" in before[("press_buttons", "reasoning")]
+    assert set(after.values()) == {registry.BRIEF_REASONING_DESCRIPTION}, set(after.values())
+    # Everything else is the same.
+    for d, b in zip(default, brief):
+        assert d["name"] == b["name"] and d["description"] == b["description"]
+        dp = {k: v for k, v in (d["parameters"].get("properties") or {}).items() if k not in registry.REASONING_PARAMETER_NAMES}
+        bp = {k: v for k, v in (b["parameters"].get("properties") or {}).items() if k not in registry.REASONING_PARAMETER_NAMES}
+        assert dp == bp, d["name"]
+    with mock.patch.dict(os.environ, {"BRIEF_REASONING": ""}):
+        assert registry.build_tools_for_scaffold("simple") == default  # the registry was not changed
+
+
 def test_a_store_write_refreshes_the_overviews():
     agent = _agent()
     agent._gather_store_context()

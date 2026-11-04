@@ -176,6 +176,12 @@ else
         if [ -n "${!var:-}" ]; then env_args+=(-e "$var"); fi
     done
 fi
+# Speed-plan switches, passed through when set so each can be tried on its own, e.g.
+# BRIEF_REASONING=1 ./play-local.sh (one-line rationale), SCREENSHOT_POLICY=needed (the
+# frame only when the text state can't describe the screen), OPENAI_MAX_OUTPUT_TOKENS.
+for var in BRIEF_REASONING SCREENSHOT_POLICY OPENAI_MAX_OUTPUT_TOKENS; do
+    if [ -n "${!var:-}" ]; then env_args+=(-e "$var"); fi
+done
 
 state_args=()
 if [ "${1:-}" != "new" ]; then

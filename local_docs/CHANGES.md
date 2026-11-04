@@ -1529,6 +1529,21 @@ prompt. That came to 1.1 tiles walked per minute.
   of the removed parts present; plus _map_things, the single error, one-line history.
   test_phase4_agent's history-budget cut (500 → 50 tokens) follows the shorter entries.
 
+## Speed plan, Phase 3: output cap; brief rationale behind a switch (2026-11-04)
+- Local output cap 1024 → 256 tokens (`DEFAULT_LOCAL_MAX_OUTPUT_TOKENS`): today's
+  replies were p50 103 / p90 127 / p99 152; only runaways went past 256 (0.17%), each
+  running ~40 s to the old cap. On by default.
+- `BRIEF_REASONING=1` (off by default, so its effect on play is measured on its own):
+  every tool's reasoning/reason field asks for one line of at most 25 words ("what you
+  see, then what you do", one example), and the system instructions say the same.
+  The registry isn't changed; a copy per build. Gate: revert if refused or invalid
+  calls rise more than 20% over a matched window.
+- play-local.sh passes BRIEF_REASONING, SCREENSHOT_POLICY and OPENAI_MAX_OUTPUT_TOKENS
+  through when set.
+- *Verified:* test_prompt_cache.py: off, the ANALYZE/PLAN text is unchanged; on, all 21
+  rationale fields ask for one line and nothing else differs. test_phase4_backend's two
+  default-cap assertions now read the constant (comment says why).
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

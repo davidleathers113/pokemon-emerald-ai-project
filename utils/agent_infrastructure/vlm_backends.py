@@ -157,6 +157,11 @@ def gemini_schema_to_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# Output-token cap for local OpenAI-compatible servers (Ollama) when
+# OPENAI_MAX_OUTPUT_TOKENS isn't set; see OpenAIBackend.__init__.
+DEFAULT_LOCAL_MAX_OUTPUT_TOKENS = 256
+
+
 def _int_setting(explicit, env_name: str, default):
     """Resolve an optional int setting: explicit kwarg, then env var, then default.
     0 / "none" / "off" disable the setting (returns None)."""
@@ -396,12 +401,13 @@ class OpenAIBackend(VLMBackend):
         # reasoning tokens count against max_output_tokens there.
         base_url = os.getenv("OPENAI_BASE_URL", "")
         self._is_compatible_server = bool(base_url) and "api.openai.com" not in base_url
-        # Default 1024: successful local steps used p50=496 / p95=685 / max=754
-        # output tokens (llm_logs, n=37 excluding one 3,902-token runaway), so
-        # 1024 leaves ~35% headroom over the largest normal reply.
+        # Default 256 (speed plan, Phase 3): the compact prompts' replies measured
+        # p50=103 / p90=127 / p99=152 output tokens (llm_logs of 2026-11-04); only
+        # runaways went past 256 (0.17%, each running to the old 1,024 cap at ~25
+        # tok/s, ~40 s). It was 1024 when replies were verbose (p50=496, max=754).
         self.max_output_tokens = _int_setting(
             kwargs.get("max_output_tokens"), "OPENAI_MAX_OUTPUT_TOKENS",
-            1024 if self._is_compatible_server else None,
+            DEFAULT_LOCAL_MAX_OUTPUT_TOKENS if self._is_compatible_server else None,
         )
         # Per-request timeout: local Qwen3-VL-8B measured ~250 tok/s prefill and
         # ~19 tok/s decode, so a 28K-token prompt plus 1024 output tokens is

@@ -885,6 +885,39 @@ def _tool_available(entry: Dict[str, Any], scaffold: str) -> bool:
     return scaffold in s
 
 
+# Speed plan, Phase 3 (David, 2026-11-04): a small model does no worse with a brief
+# rationale before its call ("Brief Is Better", arXiv 2604.02155; Chain of Draft,
+# 2502.18600), and output costs ~25 tok/s. Opt-in with BRIEF_REASONING=1 so its effect on
+# play can be measured on its own: the ANALYZE/PLAN format stays the default.
+BRIEF_REASONING_ENV = "BRIEF_REASONING"
+BRIEF_REASONING_DESCRIPTION = (
+    "One short line, at most 25 words: what you see, then what you do. "
+    "Example: 'Birch's dialogue box is open -> press A twice to read it.'"
+)
+BRIEF_REASONING_SYSTEM_NOTE = (
+    "\n\n## Reasoning\nKeep every tool call's reasoning to one short line (at most 25 words): "
+    "what you see, then what you do. Think it through, then write only that line."
+)
+# Parameters that carry the model's rationale.
+REASONING_PARAMETER_NAMES = ("reasoning", "reason")
+
+
+def brief_reasoning_enabled() -> bool:
+    return os.environ.get(BRIEF_REASONING_ENV, "").strip() == "1"
+
+
+def _with_brief_reasoning(parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of a tool's parameters with every rationale field asking for one line."""
+    props = (parameters or {}).get("properties") or {}
+    if not any(name in props for name in REASONING_PARAMETER_NAMES):
+        return parameters
+    new_props = {
+        name: ({**spec, "description": BRIEF_REASONING_DESCRIPTION} if name in REASONING_PARAMETER_NAMES else spec)
+        for name, spec in props.items()
+    }
+    return {**parameters, "properties": new_props}
+
+
 def build_tools_for_scaffold(scaffold: str) -> List[Dict[str, Any]]:
     """Return the filtered list of Gemini tool declarations for *scaffold*.
 
@@ -893,6 +926,7 @@ def build_tools_for_scaffold(scaffold: str) -> List[Dict[str, Any]]:
     ``agents.subagents.utils.registry.build_local_subagent_tool_declarations``.
     """
     # 1) Static registry tools
+    brief = brief_reasoning_enabled()
     tools: List[Dict[str, Any]] = []
     for entry in TOOL_REGISTRY:
         if not _tool_available(entry, scaffold):
@@ -901,7 +935,7 @@ def build_tools_for_scaffold(scaffold: str) -> List[Dict[str, Any]]:
             {
                 "name": entry["name"],
                 "description": entry["description"],
-                "parameters": entry["parameters"],
+                "parameters": _with_brief_reasoning(entry["parameters"]) if brief else entry["parameters"],
             }
         )
 
@@ -916,7 +950,7 @@ def build_tools_for_scaffold(scaffold: str) -> List[Dict[str, Any]]:
                 {
                     "name": spec.tool_name,
                     "description": spec.description,
-                    "parameters": spec.parameters,
+                    "parameters": _with_brief_reasoning(spec.parameters) if brief else spec.parameters,
                 }
             )
 

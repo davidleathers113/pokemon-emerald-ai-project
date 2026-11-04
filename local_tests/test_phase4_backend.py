@@ -223,7 +223,9 @@ def test_retry_bounded_attempts_and_wait_and_reraises_original():
 
 def test_backend_settings_for_compatible_server():
     backend = _make_backend()
-    assert backend.max_output_tokens == 1024
+    # The local default cap: 1024 until speed-plan Phase 3 measured replies at p99=152
+    # tokens and lowered it (vb.DEFAULT_LOCAL_MAX_OUTPUT_TOKENS, 256).
+    assert backend.max_output_tokens == vb.DEFAULT_LOCAL_MAX_OUTPUT_TOKENS == 256
     assert backend.request_timeout_s == 240.0
     assert backend.max_attempts == 3
     assert backend.temperature is None and backend.top_p is None
@@ -260,7 +262,7 @@ def test_call_responses_sends_cap_and_retries_transient_only():
         assert backend._call_responses("sys", "hello", tools=backend._tools_openai) == "resp"
     assert len(seen) == 2
     kw = seen[-1]
-    assert kw["max_output_tokens"] == 1024
+    assert kw["max_output_tokens"] == vb.DEFAULT_LOCAL_MAX_OUTPUT_TOKENS
     assert kw["temperature"] == 0.7
     assert "top_p" not in kw
     assert kw["extra_body"]["prompt_cache_key"].startswith("sys-")
