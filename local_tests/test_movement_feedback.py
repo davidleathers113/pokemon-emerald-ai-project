@@ -43,7 +43,13 @@ class InProcessServer:
         self.thread = threading.Thread(target=srv.game_loop, daemon=True)
         self.thread.start()
 
-    def load(self, state_path):
+    def load(self, state_path, wild_encounters=True):
+        """wild_encounters=False starts a Repel (in RAM) so grass can't interrupt a walk.
+
+        The game loop runs on wall-clock time and pokeemerald advances its RNG every
+        frame, so which grass step meets a wild Pokémon differs run to run (L12: Route
+        101 walks stopped on "the game left the overworld" about 1 run in 3). Tests
+        about walking, not about wild battles, turn encounters off this way."""
         srv = self.srv
         # getattr: the same harness must also run against the pre-change server.
         with srv.memory_lock:
@@ -58,6 +64,15 @@ class InProcessServer:
             # Right after a load the game ignores input for a while (seen on both
             # fixtures); run past that so every test starts from a playable state.
             srv.env.tick(300)
+            if not wild_encounters:
+                # pret/pokeemerald src/wild_encounter.c IsWildLevelAllowedByRepel: while
+                # VAR_REPEL_STEP_COUNT (0x4021, a SaveBlock1 var) is nonzero, no wild
+                # Pokémon below the lead's level appears. Route 101's are Lv2-3 and the
+                # fixture's Torchic is Lv6; 1000 steps never wear off inside one test.
+                reader = srv.env.memory_reader
+                sb1 = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR)
+                srv.env.core.memory.u16[sb1 + reader.addresses.SAVE_BLOCK1_VARS_OFFSET + (0x4021 - 0x4000) * 2] = 1000
+                reader._invalidate_mem_cache()
 
     def call(self, endpoint, payload):
         if not hasattr(self.srv, endpoint):
@@ -116,7 +131,7 @@ def server():
 
 def test_blocked_press_into_trees_is_reported_and_rest_skipped():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     snap = s.snapshot()
     assert (snap.x, snap.y, snap.facing) == (13, 2, "UP"), snap
     r = s.call("mcp_press_buttons", {"buttons": ["UP", "UP", "UP"], "reasoning": "go north"})
@@ -132,7 +147,7 @@ def test_blocked_press_into_trees_is_reported_and_rest_skipped():
 
 def test_identical_repeat_of_blocked_press_is_refused():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     s.call("mcp_press_buttons", {"buttons": ["UP"], "reasoning": "north"})
     executed_before = s.srv.latest_metrics.get("total_actions", 0)
     r = s.call("mcp_press_buttons", {"buttons": ["UP", "UP"], "reasoning": "north again"})
@@ -173,7 +188,7 @@ def test_turning_in_place_is_not_blocked_but_the_next_press_is():
 def test_two_presses_same_direction_blocked_after_turn():
     """Facing west, UP into a tree: the 1st press turns, the 2nd is the BLOCKED one."""
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     s.call("mcp_press_buttons", {"buttons": ["LEFT"], "reasoning": "west"})  # (12,2) facing west
     r = s.call("mcp_press_buttons", {"buttons": ["UP", "UP", "UP"], "reasoning": "north"})
     print("   ", r)
@@ -186,7 +201,7 @@ def test_two_presses_same_direction_blocked_after_turn():
 def test_a_press_that_does_nothing_says_so():
     """Seen live: 10 A presses at a Pokemon Center door, 6 tiles from the nurse."""
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     r = s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "talk"})
     print("   ", r)
     assert "Nothing happened" in r["summary"] and "(13,1)" in r["summary"], r
@@ -205,7 +220,7 @@ def test_a_press_that_does_nothing_says_so():
 
 def test_ledge_jump_is_not_blocked_and_no_press_is_lost():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     s.call("mcp_press_buttons", {"buttons": ["LEFT"] * 5, "reasoning": "to x=8"})
     snap = s.snapshot()
     assert (snap.x, snap.y) == (8, 2), snap
@@ -216,6 +231,23 @@ def test_ledge_jump_is_not_blocked_and_no_press_is_lost():
     snap = s.snapshot()
     assert (snap.x, snap.y) == (8, 9), snap
     assert r.get("status") == "DONE", r
+
+
+def test_harness_can_turn_wild_encounters_off():
+    """Guards the L12 fix the Route 101 walking tests rely on. Pacing x=13-16 in the
+    grass at y=4 met 5 and 6 wild Pokémon in 60 steps without it, 0 and 0 with it."""
+    s = server()
+    s.load(ROUTE101, wild_encounters=False)
+    reader = s.srv.env.memory_reader
+    with s.srv.memory_lock:
+        assert reader.read_game_var(0x4021) == 1000  # VAR_REPEL_STEP_COUNT
+    s.call("mcp_press_buttons", {"buttons": ["DOWN", "DOWN"], "reasoning": "into the grass"})
+    for i in range(20):
+        s.call("mcp_press_buttons", {"buttons": ["RIGHT" if i % 2 == 0 else "LEFT"] * 3, "reasoning": "pace"})
+        with s.srv.memory_lock:
+            assert not reader.is_in_battle(), f"wild battle after {(i + 1) * 3} grass steps"
+    with s.srv.memory_lock:
+        assert reader.read_game_var(0x4021) == 1000 - 62, reader.read_game_var(0x4021)  # every step counted
 
 
 def _run_all():

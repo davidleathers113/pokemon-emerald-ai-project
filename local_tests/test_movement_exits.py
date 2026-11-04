@@ -45,7 +45,7 @@ def test_walking_tools_refuse_during_a_battle():
 
 def test_go_to_exit_north_edge_from_route101_reaches_oldale():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     r = s.call("mcp_go_to_exit", {"exit": "north", "reasoning": "to Oldale"})
     print("   ", r)
     assert r["success"] is True, r
@@ -55,16 +55,8 @@ def test_go_to_exit_north_edge_from_route101_reaches_oldale():
 
 def test_go_to_exit_by_destination_name():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     r = s.call("mcp_go_to_exit", {"exit": "Oldale Town", "reasoning": "to Oldale"})
-    with s.srv.memory_lock:
-        interrupted = not r["success"] and s.srv.env.memory_reader.is_in_battle()
-    if interrupted:
-        # About 1 full-suite run in 3, a random wild encounter in the grass beside (13,2)
-        # stopped the walk ("the game left the overworld"). That's the game, not the
-        # tool: leave the battle and walk again.
-        assert s.call("mcp_run_from_battle", {"reasoning": "test"})["success"], r
-        r = s.call("mcp_go_to_exit", {"exit": "Oldale Town", "reasoning": "to Oldale"})
     assert r["success"] is True and _location(s) == "OLDALE TOWN", r
 
 
@@ -73,7 +65,7 @@ def test_go_to_exit_south_from_a_corner_of_oldale_uses_the_real_opening():
     trees 20+ times. Oldale's whole south row is open ground, but Route 101 continues
     only under x=8-11, so the exit list and the route must both use that opening."""
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     assert s.call("mcp_go_to_exit", {"exit": "north", "reasoning": ""})["success"]
     r = s.call("mcp_navigate_to", {"x": 15, "y": 19, "variance": "none", "reason": "corner"})
     assert r["success"] is True, r
@@ -86,7 +78,7 @@ def test_go_to_exit_south_from_a_corner_of_oldale_uses_the_real_opening():
 def test_go_to_exit_through_a_building_door():
     """Route 101 -> Oldale, then into the POKEMON CENTER through its front door."""
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     assert s.call("mcp_go_to_exit", {"exit": "north", "reasoning": ""})["success"]
     r = s.call("mcp_go_to_exit", {"exit": "POKEMON CENTER", "reasoning": "heal"})
     print("   ", r)
@@ -115,7 +107,7 @@ def test_go_to_exit_up_the_stairs():
 
 def test_go_to_exit_unknown_name_lists_the_exits():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     r = s.call("mcp_go_to_exit", {"exit": "west", "reasoning": ""})
     assert r["success"] is False, r
     assert "north edge -> OLDALE TOWN" in r["error"] and "south edge -> LITTLEROOT TOWN" in r["error"], r
@@ -123,7 +115,7 @@ def test_go_to_exit_unknown_name_lists_the_exits():
 
 def test_navigate_to_unwalkable_target_says_so():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     # (13,0) is a tree and every tile around it is too: refuse with a reason.
     r = s.call("mcp_navigate_to", {"x": 13, "y": 0, "variance": "none", "reason": ""})
     print("   ", r)
@@ -144,7 +136,7 @@ def test_navigate_to_a_door_reports_the_new_map():
     """Seen live: navigate_to onto a shop door said "Did not reach", and the model walked
     back out and in again."""
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     assert s.call("mcp_go_to_exit", {"exit": "north", "reasoning": ""})["success"]
     r = s.call("mcp_navigate_to", {"x": 6, "y": 16, "variance": "none", "reason": "Pokemon Center door"})
     print("   ", r)
@@ -204,7 +196,7 @@ def test_navigate_to_across_an_exit_mat_reports_the_new_map():
     and the warp cut the walk short. The result said "STOPPED ... on OLDALE TOWN MART: an
     event is running" although the player was already outside."""
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     assert s.call("mcp_go_to_exit", {"exit": "north", "reasoning": ""})["success"]
     assert s.call("mcp_go_to_exit", {"exit": "MART", "reasoning": ""})["success"]
     assert _location(s) == "OLDALE TOWN MART", _location(s)
@@ -231,7 +223,7 @@ def test_navigate_to_toward_a_neighbouring_map_names_the_exit_call():
     assert 'OLDALE TOWN use go_to_exit("north")' in both and 'LITTLEROOT TOWN use go_to_exit("south")' in both, both
 
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     assert s.call("mcp_go_to_exit", {"exit": "north", "reasoning": ""})["success"]
     start = s.snapshot()
     r = s.call("mcp_navigate_to", {
@@ -366,7 +358,7 @@ def test_maps_are_named_as_the_rom_numbers_them():
     assert _location(s) == "ROUTE 117 POKEMON DAY CARE", _location(s)
     r = s.call("mcp_go_to_exit", {"exit": "ROUTE 117", "reasoning": "test"})
     assert _location(s) == "ROUTE 117", (_location(s), r)
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     assert _location(s) == "ROUTE 101"  # a name the table had right is unchanged
 
 
@@ -468,7 +460,7 @@ def test_navigate_to_toward_a_map_further_away_names_the_first_exit():
 
 def test_navigate_to_walkable_target_reports_arrival():
     s = server()
-    s.load(ROUTE101)
+    s.load(ROUTE101, wild_encounters=False)
     r = s.call("mcp_navigate_to", {"x": 9, "y": 0, "variance": "none", "reason": ""})
     print("   ", r)
     assert r["success"] is True and r["summary"].startswith("Reached (9,0)."), r

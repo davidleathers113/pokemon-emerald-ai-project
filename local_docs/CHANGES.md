@@ -1066,6 +1066,18 @@ prompt. That came to 1.1 tiles walked per minute.
 - Tests: `test_go_to_walks_map_after_map` (Route 101 → Oldale Pokémon Center; Day Care →
   Route 117), `local_tests/test_stall_watch.py` (4). Macros 22/22.
 
+## Route 101 walking tests no longer meet wild Pokémon (2026-11-04, WEAKNESSES L12)
+- Cause of the 1-in-3 flake: the test game loop runs on wall-clock time and pokeemerald
+  advances its RNG every frame, so which grass step meets a wild Pokémon varied run to run.
+- `InProcessServer.load(state, wild_encounters=False)` sets VAR_REPEL_STEP_COUNT (0x4021)
+  to 1000 in RAM after the load (pret `IsWildLevelAllowedByRepel`: no wild Pokémon below
+  the lead's level; Route 101's are Lv2-3, the fixture's Torchic Lv6). The movement suites
+  use it for every Route 101 load; the retry in `test_go_to_exit_by_destination_name` is
+  gone. Macro tests about running from grass keep encounters on.
+- *Verified:* pacing 60 grass steps at y=4: 5 and 6 wild battles without, 0 and 0 with.
+  `test_harness_can_turn_wild_encounters_off` checks the counter and that no battle starts.
+  Movement suites 7/7 and 26/26 in two back-to-back rounds.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
