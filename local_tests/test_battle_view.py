@@ -377,6 +377,29 @@ def test_counter_is_not_an_attack():
     assert ADDRESSES  # imported for the reader's tables
 
 
+def test_a_clearly_better_teammate_is_named():
+    """Seen live vs Wattson's MAGNETON (Electric/Steel): BRELOOM's MEGA DRAIN 0.5x eight
+    times, ELECTRIKE's SPARK 0.5x six times, no switch; only COMBUSKEN's EMBER was 2x.
+    RAM: Isaac's foe made Electric/Steel with 100 HP (SABLEYE out; COMBUSKEN, BRELOOM
+    benched). Without the change SABLEYE knocks WHISMUR out this turn: no advice."""
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(ISAAC)
+    assert _view(s)["better_switch"] is None, _view(s)["better_switch"]
+    _poke(s, 8, FOE + 0x21, 13)  # ELECTRIC
+    _poke(s, 8, FOE + 0x22, 8)  # STEEL
+    _poke(s, 16, FOE + 0x28, 100)
+    _poke(s, 16, FOE + 0x2C, 100)
+    view = _view(s)
+    lines = format_battle_view(view)
+    print("    " + "\n    ".join(lines))
+    better = view["better_switch"]
+    assert better is not None and better["name"] in ("COMBUSKEN", "BRELOOM") and better["effectiveness"] >= 2, better
+    assert better["damage"] >= 2 * view["best_move"]["damage"], (better, view["best_move"])
+    assert any(f'Better matchup: call switch_pokemon("{better["name"]}") instead' in line for line in lines), lines
+
+
 def _run_all():
     import test_movement_feedback as harness
 

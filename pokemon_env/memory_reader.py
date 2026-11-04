@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import json
+import math
 import struct
 from typing import Optional, Dict, Any, List, Tuple
 import logging
@@ -1773,6 +1774,107 @@ class PokemonEmeraldReader:
                 return f"{foe} is immune to Electric moves"
         return None
 
+    def _party_battle_mon(self, index: int, mon: PokemonData) -> Dict[str, Any]:
+        """A party Pokémon in the shape of _read_battle_mon, for estimate_damage: stats from
+        its struct Pokemon (pret: level +0x54, hp +0x56, maxHP +0x58, attack +0x5A, defense
+        +0x5C, spAttack +0x60, spDefense +0x62), no stat stages yet, battler 0's side."""
+        base = self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE
+        move_ids = []
+        for name in mon.moves or []:
+            try:
+                move_ids.append(Move[str(name).upper().replace(" ", "_")].value)
+            except KeyError:
+                move_ids.append(0)
+        return {
+            "battler": 0,
+            "name": mon.species_name,
+            "level": self._read_u8(base + 0x54),
+            "hp": self._read_u16(base + 0x56),
+            "max_hp": self._read_u16(base + 0x58),
+            "type_ids": self.party_mon_types(mon),
+            "status": "OK",
+            "move_ids": move_ids,
+            "pp": list(mon.move_pp or []),
+            "stats": {
+                "attack": self._read_u16(base + 0x5A),
+                "defense": self._read_u16(base + 0x5C),
+                "sp_attack": self._read_u16(base + 0x60),
+                "sp_defense": self._read_u16(base + 0x62),
+            },
+            "stat_stages": [6] * 8,
+            "ability": self.species_ability(mon.species_id, mon.ability_num),
+        }
+
+    def _best_hit(self, attacker: Dict[str, Any], defender: Dict[str, Any]) -> Tuple[float, int]:
+        """(average damage, move id) of the attacker's hardest attack with PP on the defender."""
+        hits = [
+            (self.estimate_damage(attacker, defender, move), move)
+            for move, pp in zip(attacker.get("move_ids") or [], attacker.get("pp") or [])
+            if move and pp
+        ]
+        return max(hits, default=(0.0, 0))
+
+    def turns_to_win(self, index: int, mon: PokemonData, target: Dict[str, Any]) -> float:
+        """Hits party slot `index` needs to knock the target out with its best attack
+        (estimate_damage); inf if it can't hurt it."""
+        hit = self._best_hit(self._party_battle_mon(index, mon), target)[0]
+        return math.ceil(target["hp"] / hit) if hit else math.inf
+
+    def _better_switch(
+        self, player: Dict[str, Any], target: Dict[str, Any], best: Dict[str, Any], player_battlers: List[int]
+    ) -> Optional[Dict[str, Any]]:
+        """A teammate that clearly does better against this foe than the Pokémon out, or None.
+
+        Seen live against Wattson's MAGNETON: BRELOOM's MEGA DRAIN (0.5x) 8 times and
+        ELECTRIKE's SPARK (0.5x) 6 times, while COMBUSKEN's EMBER was 2x; the model never
+        switched. A teammate qualifies when its best hit (estimate_damage) is at least
+        twice the best move's, and it still knocks the foe out before the foe's best hit
+        (its real moves) knocks it out, counting the free hit it takes coming in. Nothing
+        is said while the Pokémon out can knock the foe out this turn.
+        """
+        if not best or best.get("damage", 0) >= target["hp"]:
+            return None
+        party = self.read_party_pokemon() or []
+        out = {
+            self._read_u32(self.addresses.BATTLE_MONS + b * self.addresses.BATTLE_MON_SIZE + 0x48)
+            for b in player_battlers
+        }
+        choice = None
+        for index, mon in enumerate(party):
+            personality = self._read_u32(self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE)
+            if mon.is_egg or mon.current_hp == 0 or personality in out:
+                continue
+            cand = self._party_battle_mon(index, mon)
+            hit, move_id = self._best_hit(cand, target)
+            if not hit or hit < 2 * best["damage"]:
+                continue
+            taken = self._best_hit(target, cand)[0]
+            left = cand["hp"] - taken  # after the hit it takes switching in
+            if left <= 0:
+                continue
+            turns_to_win = math.ceil(target["hp"] / hit)
+            turns_alive = math.ceil(left / taken) if taken else math.inf
+            if turns_to_win > turns_alive:
+                continue
+            key = (turns_to_win, -left)
+            if choice is None or key < choice["key"]:
+                data = self._rom_battle_move(move_id)
+                try:
+                    move_name = Move(move_id).name.replace("_", " ")
+                except ValueError:
+                    move_name = f"MOVE {move_id}"
+                choice = {
+                    "key": key,
+                    "slot": index + 1,
+                    "name": mon.species_name.upper(),
+                    "move": move_name,
+                    "effectiveness": self.type_effectiveness(data["type"], target["type_ids"]),
+                    "damage": round(hit, 1),
+                }
+        if choice:
+            choice.pop("key")
+        return choice
+
     def _switch_hint(self, target: Optional[Dict[str, Any]], player_battlers: List[int]) -> Optional[Dict[str, Any]]:
         """The party Pokémon to send in when the one battling has no damaging move with PP:
         able to fight (HP > 0, not an Egg), not the one out, with a damaging move with PP,
@@ -1950,6 +2052,7 @@ class PokemonEmeraldReader:
         scored = [m for m in moves if m["expected"] > 0]
         best = max(scored, key=lambda m: (m["expected"], m["damage"], -m["slot"])) if scored else None
         switch_hint = self._switch_hint(target, player_battlers) if moves and best is None else None
+        better_switch = self._better_switch(player, target, best, player_battlers) if player and target and best else None
 
         action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3
         return {
@@ -1967,6 +2070,7 @@ class PokemonEmeraldReader:
             "moves": moves,
             "best_move": best,
             "switch_hint": switch_hint,
+            "better_switch": better_switch,
         }
 
     def read_team_condition(self, lead_index: Optional[int] = None) -> Dict[str, Any]:

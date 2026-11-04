@@ -402,6 +402,14 @@ def format_battle_view(view):
     best = view.get('best_move')
     if best:
         lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\").")
+        better = view.get('better_switch')
+        if better:
+            # Seen live vs Wattson's MAGNETON: 0.5x moves 14 times, never a switch.
+            lines.append(
+                f"Better matchup: call switch_pokemon(\"{better['name']}\") instead "
+                f"({better['move']} {better['effectiveness']:g}x, ~{round(better['damage'])} HP a hit vs "
+                f"~{round(best.get('damage') or 0)} for {best['name']}; it takes one hit coming in)."
+            )
     elif moves and view.get('switch_hint'):
         # Seen live: with only "switch Pokémon" here, the model used LEECH SEED 5 times.
         hint = view['switch_hint']

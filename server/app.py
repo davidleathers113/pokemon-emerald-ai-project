@@ -5919,16 +5919,27 @@ def _train_can_take_a_turn(party: List[Tuple[int, Any]], trainee_pid: int) -> bo
 
 
 def _train_partner(party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: Optional[int]) -> Optional[int]:
-    """Index of the teammate that fights for the trainee: the one asked for, else the
-    highest-level teammate above half HP (the partner _switch_train_line names). None
-    when that Pokémon can't fight now."""
+    """Index of the teammate that fights for the trainee: the one asked for, else, in a
+    battle, the teammate above half HP that knocks the foe out in the fewest hits
+    (reader.turns_to_win, the battle view's damage estimate; level breaks ties), else the
+    highest-level one (the partner _switch_train_line names). None when that Pokémon
+    can't fight now. Seen live vs MAGNETON: the highest level isn't always the one that
+    hurts it (EMBER 2x where MEGA DRAIN and SPARK were 0.5x)."""
     able = [
         i for i, (pid, mon) in enumerate(party)
         if pid != trainee_pid and not mon.is_egg and mon.max_hp and mon.current_hp * 2 > mon.max_hp
     ]
     if wanted_pid is not None:
         return next((i for i in able if party[i][0] == wanted_pid), None)
-    return max(able, key=lambda i: party[i][1].level) if able else None
+    if not able:
+        return None
+    with memory_lock:
+        reader = env.memory_reader
+        view = reader.read_battle_view() if reader.is_in_battle() else None
+        target = (view or {}).get("target")
+        if target and target.get("hp"):
+            return min(able, key=lambda i: (reader.turns_to_win(i, party[i][1], target), -party[i][1].level))
+    return max(able, key=lambda i: party[i][1].level)
 
 
 def _train_weakness(partner_index: Optional[int]) -> List[str]:

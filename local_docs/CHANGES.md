@@ -1292,7 +1292,25 @@ prompt. That came to 1.1 tiles walked per minute.
 - `navigate_to` accepts `avoid: [[x, y], ...]` (operator use; not in the model's tools).
 - *Verified:* `test_walks_go_round_floor_switches` on test_mauville_gym_switch1.state:
   new route (0,15)→(2,10)→(4,10)→(5,3) touches no switch; with the trigger list emptied
-  the same search crosses (3,9); navigate_to reaches (5,3), also with avoid [[4,10]].
+  the same search crosses (3,9); navigate_to reaches (5,3), also with an avoid tile.
+  (Avoiding (4,10) itself leaves no switch-free way, so the walk rightly crosses one.)
+
+## "Better matchup": name a clearly better teammate mid-battle (2026-11-04, WEAKNESSES M55)
+- Seen live 10:05-10:18, lost to Wattson: 0.5x moves 14 times against MAGNETON, no
+  switch by choice.
+- `memory_reader._party_battle_mon` builds a battle-mon dict for a party Pokémon from
+  its struct Pokemon stats (+0x54..+0x62); `_best_hit` is an attacker's hardest hit with
+  PP; `_better_switch` picks the teammate that hits at least 2x harder than the best
+  move and still wins the race after one free hit coming in (fewest hits to win, then
+  most HP left). Not offered while the Pokémon out knocks the foe out this turn.
+  `view["better_switch"]`; the formatter adds the "Better matchup" line after "Best move".
+- `_train_partner`: in a battle, the able teammate (above half HP) with the fewest hits
+  to win (`reader.turns_to_win`), level breaking ties; outside battle the highest level,
+  as before.
+- *Verified:* `test_a_clearly_better_teammate_is_named`: on test_switch_question.state
+  the plain WHISMUR gets no advice (SABLEYE knocks it out this turn); made Electric/
+  Steel with 100 HP in RAM → "Better matchup: call switch_pokemon("COMBUSKEN") instead
+  (EMBER 2x, ~125 HP a hit vs ~24 for NIGHT SHADE …)".
 
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
