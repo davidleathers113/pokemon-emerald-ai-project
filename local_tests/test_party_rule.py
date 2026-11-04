@@ -79,7 +79,8 @@ def test_the_lowest_level_pokemon_is_put_first():
     assert _names(s)[0] == "AZUMARILL", _names(s)
     assert s.srv._player_can_walk()
     again = _maintain(s)
-    assert again == {"changed": False, "summary": ""}, again  # already right: nothing to do
+    # Already right: nothing to do, and it says why (each "nothing" carries a reason).
+    assert again["changed"] is False and again["summary"] == "" and "already leads" in again["why"], again
     feed = asyncio.run(s.srv.get_ai_feed())
     assert any(e["kind"] == "party" and "AZUMARILL" in e["text"] for e in feed["events"]), feed["events"]
 
@@ -114,14 +115,16 @@ def test_nothing_happens_in_a_battle_or_a_conversation():
     s = server()
     s.load(ISAAC, wild_encounters=False)
     order = _names(s)
-    assert _maintain(s) == {"changed": False, "summary": ""} and _names(s) == order
+    r = _maintain(s)
+    assert r["changed"] is False and r["why"] == "in a battle" and _names(s) == order, r
     s.load(CHIMNEY, wild_encounters=False)
     s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "test"})  # the busy grunt's line opens
     deadline = time.time() + 5
     while s.srv._player_can_walk() and time.time() < deadline:
         time.sleep(0.1)
     assert not s.srv._player_can_walk()
-    assert _maintain(s) == {"changed": False, "summary": ""} and _names(s)[0] == "BRELOOM"
+    r = _maintain(s)
+    assert r["changed"] is False and r["why"].startswith("the player can't walk") and _names(s)[0] == "BRELOOM", r
 
 
 def test_with_the_exp_share_the_weakest_holds_it_and_it_moves_when_that_changes():

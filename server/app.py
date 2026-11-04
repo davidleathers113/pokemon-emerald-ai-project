@@ -7798,16 +7798,20 @@ async def _open_item_submenu(index: int, source: str) -> Optional[str]:
     return None
 
 
-def _held_items() -> List[int]:
+def _held_item(index: int) -> Optional[int]:
+    """What party slot `index` holds (0 = nothing), or None when the party can't be read
+    right now. Seen in a test run: a read during the party screen's swap came back short
+    and indexing it raised IndexError."""
     with memory_lock:
-        return [p.held_item for p in env.memory_reader.read_party_pokemon() or []]
+        party = env.memory_reader.read_party_pokemon() or []
+    return party[index].held_item if index < len(party) else None
 
 
 async def _take_held_item(index: int, source: str) -> Optional[str]:
     """Take what party slot `index` holds into the bag; None when done, else why not."""
     from server import menu_state as ms
 
-    if not _held_items()[index]:
+    if _held_item(index) == 0:
         return None
     error = await _open_item_submenu(index, source)
     if error is None:
@@ -7816,7 +7820,7 @@ async def _take_held_item(index: int, source: str) -> Optional[str]:
             await _macro_press(["A"], source)
             # "Received the X from Y." then back to the party list.
             for _ in range(HELD_ITEM_TEXT_PRESSES):
-                if not _held_items()[index] and await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES):
+                if _held_item(index) == 0 and await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES):
                     break
                 await _macro_press(["A"], source)
         else:
@@ -7824,7 +7828,7 @@ async def _take_held_item(index: int, source: str) -> Optional[str]:
     closed = await _close_field_menus(source)
     if error:
         return error + ("" if closed else " Could not close every menu: look at the screen.")
-    return None if not _held_items()[index] else "The item is still held (is the bag full?)."
+    return None if _held_item(index) == 0 else "The item is still held (is the bag full?)."
 
 
 async def _give_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
@@ -7857,13 +7861,13 @@ async def _give_from_bag(index: int, item_id: int, source: str) -> Optional[str]
             # "X was given the Y to hold.", or "...already holding Z. Switch the two
             # items?" whose cursor starts on YES: A through to the party list again.
             for _ in range(HELD_ITEM_TEXT_PRESSES):
-                if _held_items()[index] == item_id and await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES):
+                if _held_item(index) == item_id and await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES):
                     break
                 await _macro_press(["A"], source)
     closed = await _close_field_menus(source)
     if error:
         return error + ("" if closed else " Could not close every menu: look at the screen.")
-    return None if _held_items()[index] == item_id else "The Pokémon does not hold the item afterwards."
+    return None if _held_item(index) == item_id else "The Pokémon does not hold the item afterwards."
 
 
 def _item_name(item_id: int) -> str:
@@ -7962,26 +7966,35 @@ async def maintain_party(request: dict = None):
     from server import menu_state as ms
     from server.field_control import DIALOGUE_NONE
 
-    nothing = {"changed": False, "summary": ""}
-    if env is None or _mem(lambda r: r.is_in_battle()) or not _player_can_walk() or _field_status() != DIALOGUE_NONE:
-        return nothing
+    def nothing(why: str) -> Dict[str, Any]:
+        # Why nothing was done, for whoever checks it live (seen: at a Pokémon Center the
+        # answer was "nothing" while two of the lowest were fainted, which is right, but
+        # nothing said so).
+        return {"changed": False, "summary": "", "why": why}
+
+    if env is None:
+        return nothing("no emulator")
+    if _mem(lambda r: r.is_in_battle()):
+        return nothing("in a battle")
+    if not _player_can_walk() or _field_status() != DIALOGUE_NONE:
+        return nothing(f"the player can't walk now ({_field_status()})")
     with memory_lock:
         party = env.memory_reader.read_party_pokemon() or []
         share_in_bag = any(ms.ITEM_EXP_SHARE in _mem_bag_ids(env.memory_reader, p) for p in range(5))
     target = _party_rule_target(party)
     if target is None or len(party) < 2:
-        return nothing
+        return nothing("fewer than two Pokémon, or none able to battle")
     mon = party[target]
     who = f"{mon.species_name.upper()} (lowest level, Lv{mon.level})"
     holder = next((i for i, p in enumerate(party) if p.held_item == ms.ITEM_EXP_SHARE), None)
     if share_in_bag or holder is not None:
         if holder == target:
-            return nothing
+            return nothing(f"{who} already holds the Exp. Share")
         result = await mcp_give_item({"item": _item_name(ms.ITEM_EXP_SHARE), "pokemon": str(target + 1)})
         summary = f"Exp. Share given to {who}" + (f", from {party[holder].species_name.upper()}" if holder is not None else "")
     else:
         if target == 0:
-            return nothing
+            return nothing(f"{who} already leads (fainted ones and eggs don't count)")
         result = await mcp_set_lead({"pokemon": str(target + 1)})
         summary = f"Lead set to {who}"
     if not result.get("success"):
