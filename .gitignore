@@ -6,6 +6,8 @@
 *.gbc
 *.pem
 *.gba
+# In-game saves (Nintendo game data): fixtures are .state files in local_tests/.
+*.sav
 llm_log_*
 .cursor/*
 .claude/*

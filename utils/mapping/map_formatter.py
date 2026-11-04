@@ -220,6 +220,16 @@ def format_tile_to_symbol(tile, x=None, y=None, location_name=None, player_pos=N
     # tile_id 1023 (0x3FF) is usually invalid/out-of-bounds
     if tile_id == 1023:
         return "#"  # Always show as blocked/wall
+    # A set collision bit blocks the tile whatever its behaviour says. Seen live
+    # (2026-11-03, Rusturf Tunnel): (6,11) is CAVE floor with collision 1; the game
+    # refused the step, but the cave branch below drew it as '.', and navigate_to
+    # failed 5 times in a row. Floor-like behaviours (cave, indoor, decoration, grass,
+    # shallow water, bridge) never overrode collision in the game, only here.
+    elif collision != 0 and any(
+        word in behavior_name
+        for word in ("CAVE", "INDOOR", "DECORATION", "HOLDS", "TALL_GRASS", "SHALLOW_WATER", "BRIDGE")
+    ):
+        return "#"
     elif behavior_name == "NORMAL" or behavior_name == "MOUNTAIN_TOP":
         return "." if collision == 0 else "#"
     # Fix for reversed door/stairs mapping in Brendan's house

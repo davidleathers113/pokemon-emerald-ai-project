@@ -579,9 +579,10 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "scaffolds": GUIDE_SCAFFOLDS,
         "description": (
             "In a battle, use one of your Pokemon's moves: opens FIGHT if needed, "
-            "moves the cursor to the move and confirms it. The battle section names "
-            "the best move. Fails without pressing anything if text is still playing "
-            "(press A first) or the move has no PP."
+            "moves the cursor to the move and confirms it, then reads through the turn's "
+            "text. Answers at your next turn, when the battle ends, or at a question, "
+            "quoting what happened and both sides' HP. The battle section names the best "
+            "move. Fails without pressing anything if the move has no PP."
         ),
         "parameters": {
             "type_": "OBJECT",
@@ -603,12 +604,46 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
     # memory before every press and stopping with the reason when the screen isn't
     # what it expects: fewer ~30 s decisions, and none of them inside a menu.
     {
+        "name": "go_to",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Walk to a named place in one call: a town, route, building or cave floor, map "
+            "after map (e.g. 'Route 117', 'Mauville City Pokemon Center'). Runs from wild "
+            "battles on the way; stops for a trainer battle or a question."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "place": {"type_": "STRING", "description": "Where to go: a map name as the objectives write it."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why go there."},
+            },
+            "required": ["place", "reasoning"],
+        },
+    },
+    {
+        "name": "talk_to",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Talk to the person standing at (x, y): walks to a tile next to them, turns to "
+            "face them, presses A and reads what they say. If it starts a battle, use use_move."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "x": {"type_": "INTEGER", "description": "The x of the tile the person stands on."},
+                "y": {"type_": "INTEGER", "description": "The y of the tile the person stands on."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: who and why."},
+            },
+            "required": ["x", "y", "reasoning"],
+        },
+    },
+    {
         "name": "heal_at_pokecenter",
         "scaffolds": GUIDE_SCAFFOLDS,
         "description": (
-            "Inside a Pokemon Center: walks to the nurse, says YES and reads through her "
-            "text, then checks every party Pokemon is fully healed. Outside one it says "
-            "which exit leads to a Pokemon Center."
+            "Heals the whole party from anywhere: walks to the nearest Pokemon Center "
+            "(running from wild battles on the way), talks to the nurse, says YES, and "
+            "checks every party Pokemon is fully healed."
         ),
         "parameters": {
             "type_": "OBJECT",
@@ -688,6 +723,37 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
                 "reasoning": {"type_": "STRING", "description": "One short sentence: why buy it."},
             },
             "required": ["item", "count", "reasoning"],
+        },
+    },
+    # Seen live: switch-training cost ~3 model decisions per wild battle (walk into the
+    # grass, switch_pokemon, use_move); train runs the whole loop server-side.
+    {
+        "name": "train",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Level up one party Pokemon on wild battles, in one call: walks into the nearest "
+            "tall grass (or cave), steps until a wild Pokemon appears, switches the trainee "
+            "out on turn 1 for your strongest teammate, wins with its best move, and repeats. "
+            "The trainee shares the EXP without fighting. Stops at until_level, when the team "
+            "is weak, at a question (new move, evolution), a trainer, or after max_minutes, "
+            "and reports every battle. With catch, it also stops when that wild species "
+            "appears (at catch_min_level or higher) so you can catch it."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "trainee": {"type_": "STRING", "description": "The party Pokemon to level up, e.g. 'SHROOMISH'."},
+                "until_level": {"type_": "INTEGER", "description": "Stop once the trainee reaches this level."},
+                "partner": {
+                    "type_": "STRING",
+                    "description": "Who fights for it (default: your highest-level Pokemon above half HP).",
+                },
+                "max_minutes": {"type_": "NUMBER", "description": "Time limit, default 4, at most 10."},
+                "catch": {"type_": "STRING", "description": "A wild species to stop for and catch, e.g. 'SABLEYE'."},
+                "catch_min_level": {"type_": "INTEGER", "description": "Only stop for one at this level or higher."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why train now."},
+            },
+            "required": ["trainee", "reasoning"],
         },
     },
     # -- get_walkthrough: expert scaffolds only --

@@ -3610,6 +3610,42 @@ class DirectObjectiveManager:
             return self.dynamics_index
         return 0
 
+    def insert_objective(self, category: str, index: int, obj_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert one objective at ``index`` (current or later), shifting the rest down.
+
+        replan_category can only replace, append or delete, so putting a step *before* the
+        current objective (e.g. "train to Lv16, then Roxanne") would overwrite a later one.
+        The whole sequence is persisted (serialize_full_state), so the insert survives
+        restarts.
+        """
+        if category not in ("story", "battling", "dynamics"):
+            return {"success": False, "error": f"Invalid category '{category}'."}
+        sequence = self._get_sequence_for_category(category)
+        current_idx = self._get_index_for_category(category)
+        if not isinstance(index, int) or index < current_idx or index > len(sequence):
+            return {
+                "success": False,
+                "error": f"index must be between the current index ({current_idx}) and {len(sequence)}.",
+            }
+        if not obj_data.get("id") or not obj_data.get("description"):
+            return {"success": False, "error": "objective needs at least 'id' and 'description'."}
+        if any(o.id == obj_data["id"] for o in sequence):
+            return {"success": False, "error": f"An objective with id '{obj_data['id']}' already exists."}
+        new_obj = DirectObjective(
+            id=obj_data["id"],
+            description=obj_data["description"],
+            action_type=obj_data.get("action_type", "navigate"),
+            category=category,
+            target_location=obj_data.get("target_location"),
+            target_coords=obj_data.get("target_coords"),
+            navigation_hint=obj_data.get("navigation_hint"),
+            completion_condition=obj_data.get("completion_condition"),
+            priority=obj_data.get("priority", 1),
+        )
+        sequence.insert(index, new_obj)
+        self.auto_save()
+        return {"success": True, "inserted": {"index": index, "id": new_obj.id}, "current_index": current_idx}
+
     def replan_category(self, category: str, edits: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Apply a batch of index-based edits to a single objective category.
 

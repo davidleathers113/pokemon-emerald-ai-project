@@ -54,6 +54,9 @@ ADDRESSES = {
     "gSaveBlock2Ptr":               0x03005d90,
     "gPokemonStoragePtr":           0x03005d94,
     "gSpeciesNames":                0x083185c8,
+    # 5 x {u16 method, u16 param, u16 targetSpecies, pad} per species (8-byte entries,
+    # checked on the US ROM: SHROOMISH 306 -> BRELOOM 307 at Lv23).
+    "gEvolutionTable":              0x0832531c,
     "sSpeciesToHoennPokedexNum":    0x0831d94c,
     "sSpeciesToNationalPokedexNum": 0x0831dc82,
     "sHoennToNationalOrder":        0x0831dfb8,

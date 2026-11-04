@@ -118,21 +118,79 @@ def test_heal_restores_hp_and_status():
     assert s.srv._player_can_walk(), "the player should be free to walk after healing"
 
 
-def test_heal_refuses_outside_a_pokemon_center():
-    s = server()
-    s.load(ROUTE101)
-    r = s.call("mcp_heal_at_pokecenter", {})
-    print("   ", r)
-    assert r["success"] is False and "not inside a Pokémon Center (ROUTE 101)" in r["error"], r
-
-
-def test_heal_outdoors_names_the_door():
+def test_heal_from_outside_walks_into_the_pokemon_center():
+    """Seen live: told "TEAM IS WEAK … go_to_exit("south") takes the first step", the model
+    called train and navigate_to on its own tile while poison drained SHROOMISH.
+    heal_at_pokecenter now makes the trip itself. (It used to refuse outside a center.)"""
     s = server()
     s.load(POKECENTER)
     assert s.call("mcp_go_to_exit", {"exit": "RUSTBORO CITY", "reasoning": "test"})["success"]
+    _write(s, 16, PARTY + 0x56, 10)  # RAM: TORCHIC 10/35
     r = s.call("mcp_heal_at_pokecenter", {})
-    print("   ", r)
-    assert r["success"] is False and 'go_to_exit("POKEMON CENTER")' in r["error"], r
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["status"] == "HEALED", r
+    assert r["summary"].startswith("Walked RUSTBORO CITY POKEMON CENTER 1F. Healed"), r["summary"]
+    assert _party(s)[0].current_hp == 35
+
+
+def test_talk_to_walks_up_faces_and_starts_the_battle():
+    """Seen live: told to talk to Wally (8,6) in front of Mauville Gym, the model shuffled
+    around him for many minutes. test_mauville_wally.state is the player at (10,7);
+    talking to Wally starts his battle."""
+    s = server()
+    s.load(HERE / "test_mauville_wally.state")
+    r = s.call("mcp_talk_to", {"x": 8, "y": 6, "reasoning": "test"})
+    print("   ", r.get("summary")[-200:])
+    # The whole scene is read (Wally and his uncle, then Wally to the player), and it
+    # stops at his question: a YES/NO is the model's to answer.
+    assert r["success"] is True and "will you have a battle with me?" in r["summary"], r
+    assert "A choice (YES/NO or a menu) is open now" in r["summary"], r
+    assert s.srv._field_status() == "choice"
+    s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "test: YES"})
+    # His lines after YES are read the way the agent's auto-dialogue reads them.
+    for _ in range(6):
+        if _in_battle(s):
+            break
+        s.call("mcp_auto_advance_dialogue", {})
+        time.sleep(0.5)
+    assert _in_battle(s), "YES to Wally starts the battle"
+    s.load(HERE / "test_mauville_wally.state")
+    r = s.call("mcp_talk_to", {"x": "eight", "y": 6})
+    assert r["success"] is False and "x and y are required" in r["error"], r
+
+
+def test_go_to_walks_map_after_map():
+    """David (2026-11-04): "One call per objective." ROUTE 101 to OLDALE TOWN's Pokémon
+    Center is a map edge and a door (wild grass on the way is run from); from inside
+    ROUTE 117's Day Care, "Route 117" means the route outside."""
+    s = server()
+    s.load(ROUTE101)
+    r = s.call("mcp_go_to", {"place": "Oldale Town Pokemon Center", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["status"] == "ARRIVED", r
+    assert s.srv._location_name() == "OLDALE TOWN POKEMON CENTER 1F", s.srv._location_name()
+    assert "Walked OLDALE TOWN → OLDALE TOWN POKEMON CENTER 1F" in r["summary"], r
+    s.load(HERE / "test_route117_daycare.state")
+    r = s.call("mcp_go_to", {"place": "Route 117", "reasoning": "test"})
+    assert r["success"] is True and s.srv._location_name() == "ROUTE 117", (s.srv._location_name(), r)
+    r = s.call("mcp_go_to", {"place": "Route 117", "reasoning": "test"})
+    assert r["status"] == "ARRIVED" and "already" in r["summary"], r
+    r = s.call("mcp_go_to", {"place": "Nowhere Town", "reasoning": "test"})
+    assert r["success"] is False and "Did not reach Nowhere Town" in r["error"], r
+
+
+def test_heal_from_a_route_walks_to_the_next_town():
+    """ROUTE 101 to OLDALE TOWN's center: a map edge, a door, and wild grass on the way
+    (a wild battle there is run from)."""
+    s = server()
+    s.load(ROUTE101)
+    _write(s, 16, PARTY + 0x56, 5)  # RAM: the starter at 5 HP
+    r = s.call("mcp_heal_at_pokecenter", {})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True, r
+    assert "OLDALE TOWN POKEMON CENTER 1F" in r["summary"], r["summary"]
+    lead = _party(s)[0]
+    assert lead.current_hp == lead.max_hp, lead
 
 
 # -- run_from_battle ----------------------------------------------------------

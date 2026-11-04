@@ -6,6 +6,7 @@ Fixed Pokemon Emerald server - headless FastAPI server
 # Standard library imports
 import asyncio
 import base64
+import contextlib
 import datetime
 import glob
 import io
@@ -195,6 +196,64 @@ _start_wait_frames = 0
 _pending_before_snapshot = None
 # The last BLOCKED press; an identical press from the same tile is refused, not run.
 last_blocked_press: Optional[Dict[str, Any]] = None
+# Macro waits in progress (battle play-outs, menu waits, train). The game loop runs at
+# TURBO_FPS while any is open: between presses nothing is queued, so battle animations
+# and text played at GAME_FPS while a macro (and the model behind it) only waited on
+# them. Every such wait is a frame budget, so turbo doesn't shorten it in game time.
+_turbo_macros = 0
+
+
+@contextlib.contextmanager
+def _turbo():
+    global _turbo_macros
+    _turbo_macros += 1
+    try:
+        yield
+    finally:
+        _turbo_macros -= 1
+
+
+# Battle messages as the game loop saw them, one entry per message: (frame number, text).
+# The play-out used to sample the message window from the event loop every 30 ms; at
+# turbo speed a message that doesn't wait for A ("Go! TORCHIC!") prints and is replaced
+# between two samples (seen in test_battle_flow's auto-advance test once macro waits ran
+# at turbo), so the game loop records each one as it prints.
+battle_message_log: "deque" = None  # created on first use (collections.deque, maxlen 64)
+_frames_run = 0
+_last_battle_message_raw = b""
+
+
+def _record_battle_message() -> None:
+    """Called under memory_lock after every emulated frame; cheap outside battle text."""
+    global battle_message_log, _frames_run, _last_battle_message_raw
+    _frames_run += 1
+    if game_type != "emerald" or env is None or getattr(env, "memory_reader", None) is None:
+        return
+    try:
+        from server import menu_state as ms
+
+        reader = env.memory_reader
+        if not reader._read_u8(ms.S_TEXT_PRINTERS + ms.B_WIN_MSG * ms.TEXT_PRINTER_SIZE + 0x1B):
+            return  # the battle message window isn't printing
+        from server.field_control import G_MAIN_IN_BATTLE_BYTE, IN_BATTLE_MASK
+
+        if not reader._read_u8(G_MAIN_IN_BATTLE_BYTE) & IN_BATTLE_MASK:
+            return
+        raw = bytes(reader._read_bytes(ms.G_DISPLAYED_STRING_BATTLE, ms.DISPLAYED_STRING_BATTLE_SIZE))
+        if raw == _last_battle_message_raw:
+            return
+        _last_battle_message_raw = raw
+        if battle_message_log is None:
+            from collections import deque
+
+            battle_message_log = deque(maxlen=64)
+        battle_message_log.append((_frames_run, ms.battle_text(reader)))
+    except Exception as e:  # a missed quote must never stop the game loop
+        logger.debug(f"battle message record failed: {e}")
+
+
+def _battle_messages_since(frame: int) -> List[Tuple[int, str]]:
+    return [(at, text) for at, text in list(battle_message_log or ()) if at > frame and text]
 
 # Video recording state
 video_writer = None
@@ -687,6 +746,7 @@ def step_environment(actions_pressed):
     with memory_lock:
         env.run_frame_with_buttons(actions_pressed)
         last_frame_monotonic = time.monotonic()
+        _record_battle_message()
 
         # Do lightweight area transition detection inside the lock
         if hasattr(env, "memory_reader") and env.memory_reader:
@@ -1033,6 +1093,8 @@ def _judge_move(check: Dict[str, Any], after) -> None:
         if report is not None:
             report["blocked"] = message
             report["skipped"] = skipped
+            if occupied:
+                report["blocked_by_person"] = (tx, ty)
         logger.info(f"🧱 {message}")
     elif not skipped:
         # The interruption came with the last press: nothing was skipped, but say why
@@ -1219,7 +1281,10 @@ def game_loop(manual_mode=False):
 
         # Turbo while the harness is executing presses (queue, held button, release
         # delay, or a direction press waiting to settle); normal speed while idle.
-        busy = bool(action_queue) or current_action is not None or release_frames_remaining > 0 or _move_check is not None
+        busy = (
+            bool(action_queue) or current_action is not None or release_frames_remaining > 0
+            or _move_check is not None or _turbo_macros > 0
+        )
         target_fps = TURBO_FPS if busy else GAME_FPS
         if target_fps <= 0:
             next_frame_deadline = time.monotonic()
@@ -2956,6 +3021,9 @@ _SYSTEM_FLAGS = 0x860
 _CONDITION_FLAGS = {
     "pokedex_received": (_SYSTEM_FLAGS + 0x1, "the POKéDEX"),  # FLAG_SYS_POKEDEX_GET
     "pokenav_received": (_SYSTEM_FLAGS + 0x2, "the POKéNAV"),  # FLAG_SYS_POKENAV_GET
+    # Seen live: the theft happened while David played the gym exit himself; the AI then
+    # sat on "Exit Gym - Devon Researcher reports theft" with nothing left to trigger.
+    "theft_event_triggered": (0x8E, "seen the DEVON GOODS being stolen"),  # FLAG_DEVON_GOODS_STOLEN
     "running_shoes_received": (_SYSTEM_FLAGS + 0x60, "the RUNNING SHOES"),  # FLAG_SYS_B_DASH
     "stone_badge_obtained": (_SYSTEM_FLAGS + 0x7, "the STONE BADGE"),  # FLAG_BADGE01_GET ...
     "knuckle_badge_obtained": (_SYSTEM_FLAGS + 0x8, "the KNUCKLE BADGE"),
@@ -2965,6 +3033,82 @@ _CONDITION_FLAGS = {
     "feather_badge_obtained": (_SYSTEM_FLAGS + 0xC, "the FEATHER BADGE"),
     "mind_badge_obtained": (_SYSTEM_FLAGS + 0xD, "the MIND BADGE"),
     "rain_badge_obtained": (_SYSTEM_FLAGS + 0xE, "the RAIN BADGE"),
+    # Story scenes, each read from the map script that plays it (pret/pokeemerald
+    # data/maps/<Map>/scripts.inc). None of these flags is ever cleared. Where a step
+    # names part of a scene, the flag is the one its script sets at the end of that scene.
+    "steven_found_granite": (0xBD, "found Steven and given him the LETTER"),  # FLAG_DELIVERED_STEVEN_LETTER
+    "letter_delivered": (0xBD, "given Steven the LETTER"),  # GraniteCave_StevensRoom
+    # The towns' map scripts set these on arrival, and at this point of the story Mr.
+    # Briney's boat is the only way there (it lands at Slateport's beach on Route 109).
+    "sailed_to_dewford": (_SYSTEM_FLAGS + 0x11, "arrived in DEWFORD TOWN"),  # FLAG_VISITED_DEWFORD_TOWN
+    "sailed_to_slateport": (_SYSTEM_FLAGS + 0x17, "arrived in SLATEPORT CITY"),  # FLAG_VISITED_SLATEPORT_CITY
+    "shipyard_checked": (0x94, "talked to Dock at the Shipyard"),  # FLAG_DOCK_REJECTED_DEVON_GOODS
+    # SlateportCity_OceanicMuseum_2F: grunts, Archie's warning, then the DEVON GOODS handed
+    # to Stern, all one scene that ends with this flag; it needs the museum to be entered.
+    "museum_entered": (0x95, "been through the Oceanic Museum"),  # FLAG_DELIVERED_DEVON_GOODS
+    "archie_first_encounter": (0x95, "met Archie in the Oceanic Museum"),
+    "goods_delivered": (0x95, "delivered the DEVON GOODS to Captain Stern"),
+    "meteor_falls_event_witnessed": (0xCF, "seen Archie and Maxie at Meteor Falls"),  # FLAG_MET_ARCHIE_METEOR_FALLS
+    # MtChimney: set after the Maxie battle once Archie has thanked you and left.
+    "archie_chimney_fled": (0x8B, "seen Team Magma and Archie leave Mt. Chimney"),  # FLAG_DEFEATED_EVIL_TEAM_MT_CHIMNEY
+    "wynaut_egg_received": (0x10A, "the EGG from the Lavaridge hot springs"),  # FLAG_RECEIVED_LAVARIDGE_EGG
+    "castform_received": (0x97, "CASTFORM"),  # FLAG_RECEIVED_CASTFORM
+    # Route120: Steven reveals the Kecleon, you battle it, and he then hands over the
+    # DEVON SCOPE whatever the battle's outcome (won, ran or caught).
+    "steven_route120_found": (0x11D, "found Steven and got the DEVON SCOPE"),  # FLAG_RECEIVED_DEVON_SCOPE
+    "kecleon_route120_battled": (0x11D, "battled the Kecleon and got the DEVON SCOPE"),
+    "gym_kecleon_cleared": (0x127, "used the DEVON SCOPE on the Kecleon at the Gym"),  # FLAG_KECLEON_FLED_FORTREE
+    "submarine_escape_witnessed": (0x70, "seen Team Aqua's submarine leave"),  # FLAG_TEAM_AQUA_ESCAPED_IN_SUBMARINE
+    # SeafloorCavern_Room9: Archie wakes Kyogre, it escapes, Maxie arrives and Archie
+    # admits his mistake; the flag closes that scene.
+    "kyogre_awakened": (0x81, "seen Kyogre awaken"),  # FLAG_KYOGRE_ESCAPED_SEAFLOOR_CAVERN
+    "archie_regret_witnessed": (0x81, "seen Archie admit his mistake"),
+    "steven_wallace_found": (0x133, "been led to the Cave of Origin by Steven"),  # FLAG_STEVEN_GUIDES_TO_CAVE_OF_ORIGIN
+    "sky_pillar_quest_received": (0x137, "been told by Wallace to go to Sky Pillar"),  # FLAG_WALLACE_GOES_TO_SKY_PILLAR
+    "crisis_resolved": (0x9E, "talked to Archie and Maxie after Rayquaza"),  # FLAG_SOOTOPOLIS_ARCHIE_MAXIE_LEAVE
+    # SootopolisCity: Wallace's thanks and HM07 are one conversation.
+    "wallace_thanks": (0x138, "been thanked by Wallace and given HM07"),  # FLAG_RECEIVED_HM_WATERFALL
+    "elite_four_entered": (0x107, "passed the League guards"),  # FLAG_ENTERED_ELITE_FOUR
+    "hall_of_fame_entered": (_SYSTEM_FLAGS + 0x4, "entered the Hall of Fame"),  # FLAG_SYS_GAME_CLEAR
+    # Battling objectives.
+    "master_ball_found": (0x464, "picked up the MASTER BALL"),  # FLAG_ITEM_AQUA_HIDEOUT_B1F_MASTER_BALL
+    "steven_postgame_defeated": (0x4F8, "beaten Steven at Meteor Falls"),  # FLAG_DEFEATED_METEOR_FALLS_STEVEN
+}
+
+# Story scenes the game records as a progress var (pret/pokeemerald include/constants/
+# vars.h) that only moves forward: (var id, value the scene's script sets, what you did).
+# Met when the var has reached that value.
+_CONDITION_VARS = {
+    # RustboroCity_DevonCorp_3F: set after Mr. Stone's talk and the POKéNAV.
+    "mr_stone_met": (0x408F, 1, "met Mr. Stone"),  # VAR_DEVON_CORP_3F_STATE
+    # MtPyre_Summit: set once Archie leaves with the BLUE ORB, before the MAGMA EMBLEM.
+    "blue_orb_stolen_learned": (0x40B9, 1, "seen Team Aqua take the BLUE ORB"),  # VAR_MT_PYRE_STATE
+    # MossdeepCity_SpaceCenter_2F: 1 when the attack starts (after the Mind Badge), 2
+    # after the three grunts upstairs, 3 after Maxie and Tabitha give up. The Maxie and
+    # Tabitha fight is a DoSpecialTrainerBattle with Steven, which ends in
+    # HandleSpecialTrainerBattleEnd (src/battle_tower.c) and never sets trainer flags, so
+    # this var is the only record of that win.
+    "space_center_attack_triggered": (0x409F, 2, "reached the Space Center and fought Team Magma"),
+    "space_center_magma_defeated": (0x409F, 2, "beaten the Team Magma grunts in the Space Center"),
+    "maxie_tabitha_defeated": (0x409F, 3, "beaten Maxie and Tabitha"),  # VAR_MOSSDEEP_SPACE_CENTER_STATE
+    "magma_space_retreat": (0x409F, 3, "seen Team Magma give up"),
+    # VAR_SOOTOPOLIS_CITY_STATE: 1 Kyogre escaped, 2 the legendaries' fight seen from the
+    # city, 3 Wallace sends you to Sky Pillar, 4 its door opened, 5 Rayquaza woken
+    # (SkyPillar_Top), 6 Juan beaten.
+    "legendary_battle_witnessed": (0x405E, 2, "seen Kyogre and Groudon fight"),
+    "rayquaza_awakened": (0x405E, 5, "woken Rayquaza"),
+    # SootopolisCity: 1 at Rayquaza's waking, then 2 or 3 once it has calmed the city.
+    "rayquaza_intervention_witnessed": (0x40CA, 2, "seen Rayquaza stop Kyogre and Groudon"),  # VAR_SKY_PILLAR_STATE
+}
+
+# "Teach <HM move>" objectives: met when a party Pokémon knows the move (names as the
+# party reader spells them, pokemon_env/memory_reader.py _read_pokemon_moves_from_decrypted).
+_CONDITION_MOVES = {
+    "rock_smash_taught": "Rock Smash",
+    "surf_taught": "Surf",
+    "fly_taught": "Fly",
+    "dive_taught": "Dive",
+    "waterfall_taught": "Waterfall",
 }
 
 # Objectives about being given an item: met when the bag holds it (names as the bag reader
@@ -2998,13 +3142,16 @@ _CONDITION_TRAINERS = {
     "rival_battle_1_won": ("any", _RIVAL_103, "your rival on Route 103"),
     "aqua_grunt_woods_defeated": ("any", (10,), "the Team Aqua Grunt in Petalburg Woods"),
     "aqua_grunt_tunnel_defeated": ("any", (16,), "the Team Aqua Grunt in Rusturf Tunnel"),
+    # SlateportCity_OceanicMuseum_2F fights both, back to back, in one scene.
+    "museum_grunts_defeated": ("all", (20, 21), "the two Team Aqua Grunts in the Oceanic Museum"),
     "rival_battle_2_won": ("any", _RIVAL_110, "your rival on Route 110"),
     "wally_mauville_defeated": ("any", (656,), "Wally in Mauville"),
     "maxie_chimney_defeated": ("any", (602,), "Maxie on Mt. Chimney"),
     "shelly_defeated": ("any", (32,), "Shelly in the Weather Institute"),
     "rival_battle_3_won": ("any", _RIVAL_119, "your rival on Route 119"),
     "matt_hideout_defeated": ("any", (30,), "Matt in the Aqua Hideout"),
-    "maxie_tabitha_defeated": ("all", (734, 514), "Maxie and Tabitha in the Space Center"),
+    # maxie_tabitha_defeated is in _CONDITION_VARS: that battle sets no trainer flag.
+    "archie_found_seafloor": ("any", (34,), "Archie in the Seafloor Cavern"),  # found him, then fought him
     "archie_defeated_seafloor": ("any", (34,), "Archie in the Seafloor Cavern"),
     "wally_victory_road_defeated": ("any", (519, 657, 658, 659, 660), "Wally in Victory Road"),
     "sidney_defeated": ("any", (261,), "Sidney"),
@@ -3013,6 +3160,239 @@ _CONDITION_TRAINERS = {
     "drake_defeated": ("any", (264,), "Drake"),
     "champion_wallace_defeated": ("any", (335,), "Wallace"),
 }
+
+
+def _set_grass_cost_for(guidance: Dict[str, Any]) -> None:
+    """Walk through tall grass while a training objective is current; go around it otherwise.
+
+    Travelling, a wild battle costs about a minute of model time, so routes avoid grass
+    (utils/mapping/pathfinding.py). Training, those battles are the point (David,
+    2026-11-03: "make sure it doesn't avoid tall grass now. I want it to battle pokemon").
+    A training objective is a story objective whose condition is a level goal not yet met.
+    """
+    from server import game_tools
+    from utils.mapping.pathfinding import GRASS_TILE_COST_MULTIPLIER
+
+    story = guidance.get("story") or {}
+    condition = str(story.get("completion_condition") or "")
+    training = condition.startswith(("level_", "lead_level_")) and "ALREADY TRUE" not in condition
+    game_tools.pathfinder.grass_cost = 1.0 if training else GRASS_TILE_COST_MULTIPLIER
+
+
+def _trainee_advantage(view: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The move the Pokémon in battle (the trainee) can win with itself, or None to switch.
+
+    David (2026-11-03): "You don't need to switch train when the other pokemon is weak
+    against shroomish", and later: "I don't think we absolutely need to use combusken to
+    fight every time. The pokemon are strong enough to fight on their own." The trainee
+    fights on its own when all of these hold: its best move with PP left (the battle
+    view's best_move) is not resisted (≥1x); none of the foe's types is super-effective
+    against the trainee's types (ROM type chart); the foe is at most 2 levels above it;
+    and it is above half HP. Anything else brings the partner in.
+    """
+    player, target, best = view.get("player"), view.get("target"), view.get("best_move")
+    if not player or not target or not best or best["effectiveness"] < 1:
+        return None
+    if not player["max_hp"] or player["hp"] * 2 <= player["max_hp"]:
+        return None
+    if target.get("level", 0) > player.get("level", 0) + 2:
+        return None
+    with memory_lock:
+        reader = env.memory_reader
+        threat = max(reader.type_effectiveness(t, player["type_ids"]) for t in dict.fromkeys(target["type_ids"]))
+    return best if threat < 2 else None
+
+
+def _switch_train_line(guidance: Dict[str, Any]) -> str:
+    """Top-of-state line: switch the Pokémon being trained out on its first turn.
+
+    Switch-training (David, 2026-11-03): the trainee leads, a stronger partner comes in
+    on turn 1 and wins, and both share the EXP. Seen live: the model attacked with the
+    Lv6 SHROOMISH first ("Best move now" in the battle view) and switched only after it
+    had taken damage. The trainee is the species in the story objective's unmet
+    level_<species>_<n> condition; the partner is the highest-level teammate above half HP.
+
+    Outside a battle the line names train(), which does all of it on its own: David
+    (2026-11-03) "It sits for a while after the battle is over" — each battle cost about
+    three ~30 s decisions (walk into the grass, switch, attack). Nothing is said while
+    the team is weak: the heal-first line is the one to follow then.
+    """
+    story = guidance.get("story") or {}
+    condition = str(story.get("completion_condition") or "")
+    if not condition.startswith("level_") or "ALREADY TRUE" in condition:
+        return ""
+    species, _, level = condition.split(":")[0][len("level_"):].rpartition("_")
+    trainee = species.upper()
+    with memory_lock:
+        if not env.memory_reader.is_in_battle():
+            party = env.memory_reader.read_party_pokemon() or []
+            names = [str(p.species_name).upper() for p in party if not p.is_egg]
+            if not level.isdigit() or trainee not in names or all(n == trainee for n in names):
+                return ""  # nothing to train, or no teammate to fight for it
+            if env.memory_reader.read_team_condition()["weak"]:
+                return ""
+            return (
+                f'TRAINING: call train("{trainee}", until_level={int(level)}) now. It walks into the tall '
+                f"grass and fights wild Pokémon with your strongest teammate while {trainee} shares the "
+                "EXP, and answers when it is done or something needs you."
+            )
+        view = env.memory_reader.read_battle_view() or {}
+        party = env.memory_reader.read_party_pokemon() or []
+    active = str((view.get("player") or {}).get("name", "")).upper()
+    if active != trainee:
+        return ""
+    move = _trainee_advantage(view)
+    if move is not None:
+        foe = str(view["target"]["name"]).upper()
+        return (
+            f"{trainee} can beat {foe} on its own ({move['name']} {move['effectiveness']:g}x, no threat to it): "
+            f'fight with use_move("{move["name"]}") — no switch needed.'
+        )
+    partners = [
+        p for p in party
+        if str(p.species_name).upper() != trainee and p.max_hp and p.current_hp * 2 > p.max_hp
+    ]
+    if not partners:
+        return ""
+    partner = max(partners, key=lambda p: p.level)
+    name = str(partner.species_name).upper()
+    return (
+        f'SWITCH-TRAINING: {trainee} is being trained and must not fight. Call '
+        f'switch_pokemon("{name}") now; {trainee} still shares the EXP. Then win with {name}. '
+        f"Ignore the 'Best move' line below until {name} is out."
+    )
+
+
+def _catch_target_line(guidance: Dict[str, Any]) -> str:
+    """A top-of-state line when the wild Pokémon in battle is the one an objective wants caught.
+
+    The battle view ends with "Best move now: … call use_move(…)", which a small model
+    follows. Against the Shroomish it was sent to catch (David, 2026-11-03), any attack
+    from Combusken would knock it out, so this line overrides it.
+    """
+    wanted = _catch_wanted(guidance)
+    if not wanted:
+        return ""
+    with memory_lock:
+        if not env.memory_reader.is_in_battle():
+            return ""
+        view = env.memory_reader.read_battle_view() or {}
+    if view.get("is_trainer"):
+        return ""
+    for foe in view.get("opponents") or []:
+        name = str(foe.get("name", "")).upper()
+        if name not in wanted:
+            continue
+        if foe.get("level", 0) < wanted[name]:
+            # "Catch a level 10+ Sableye" (David, 2026-11-03): a lower one isn't it.
+            return (
+                f"NOT THIS ONE: this wild {name} is Lv{foe.get('level')}, below the Lv{wanted[name]} "
+                f"your objective wants. Call run_from_battle and look for another."
+            )
+        return f"CATCH THIS ONE: the wild {name} Lv{foe.get('level')} in front of you is the Pokémon your objective wants. " + _catch_plan(view, foe)
+    return ""
+
+
+# Moves that put the foe to sleep (x2 catch rate) or paralyze it (x1.5) without hurting
+# it, as the battle view names them (pokemon_env Move enum, "_" -> " ").
+_CATCH_HELPER_MOVES = (
+    "SPORE", "SLEEP POWDER", "HYPNOSIS", "LOVELY KISS", "SING", "GRASS WHISTLE",
+    "STUN SPORE", "THUNDER WAVE", "GLARE",
+)
+
+
+def _catch_wanted(guidance: Dict[str, Any]) -> Dict[str, int]:
+    """Species an open objective wants caught, with the lowest level that counts.
+
+    "party_has_<species>" wants any level; "level_<species>_<n>" with no such species in
+    the party yet wants one caught at Lv<n> or more ("catch a level 10+ Sableye").
+    """
+    entries = [guidance.get("story"), *(guidance.get("battling_group") or [])]
+    wanted: Dict[str, int] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        text = str(e.get("completion_condition", ""))
+        if "ALREADY TRUE" in text:
+            continue
+        condition = text.split(":")[0]
+        if condition.startswith("party_has_"):
+            wanted[condition[len("party_has_"):].upper()] = 1
+        elif condition.startswith("level_"):
+            species, _, level = condition[len("level_"):].rpartition("_")
+            check = _party_condition(condition)
+            if species and level.isdigit() and check is not None and check[1].startswith("no "):
+                wanted[species.upper()] = int(level)
+    return wanted
+
+
+def _catch_plan(view: Dict[str, Any], foe: Dict[str, Any]) -> str:
+    """What to do this turn to catch the foe: a sleep/paralysis move first if one is at
+    hand, then the best ball in the bag. A full-HP Sableye (catch rate 45) breaks out of
+    about 94% of POKé BALLs; paralyzed and in a GREAT BALL it is about 1 in 7."""
+    helper = None
+    if str(foe.get("status", "OK")).upper() in ("OK", "NONE", ""):
+        helper = next(
+            (m["name"] for m in view.get("moves") or [] if m.get("name") in _CATCH_HELPER_MOVES and m.get("pp")), None
+        )
+    with memory_lock:
+        pockets = env.memory_reader.read_full_inventory() or {}
+    have = {i.get("name"): i.get("quantity", 0) for pocket in pockets.values() for i in (pocket or [])}
+    ball = next((b for b in ("Ultra Ball", "Great Ball", "Poke Ball") if have.get(b)), "Poke Ball")
+    first = (
+        f'First call use_move("{helper}"): a sleeping or paralyzed Pokémon is much easier to catch. Then '
+        if helper else "Call "
+    )
+    return (
+        f"Do NOT use damaging moves (you could knock it out). {first}throw_ball(\"{ball}\") and keep "
+        "throwing if it breaks free. Ignore the 'Best move' line below."
+    )
+
+
+def _party_condition(condition: str) -> Optional[Tuple[bool, str]]:
+    """(met, detail) for "party_has_<species>" / "level_<species>_<n>", else None.
+
+    Species names are compared case-insensitively against the party read from memory.
+    The walkthrough's "Heal at <town> Pokemon Center" steps (healed_dewford,
+    rustboro_heal_done, final_heal_done, elite_four_final_heal ...) are the same check:
+    the game keeps no record of where the team was healed, and a team at full HP is what
+    each of them is for.
+    """
+    healing = condition.startswith("healed_") or condition.endswith(("_heal_done", "_final_heal"))
+    if condition == "party_healed" or healing:
+        # "Go back to the pokemon center, heal the pokemon" (David, 2026-11-03).
+        with memory_lock:
+            party = env.memory_reader.read_party_pokemon() or []
+        hurt = [
+            f"{p.species_name} {p.current_hp}/{p.max_hp}" for p in party
+            if p.current_hp < p.max_hp or (getattr(p, "status", None) and p.status.get_status_name() not in ("OK", "Normal", "None"))
+        ]
+        return (bool(party) and not hurt, "everyone at full HP" if not hurt else "still hurt: " + ", ".join(hurt))
+    if condition.startswith("party_has_"):
+        species, level = condition[len("party_has_"):], None
+    elif condition.startswith("level_"):
+        species, _, level = condition[len("level_"):].rpartition("_")
+        if not species or not level.isdigit():
+            return None
+        level = int(level)
+    else:
+        return None
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    names = [str(getattr(p, "species_name", "")).upper() for p in party]
+    wanted = species.upper()
+    # "Train SHROOMISH to Lv23" is still about it once it is a BRELOOM.
+    with memory_lock:
+        family = env.memory_reader.species_family(wanted)
+    matching = [(p, n) for p, n in zip(party, names) if n in family]
+    team = ", ".join(f"{n} Lv{p.level}" for p, n in zip(party, names)) or "empty party"
+    if level is None:
+        return (bool(matching), f"party: {team}")
+    if not matching:
+        return (False, f"no {wanted} in the party yet; party: {team}")
+    best, now = max(((p.level, n) for p, n in matching), key=lambda t: t[0])
+    called = wanted if now == wanted else f"{wanted} (now {now})"
+    return (best >= level, f"{called} is Lv{best} of {level} needed")
 
 
 def _note_way_to_story_target(guidance: Dict[str, Any]) -> None:
@@ -3032,7 +3412,54 @@ def _note_way_to_story_target(guidance: Dict[str, Any]) -> None:
         _location_name(), (snap.x, snap.y) if snap is not None else None, story["target_location"]
     )
     if way:
+        # One call walks it all (mcp_go_to); the way stays so the model knows the route.
+        way += f' Or go_to("{story["target_location"]}") walks the whole way in one call.'
         story["navigation_hint"] = f"{way} {story.get('navigation_hint') or ''}".strip()
+
+
+def _team_weak_line(condition: Dict[str, Any], location: str, position: Optional[Tuple[int, int]]) -> str:
+    """'TEAM IS WEAK (TORCHIC 15/35 HP): heal before any trainer — <where to heal>'."""
+    from server import game_tools
+
+    head = f"TEAM IS WEAK ({', '.join(condition['reasons'])}): heal before any trainer — "
+    way = game_tools.way_to_pokemon_center(location, position)
+    if not way:
+        return head + f"you are inside {location}: call heal_at_pokecenter() now."
+    route = game_tools.pokemon_center_route(location, position)
+    if not route:
+        return head + way  # none reachable on foot: the note says so
+    # Seen live: the model was given the way and an exit to take, and never walked it.
+    # heal_at_pokecenter makes the trip itself (_walk_to_pokemon_center).
+    return head + f"call heal_at_pokecenter() now: it walks to {route[-1][1]} and heals."
+
+
+def _note_team_condition(guidance: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Put a heal-first line at the front of the story objective while the team is weak.
+
+    Seen live in Rustboro Gym: the model walked from one trainer to the next with a
+    worn-down Torchic. David: "It should go to the pokemon center between trainers if
+    the HP or PP are low". The story objective's navigation hint is the line the model
+    follows best, so the instruction goes first there; on a battle objective the
+    description itself starts with it too. Nothing is said in a battle (the battle
+    section shows HP and PP). Returns the line, or None when the team is fine.
+    """
+    if env is None or getattr(env, "memory_reader", None) is None:
+        return None
+    with memory_lock:
+        reader = env.memory_reader
+        if reader.is_in_battle():
+            return None
+        condition = reader.read_team_condition()
+    if not condition["weak"]:
+        return None
+    snap = _field_snapshot()
+    line = _team_weak_line(condition, _location_name(), (snap.x, snap.y) if snap is not None else None)
+    story = guidance.get("story") if isinstance(guidance, dict) else None
+    if isinstance(story, dict):
+        story["navigation_hint"] = f"{line} {story.get('navigation_hint') or ''}".strip()
+        if story.get("action_type") == "battle":
+            story["description"] = f"HEAL FIRST (team is weak), then: {story.get('description') or ''}".strip()
+    return line
 
 
 def _note_conditions_met_in_memory(guidance: Dict[str, Any]) -> None:
@@ -3085,6 +3512,76 @@ def _note_conditions_met_in_memory(guidance: Dict[str, Any]) -> None:
                     f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
                 )
             continue
+        progress = _CONDITION_VARS.get(condition)
+        if progress:
+            # Seen live: the agent sat on story steps whose scene had already played out
+            # in auto-advanced dialogue; scenes that record a var instead of a flag.
+            var, reached, did = progress
+            with memory_lock:
+                value = env.memory_reader.read_game_var(var)
+            if value is not None and value >= reached:
+                entry["completion_condition"] = (
+                    f"{condition}: ALREADY TRUE in game memory (you have {did}). Call "
+                    f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                )
+            continue
+        move = _CONDITION_MOVES.get(condition)
+        if move:
+            with memory_lock:
+                party = env.memory_reader.read_party_pokemon() or []
+            knows = [str(p.species_name).upper() for p in party if move.upper() in (m.upper() for m in p.moves)]
+            if knows:
+                entry["completion_condition"] = (
+                    f"{condition}: ALREADY TRUE in game memory ({knows[0]} knows {move.upper()}). Call "
+                    f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                )
+            continue
+        party_check = _party_condition(condition)
+        if party_check is not None:
+            # Team-building steps (David, 2026-11-03, after a whiteout to Roxanne: "we need
+            # more pokemon"): "party_has_shroomish", "level_shroomish_12".
+            met, detail = party_check
+            entry["completion_condition"] = (
+                f"{condition}: ALREADY TRUE in game memory ({detail}). Call "
+                f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                if met else f"{condition}: not yet ({detail})."
+            )
+            species, _, level = condition[len("level_"):].rpartition("_")
+            if not met and condition.startswith("level_") and not detail.startswith("no "):
+                # The one call that does the grinding (see mcp_train).
+                entry["completion_condition"] += (
+                    f' Outside a battle, call train("{species.upper()}", until_level={level}).'
+                )
+            elif not met and condition.startswith("level_") and species and level.isdigit():
+                # None in the party: catch one at that level ("a level 10+ Sableye", David).
+                # train walks the encounter tiles and stops when one appears.
+                with memory_lock:
+                    party = env.memory_reader.read_party_pokemon() or []
+                if party:
+                    lead = str(party[0].species_name).upper()
+                    entry["completion_condition"] += (
+                        f" Catch one at Lv{level} or higher: where it lives, outside a battle, call "
+                        f'train("{lead}", catch="{species.upper()}", catch_min_level={level}).'
+                    )
+            continue
+        if condition.startswith("lead_level_") and condition[len("lead_level_"):].isdigit():
+            # "Train TORCHIC to Lv16" (David, 2026-11-03): ground truth is the party's level.
+            wanted = int(condition[len("lead_level_"):])
+            with memory_lock:
+                party = env.memory_reader.read_party_pokemon() or []
+            if party:
+                lead = party[0]
+                name = getattr(lead, "nickname", None) or getattr(lead, "species_name", "your lead")
+                if lead.level >= wanted:
+                    entry["completion_condition"] = (
+                        f"{condition}: ALREADY TRUE in game memory ({name} is Lv{lead.level}). Call "
+                        f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                    )
+                else:
+                    entry["completion_condition"] = (
+                        f"{condition}: not yet ({name} is Lv{lead.level} of {wanted} needed)."
+                    )
+            continue
         items = _CONDITION_ITEMS.get(condition)
         if items:
             # Seen live: "Receive Great Ball from Devon Researcher" stayed open with the
@@ -3105,6 +3602,22 @@ def _note_conditions_met_in_memory(guidance: Dict[str, Any]) -> None:
         about_place = condition.endswith(("_reached", "_entered")) or condition.startswith(("returned_", "in_"))
         if entry.get("action_type") != "navigate" or not about_place or not entry.get("target_location"):
             continue
+        # "_reached"/"_entered" steps are first arrivals in story order, so the game's
+        # own first-visit flag answers them after the player has moved on; "returned_"
+        # steps revisit places already flagged, so they still need the map name.
+        visit_flag = None
+        if condition.endswith(("_reached", "_entered")):
+            visit_flag = game_tools.first_visit_flag(entry["target_location"])
+        if visit_flag is not None:
+            with memory_lock:
+                been = env.memory_reader._is_event_flag_set(visit_flag)
+            if been:
+                entry["completion_condition"] = (
+                    f"{condition}: ALREADY TRUE in game memory (you have been to "
+                    f"{entry['target_location']}). Call "
+                    f'complete_direct_objective(objective_id="{entry.get("id")}") now.'
+                )
+                continue
         if place is None:
             snap = _field_snapshot()
             place = (_location_name(), (snap.x, snap.y) if snap is not None else None)
@@ -3453,6 +3966,7 @@ async def mcp_get_game_state():
         )
 
         # Add direct objectives information
+        team_line_placed = False
         if result.get("success", False):
             global direct_objectives_manager, current_run_dir
 
@@ -3516,6 +4030,21 @@ async def mcp_get_game_state():
                             _note_way_to_story_target(categorized_guidance)
                         except Exception as e:
                             logger.warning(f"objective route hint failed: {e}")
+                        try:
+                            _set_grass_cost_for(categorized_guidance)
+                        except Exception as e:
+                            logger.warning(f"grass cost update failed: {e}")
+                        try:
+                            # After the route hint, so the heal line comes first.
+                            team_line_placed = bool(_note_team_condition(categorized_guidance))
+                        except Exception as e:
+                            logger.warning(f"team condition check failed: {e}")
+                        try:
+                            catch_line = _catch_target_line(categorized_guidance) or _switch_train_line(categorized_guidance)
+                            if catch_line and isinstance(result.get("state_text"), str):
+                                result["state_text"] = f"{catch_line}\n\n{result['state_text']}"
+                        except Exception as e:
+                            logger.warning(f"catch target check failed: {e}")
                         result["categorized_objectives"] = categorized_guidance
 
                     # Add categorized status
@@ -3541,6 +4070,11 @@ async def mcp_get_game_state():
                     result["objectives_mode"] = "legacy"
 
                     current_guidance = direct_objectives_manager.get_current_objective_guidance(game_state)
+                    if isinstance(current_guidance, dict):
+                        try:
+                            team_line_placed = bool(_note_team_condition({"story": current_guidance}))
+                        except Exception as e:
+                            logger.warning(f"team condition check failed: {e}")
                     if current_guidance:
                         result["direct_objective"] = current_guidance
                         result["direct_objective_status"] = direct_objectives_manager.get_sequence_status()
@@ -3549,6 +4083,15 @@ async def mcp_get_game_state():
                     objective_context = direct_objectives_manager.get_objective_context(game_state)
                     if objective_context:
                         result["direct_objective_context"] = objective_context
+
+        if result.get("success", False) and not team_line_placed and isinstance(result.get("state_text"), str):
+            # No objective to carry the heal-first line: put it at the top of the state.
+            try:
+                line = _note_team_condition(None)
+                if line:
+                    result["state_text"] = f"{line}\n\n{result['state_text']}"
+            except Exception as e:
+                logger.warning(f"team condition check failed: {e}")
 
         # Ensure all data is JSON-serializable (objectives data may contain enums/numpy types)
         from utils.json_utils import serialize_for_json
@@ -3901,27 +4444,41 @@ async def mcp_go_to_exit(request: dict):
         if refused:
             return refused
 
-        def _plan():
-            with memory_lock:
-                return game_tools.plan_exit_route(env, exit_query)
+        # Seen live (2026-11-03): a person stood at (38,10) on Route 116; every
+        # go_to_exit("west") planned through that tile, was blocked there, and the next
+        # call planned the same path again. The planner knows only where people stood
+        # when the map loaded, so a walk stopped by a person is replanned around the
+        # tile they are on now (up to two more tries).
+        avoid: List[Tuple[int, int]] = []
+        first_from = None
+        for _attempt in range(3):
+            def _plan():
+                with memory_lock:
+                    return game_tools.plan_exit_route(env, exit_query, avoid=tuple(avoid))
 
-        plan = await run_in_threadpool(_plan)
-        if not plan.get("success"):
-            plan.setdefault("summary", plan.get("error", "go_to_exit failed"))
-            return plan
+            plan = await run_in_threadpool(_plan)
+            if not plan.get("success"):
+                plan.setdefault("summary", plan.get("error", "go_to_exit failed"))
+                return plan
 
-        before = _field_snapshot()
-        from_text = _position_text(before)
-        buttons = list(plan["buttons"])
-        if plan["kind"] == "edge":
-            buttons.append(plan["final_button"])
-        report = None
-        if buttons:
-            queued = await take_action(
-                ActionRequest(buttons=buttons, source="go_to_exit", metadata={"exit": plan["label"]}, check_movement=True)
-            )
-            report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
-        snap = await _await_map_change(before.map_id, 4.0 if plan["kind"] == "warp" else 1.5)
+            before = _field_snapshot()
+            if first_from is None:
+                first_from = _position_text(before)
+            buttons = list(plan["buttons"])
+            if plan["kind"] == "edge":
+                buttons.append(plan["final_button"])
+            report = None
+            if buttons:
+                queued = await take_action(
+                    ActionRequest(buttons=buttons, source="go_to_exit", metadata={"exit": plan["label"]}, check_movement=True)
+                )
+                report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+            snap = await _await_map_change(before.map_id, 4.0 if plan["kind"] == "warp" else 1.5)
+            person = (report or {}).get("blocked_by_person")
+            if not person or snap is None or snap.map_id != before.map_id or tuple(person) in avoid:
+                break
+            avoid.append(tuple(person))
+        from_text = first_from
 
         # Arrow warps (house mats, cave mouths) fire when the player walks off them.
         pushes_tried = []
@@ -3966,6 +4523,41 @@ async def mcp_go_to_exit(request: dict):
 
 
 AUTO_DIALOGUE_MAX_PRESSES = 15
+# Wall-clock cap for pressing through one battle turn's text before a model call; the
+# agent's request to this endpoint times out at 120 s. A turn with a KO and the win
+# money took ~22 s at 60 fps on test_battle_wurmple.state.
+AUTO_BATTLE_TEXT_MAX_S = 90.0
+
+
+async def _auto_advance_battle_text() -> Optional[Dict[str, Any]]:
+    """Press A through battle text that only waits for A, up to the next decision.
+
+    Seen live in Rustboro Gym: "Foe GEODUDE fainted!", "TORCHIC gained 34 EXP. Points!"
+    and "DAVID got $160 for winning!" each cost a ~30 s press_buttons(['A']) decision.
+    Runs while the battle screen shows text or an animation (no battle menu open) and no
+    YES/NO is up; A is pressed only while a box shows its waiting-for-A arrow, and no
+    question is answered (not even the nickname one). None when not in a battle.
+    """
+    from server import menu_state as ms
+
+    flow = _mem(ms.read_battle_flow)
+    if not flow.in_battle:
+        return None
+    view = _read_battle_view()
+    playing = flow.in_battle_screen and view is not None and view["menu"] == "busy"
+    if not playing or flow.asking:
+        return {"success": True, "presses": 0, "texts": [], "final_status": "battle"}
+    played = await _play_out_battle(
+        "auto_dialogue", answer_nickname=False, max_wall_s=AUTO_BATTLE_TEXT_MAX_S
+    )
+    logger.info(f"⚔️ auto-advance battle text: {played['end']} {_turn_text(played['texts'])}")
+    return {
+        "success": True,
+        "presses": played["presses"],
+        "texts": played["texts"],
+        "final_status": f"battle_{played['end']}",
+        "summary": f"Battle text read (auto-advanced with {played['presses']} A presses). {_battle_report(played)}",
+    }
 
 
 @app.post("/mcp/auto_advance_dialogue")
@@ -3980,6 +4572,7 @@ async def mcp_auto_advance_dialogue(request: dict = None):
     from server.field_control import (
         DIALOGUE_BUSY,
         DIALOGUE_CHOICE,
+        DIALOGUE_OTHER,
         DIALOGUE_PLAIN,
         auto_advance_dialogue,
         dialogue_status,
@@ -3995,6 +4588,17 @@ async def mcp_auto_advance_dialogue(request: dict = None):
         return dialogue_status(snap) if snap is not None else "other"
 
     first = status()
+    battle = None
+    if first == DIALOGUE_OTHER:
+        battle = await _auto_advance_battle_text()
+        if battle is not None:
+            if battle["final_status"] != "battle_over":
+                return battle
+            # A trainer's or gym leader's words after the win are field text: read
+            # them too rather than leave them for a model decision.
+            first = status()
+            if first not in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
+                return battle
     if first == DIALOGUE_CHOICE:
         # A YES/NO the model just answered can take a few frames to close.
         await asyncio.sleep(0.3)
@@ -4032,7 +4636,7 @@ async def mcp_auto_advance_dialogue(request: dict = None):
     result = await run_in_threadpool(
         auto_advance_dialogue, status, read_text, press_a, settle, max_presses
     )
-    return {
+    response = {
         "success": True,
         "presses": result.presses,
         "texts": result.texts,
@@ -4040,6 +4644,11 @@ async def mcp_auto_advance_dialogue(request: dict = None):
         "capped": result.capped,
         "summary": result.summary(),
     }
+    if battle is not None:
+        response["presses"] += battle["presses"]
+        response["texts"] = battle["texts"] + response["texts"]
+        response["summary"] = f"{battle['summary']} Then: {response['summary']}"
+    return response
 
 
 @app.post("/mcp/press_buttons")
@@ -4195,11 +4804,12 @@ async def _await_battle_menu(menus: Tuple[str, ...], frames: int) -> Optional[Di
     start = _game_frame()
     deadline = time.monotonic() + 10.0  # guard in case the game loop is paused
     view = _read_battle_view()
-    while view is not None and view["menu"] not in menus:
-        if _game_frame() - start >= frames or time.monotonic() > deadline:
-            break
-        await asyncio.sleep(0.02)
-        view = _read_battle_view()
+    with _turbo():
+        while view is not None and view["menu"] not in menus:
+            if _game_frame() - start >= frames or time.monotonic() > deadline:
+                break
+            await asyncio.sleep(0.02)
+            view = _read_battle_view()
     return view
 
 
@@ -4232,7 +4842,12 @@ async def mcp_use_move(request: dict):
     A, so a Lv11 Torchic used SCRATCH (slot 1) on a Lv5 Poochyena for 12+ minutes while
     the super-effective EMBER sat in slot 4. Steering the 2x2 menus by D-pad is exactly
     what an 8B model gets wrong, so this tool does it and confirms the cursor first.
-    The turn itself is left to play out; dialogue auto-advance handles its text.
+
+    Then it plays the turn out (_play_out_battle) and answers at the next decision: the
+    FIGHT/BAG/POKEMON/RUN menu, the end of the battle, or a question. Seen live in
+    Rustboro Gym: with the turn left to play out, the model spent a ~30 s decision on
+    every text box, and alternated use_move / press A on a finished battle's text for
+    minutes. Text still playing when it is called is pressed through first.
     """
     if env is None:
         return {"success": False, "error": "Emulator not initialized"}
@@ -4261,13 +4876,36 @@ async def mcp_use_move(request: dict):
             message = f"{move['name']} has no PP left. Your moves: {listing}."
             return {"success": False, "error": message, "summary": message}
 
+        from server import menu_state as ms
+
         menu = view["menu"]
         if menu == "busy":
-            message = "Text or an animation is playing; press A to continue, then use_move again."
-            return {"success": False, "error": message, "summary": message}
+            played = await _play_out_battle("use_move")
+            if played["end"] == "over":
+                return _refusal(f"The battle ended before {move['name']} could be used. {_battle_report(played)}")
+            if played["end"] != "action":
+                return _refusal(f"{move['name']} was not used. {_battle_report(played)}")
+            view = _read_battle_view()
+            if view is None:
+                return _refusal(f"The battle ended before {move['name']} could be used.")
+            move = next((m for m in view["moves"] if m["slot"] == move["slot"]), move)
+            if move["pp"] == 0:
+                return _refusal(f"{move['name']} has no PP left. {_battle_report(played)}")
+            menu = view["menu"]
         if menu == "target":
-            message = "A target menu is open: choose the target with LEFT/RIGHT and press A."
-            return {"success": False, "error": message, "summary": message}
+            # A move was already picked and the double battle's target cursor is up:
+            # confirm it (it starts on an opposing Pokémon) and play the turn out.
+            await _press_battle_buttons(["A"], "target")
+            played = await _play_out_battle("use_move")
+            return {
+                "success": True,
+                "summary": (
+                    "A target menu was open for the move already chosen: confirmed the target "
+                    f"the cursor was on. {_battle_report(played)}"
+                ),
+                "status": {"action": "YOUR_TURN", "over": "BATTLE_OVER"}.get(played["end"], "STOPPED"),
+                "end": played["end"],
+            }
         if menu == "reorder":
             message = "The move-reorder mode is on (SELECT was pressed): press B, then use_move again."
             return {"success": False, "error": message, "summary": message}
@@ -4303,9 +4941,24 @@ async def mcp_use_move(request: dict):
             summary += f"; opponent {target['name'].upper()} HP {target['hp']}/{target['max_hp']} before the hit."
         else:
             summary += "."
+        result = {"success": True, "move": move["name"], "slot": move["slot"]}
         if view is not None and view["menu"] == "target":
-            summary += " Now choose the target with LEFT/RIGHT and press A."
-        return {"success": True, "move": move["name"], "slot": move["slot"], "summary": summary}
+            # Seen live: in a double battle (PLUSLE and MINUN) use_move stopped here with
+            # "choose the target with LEFT/RIGHT and press A"; the model's presses never
+            # confirmed one and both foes stayed at 40/40 for seven minutes. The cursor
+            # starts on an opposing Pokémon, so A confirms a valid target.
+            await _press_battle_buttons(["A"], move["name"])
+            summary += " (Double battle: confirmed the target the cursor was on.)"
+        played = await _play_out_battle("use_move")
+        logger.info(f"⚔️ use_move turn: {played['end']} {_turn_text(played['texts'])}")
+        result.update(
+            {
+                "summary": f"{summary} {_battle_report(played)}",
+                "status": {"action": "YOUR_TURN", "over": "BATTLE_OVER"}.get(played["end"], "STOPPED"),
+                "end": played["end"],
+            }
+        )
+        return result
     except Exception as e:
         logger.error(f"Error in use_move: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
@@ -4329,6 +4982,12 @@ MACRO_BATTLE_FRAMES = 4800  # a battle turn's text and animations (~400 frames s
 MACRO_MAX_BATTLE_PRESSES = 40
 
 
+def _route_flag_reader(flag: int) -> bool:
+    """Event flags for route planning (server.game_tools.flag_reader): which HM obstacles
+    are gone for good."""
+    return bool(_mem(lambda r: r._is_event_flag_set(flag)))
+
+
 def _mem(fn, *args):
     """Call fn(memory_reader, *args) under the memory lock."""
     with memory_lock:
@@ -4339,6 +4998,15 @@ def _refusal(message: str, **extra) -> Dict[str, Any]:
     result = {"success": False, "error": message, "summary": message}
     result.update(extra)
     return result
+
+
+def _install_route_flag_reader() -> None:
+    from server import game_tools
+
+    game_tools.flag_reader = _route_flag_reader
+
+
+_install_route_flag_reader()
 
 
 async def _macro_press(buttons: List[str], source: str) -> None:
@@ -4353,11 +5021,12 @@ async def _await_game(check, frames: int):
     start = _game_frame()
     deadline = time.monotonic() + max(10.0, frames / 20)  # guard in case the loop is paused
     value = check()
-    while not value:
-        if _game_frame() - start >= frames or time.monotonic() > deadline:
-            break
-        await asyncio.sleep(0.02)
-        value = check()
+    with _turbo():
+        while not value:
+            if _game_frame() - start >= frames or time.monotonic() > deadline:
+                break
+            await asyncio.sleep(0.02)
+            value = check()
     return value
 
 
@@ -4399,28 +5068,55 @@ def read_field_text(reader) -> str:
 # -- battles ---------------------------------------------------------------
 
 
-async def _play_out_battle(source: str, frames: int = MACRO_BATTLE_FRAMES) -> Dict[str, Any]:
+async def _play_out_battle(
+    source: str,
+    frames: int = MACRO_BATTLE_FRAMES,
+    answer_nickname: bool = True,
+    max_wall_s: Optional[float] = None,
+) -> Dict[str, Any]:
     """Press through battle text until the player picks an action again or the battle
     is over and the player stands on the map.
 
-    A is pressed only while a text box shows its down arrow; the nickname question is
-    answered NO with B (B always means NO there) and the caught Pokémon's Pokédex page
-    is closed with B. Any other question ("Use next POKéMON?", learning a move) ends
-    the macro: those are the model's decisions.
+    A is pressed only while a text box shows its down arrow and no YES/NO is up; the
+    nickname question is answered NO with B (B always means NO there) when
+    `answer_nickname`, and the caught Pokémon's Pokédex page is closed with B. Any
+    other question ("Use next POKéMON?", "Will DAVID change POKéMON?", deleting a move
+    to learn a new one), a party menu the game opens itself, or an evolution ends the
+    loop: those are the model's decisions.
+
+    `texts` are the battle messages in the order they showed: the string buffer is read
+    while the message window prints (BattleFlow.message_printing), so the FIGHT/BAG
+    prompt, the move menu's PP/TYPE lines and healthbox names in the same buffer are
+    left out.
     """
+    with _turbo():
+        return await _play_out_battle_steps(source, frames, answer_nickname, max_wall_s)
+
+
+async def _play_out_battle_steps(
+    source: str, frames: int, answer_nickname: bool, max_wall_s: Optional[float]
+) -> Dict[str, Any]:
     from server import menu_state as ms
 
     texts: List[str] = []
     notes: List[str] = []
     presses = 0
     start = _game_frame()
-    deadline = time.monotonic() + max(30.0, frames / 20)
+    deadline = time.monotonic() + (max_wall_s if max_wall_s is not None else max(30.0, frames / 20))
+    seen = _frames_run
     flow = _mem(ms.read_battle_flow)
+    if flow.text and flow.in_battle and flow.message_printing:
+        texts.append(flow.text)  # began printing before this call
     while True:
-        if flow.text and (not texts or texts[-1] != flow.text):
-            texts.append(flow.text)
+        # Every message printed since, in order, as the game loop recorded it.
+        for at, text in _battle_messages_since(seen):
+            seen = at
+            if not texts or texts[-1] != text:
+                texts.append(text)
         end = None
-        if flow.in_battle and flow.in_battle_screen and flow.choosing_action:
+        if flow.evolving:
+            end = "evolution"
+        elif flow.in_battle and flow.in_battle_screen and flow.choosing_action:
             end = "action"
         elif not flow.in_battle:
             snap = _field_snapshot()
@@ -4429,21 +5125,43 @@ async def _play_out_battle(source: str, frames: int = MACRO_BATTLE_FRAMES) -> Di
                 await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
                 end = "over"
         elif flow.nickname_prompt:
-            await _macro_press(["B"], source)
-            notes.append("answered NO to giving it a nickname")
-            presses += 1
+            if not answer_nickname:
+                end = "question"
+            else:
+                await _macro_press(["B"], source)
+                notes.append("answered NO to giving it a nickname")
+                presses += 1
         elif flow.dex_page:
             await _macro_press(["B"], source)
             presses += 1
+        elif flow.yes_no_prompt and "CHANGE POK" in str(flow.text).upper():
+            # "Will DAVID change POKéMON?" after a trainer's Pokémon faints: a free switch
+            # before the next one comes in. Seen live against the Route 110 rival: the
+            # model answered YES, picked the Pokémon already battling, and pressed A on
+            # SHIFT for two minutes. David: "think about who the next pokemon is and then
+            # send out the pokemon that best counters that pokemon." The trainer's line
+            # before it names the next one ("MAY is about to use SLUGMA.").
+            notes.append(await _answer_switch_question(texts, source))
+            presses += 1
         elif flow.yes_no_prompt:
             end = "question"
-        elif flow.learn_move_prompt:
-            end = "learn_move"
+        elif flow.script_question:
+            end = "learn_move" if flow.learn_move_prompt else "question"
         elif not flow.in_battle_screen and any(
             _mem(ms.callback2_is, cb) for cb in (ms.CB2_UPDATE_PARTY_MENU, ms.CB2_BAG_MENU_RUN)
         ):
             end = "menu"  # the game opened the party menu itself (a fainted Pokémon must be replaced)
+        elif flow.level_up_box and flow.in_battle_screen:
+            # The stat panel after "X grew to LV. N!" waits for a key without a text
+            # printer; A while it is still drawing is ignored, so pressing until the
+            # script moves on is safe. Seen on test_wild_two_party.state: after "TORCHIC
+            # grew to LV. 12!" use_move waited out its whole frame budget (80 s) and
+            # reported a timeout, and every switch-training level-up would do the same.
+            await _macro_press(["A"], source)
+            presses += 1
         elif flow.text_waiting and flow.in_battle_screen:
+            # Inside the learn-move script too: its "is trying to learn X" lines only
+            # wait for A; the YES/NO after them is caught by script_question above.
             await _macro_press(["A"], source)
             presses += 1
         if end is None and (
@@ -4451,24 +5169,87 @@ async def _play_out_battle(source: str, frames: int = MACRO_BATTLE_FRAMES) -> Di
         ):
             end = "timeout"
         if end is not None:
-            return {"end": end, "flow": flow, "texts": texts, "notes": notes}
+            return {"end": end, "flow": flow, "texts": texts, "notes": notes, "presses": presses}
         await asyncio.sleep(0.03)
         flow = _mem(ms.read_battle_flow)
 
 
 def _battle_end_text(played: Dict[str, Any]) -> str:
     """What a played-out battle ended on, for summaries of the cases a macro can't finish."""
-    end, flow = played["end"], played["flow"]
+    end = played["end"]
     said = _quote(played["texts"])
+    asked = _quote(played["texts"][-1:])
     if end == "question":
-        return f"The battle asks a YES/NO question ({said}): answer it yourself with press_buttons."
+        return (
+            f"The battle asks a YES/NO question ({asked}): answer it yourself with press_buttons "
+            "(A = YES, B = NO)."
+        )
     if end == "learn_move":
-        return f"Your Pokémon wants to learn a new move ({said}): decide with press_buttons."
+        return (
+            f"Your Pokémon wants to learn a new move ({asked}): decide with press_buttons "
+            "(A = YES picks a move to forget, B = NO keeps the old moves)."
+        )
     if end == "menu":
         return "The game opened the party menu (a fainted Pokémon must be replaced): pick one with press_buttons."
+    if end == "evolution":
+        said = _quote([_mem(read_field_text)]) or said
+        return f"Your Pokémon is evolving ({said}): press A to let it evolve (B stops it)."
     if end == "timeout":
         return f"The battle did not reach a menu in time; the screen last said {said or 'nothing readable'}."
     return said
+
+
+# Battle messages quoted in one turn's report; a turn with two KOs and a level-up is ~10.
+TURN_REPORT_MAX_MESSAGES = 12
+
+
+def _turn_text(texts: List[str]) -> str:
+    """The turn's battle messages in order: "TORCHIC used EMBER! · It's super effective!"."""
+    shown = [t for t in texts if t][-TURN_REPORT_MAX_MESSAGES:]
+    return f'"{" · ".join(shown)}"' if shown else ""
+
+
+def _battle_hp_text(view: Optional[Dict[str, Any]]) -> str:
+    if not view or not view.get("player"):
+        return ""
+    player = view["player"]
+    text = f"{player['name'].upper()} HP {player['hp']}/{player['max_hp']}"
+    foes = [f"foe {m['name'].upper()} HP {m['hp']}/{m['max_hp']}" for m in view.get("opponents") or []]
+    return f"Now: {'; '.join([text] + foes)}."
+
+
+def _battle_report(played: Dict[str, Any]) -> str:
+    """What happened while a battle was played out, and where it stopped.
+
+    Seen live in Rustboro Gym: after each attack the model spent a ~30 s decision per
+    text box ("TORCHIC used EMBER!", "It's not very effective…", "Foe GEODUDE fainted!",
+    "DAVID got $160 for winning!"). The presses now happen here, so the model gets the
+    whole turn as one quote plus the HP of both sides, and is asked only to decide.
+    """
+    from server import menu_state as ms
+
+    end, flow = played["end"], played["flow"]
+    texts = played["texts"]
+    if end in ("question", "learn_move"):
+        texts = texts[:-1]  # the question itself is quoted where the report asks it
+    said = _turn_text(texts)
+    happened = f"What happened: {said}. " if said else ""
+    if end == "action":
+        hp = _battle_hp_text(_read_battle_view())
+        return (
+            f"{happened}{hp} Your turn: FIGHT/BAG/POKEMON/RUN is open "
+            "(use_move, switch_pokemon, run_from_battle or throw_ball)."
+        ).strip()
+    if end == "over":
+        result = ms.outcome_name(flow.outcome)
+        if flow.outcome in (ms.B_OUTCOME_WON, ms.B_OUTCOME_LOST, ms.B_OUTCOME_DREW):
+            result = f"you {result}"
+        where = _position_text(_field_snapshot())
+        return (
+            f"{happened}The battle is over ({result}); you are on the map at {where}. "
+            f"Party HP: {_hp_text(_party_lines())}.{_screen_note()}"
+        ).strip()
+    return f"{happened}{_battle_end_text(played)}".strip()
 
 
 async def _ready_for_battle_action(tool: str, source: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -4571,27 +5352,16 @@ async def mcp_run_from_battle(request: dict = None):
             return _refusal(error)
         played = await _play_out_battle(source)
         flow = played["flow"]
-        said = _quote(played["texts"])
-        logger.info(f"🏃 run_from_battle: {played['end']} outcome={flow.outcome} {said}")
+        logger.info(f"🏃 run_from_battle: {played['end']} outcome={flow.outcome} {_turn_text(played['texts'])}")
         if played["end"] == "over" and flow.outcome == ms.B_OUTCOME_RAN:
             now = _position_text(_field_snapshot())
             return {"success": True, "status": "ESCAPED", "summary": f"Got away safely from wild {opponent}. Now at {now}."}
         if played["end"] == "over":
-            return {
-                "success": False,
-                "status": "BATTLE_OVER",
-                "summary": f"The battle ended ({ms.outcome_name(flow.outcome)}): {said}.",
-            }
+            return {"success": False, "status": "BATTLE_OVER", "summary": f"Chose RUN. {_battle_report(played)}"}
         if played["end"] == "action":
-            view = _read_battle_view()
-            player = view["player"] if view else None
-            hp = f" {player['name']} HP {player['hp']}/{player['max_hp']}." if player else ""
-            message = (
-                f"Couldn't get away: the battle against wild {opponent} continues ({said}).{hp} "
-                "Choose again: run_from_battle, use_move or switch_pokemon."
-            )
+            message = f"Couldn't get away: the battle against wild {opponent} continues. {_battle_report(played)}"
             return _refusal(message, status="STILL_IN_BATTLE")
-        return _refusal(f"Chose RUN, then: {_battle_end_text(played)}", status="STOPPED")
+        return _refusal(f"Chose RUN, then: {_battle_report(played)}", status="STOPPED")
     except Exception as e:
         logger.error(f"Error in run_from_battle: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
@@ -4698,8 +5468,7 @@ async def mcp_throw_ball(request: dict = None):
             balls_after = env.memory_reader.read_full_inventory().get("poke_balls", [])
         count_after = next((b["quantity"] for b in balls_after if b["item_id"] == ball["item_id"]), 0)
         used = f"Threw a {ball['name']} at {opponent}; {ball['name']} {count_before} -> {count_after} left."
-        said = _quote(played["texts"])
-        logger.info(f"🎯 throw_ball: {played['end']} outcome={flow.outcome} {said}")
+        logger.info(f"🎯 throw_ball: {played['end']} outcome={flow.outcome} {_turn_text(played['texts'])}")
         result = {"ball": ball["name"], "balls_before": count_before, "balls_after": count_after}
         if flow.outcome == ms.B_OUTCOME_CAUGHT:
             party_after = _mem(lambda r: r._read_u8(ms.G_PLAYER_PARTY_COUNT))
@@ -4713,13 +5482,10 @@ async def mcp_throw_ball(request: dict = None):
             result.update({"success": True, "status": "CAUGHT", "caught": True, "summary": summary})
             return result
         if played["end"] == "action":
-            view = _read_battle_view()
-            foe = view["target"] if view else None
-            foe_hp = f" Opponent {foe['name'].upper()} HP {foe['hp']}/{foe['max_hp']}." if foe else ""
-            summary = f"It broke free: not caught. {used} The battle continues ({said}).{foe_hp}"
+            summary = f"It broke free: not caught. {used} The battle continues. {_battle_report(played)}"
             result.update({"success": True, "status": "BROKE_FREE", "caught": False, "summary": summary})
             return result
-        summary = f"{used} Then: {_battle_end_text(played) if played['end'] != 'over' else said + ' The battle is over.'}"
+        summary = f"{used} Then: {_battle_report(played)}"
         result.update({"success": played["end"] == "over", "status": "STOPPED", "caught": False, "summary": summary})
         if not result["success"]:
             result["error"] = summary
@@ -4727,6 +5493,134 @@ async def mcp_throw_ball(request: dict = None):
     except Exception as e:
         logger.error(f"Error in throw_ball: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
+
+
+async def _shift_from_party_menu(personality: int, name: str, source: str) -> Optional[str]:
+    """With the battle's party menu opening (from POKEMON, or from YES to "Will DAVID
+    change POKéMON?"), pick the Pokémon with this personality and choose SHIFT. Returns
+    None once back on the battle screen, else why not (the menu may still be open)."""
+    from server import menu_state as ms
+
+    def party_menu_ready():
+        return (
+            _mem(ms.callback2_is, ms.CB2_UPDATE_PARTY_MENU)
+            and _mem(ms.task_running, ms.TASK_PARTY_CHOOSE)
+            and not _mem(ms.fade_active)
+        )
+
+    if not await _await_game(party_menu_ready, MACRO_MENU_FRAMES):
+        return "The party menu did not open."
+    # The menu draws gPlayerParty[slot]; find the slot by personality, which is unique,
+    # rather than trusting the order the model saw.
+    shown = _mem(ms.party_personalities)
+    if personality not in shown:
+        return f"{name} is not listed in the party menu."
+    slot = shown.index(personality)
+    await _macro_press(ms.list_presses(_mem(ms.party_menu_slot), slot), source)
+    if _mem(ms.party_menu_slot) != slot:
+        return f"Could not put the party cursor on {name} (it is on slot {_mem(ms.party_menu_slot) + 1})."
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_PARTY_SELECTION), MACRO_MENU_FRAMES):
+        said = _mem(read_field_text)
+        return f"Pressed A on {name} but no SHIFT menu opened{f' ({said})' if said else ''}."
+    actions = _mem(ms.party_menu_actions)
+    if ms.MENU_SHIFT not in actions:
+        return f"{name}'s menu has no SHIFT option."
+    await _macro_press(ms.list_presses(_mem(ms.read_menu_cursor).cursor, actions.index(ms.MENU_SHIFT)), source)
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.cursor >= len(actions) or actions[cursor.cursor] != ms.MENU_SHIFT:
+        return f"Could not put the cursor on SHIFT (it is on entry {cursor.cursor + 1})."
+    await _macro_press(["A"], source)  # SHIFT
+    if not await _await_game(lambda: _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN), MACRO_MENU_FRAMES * 2):
+        # Still in the party menu: the game refused (e.g. a trapping move) and says why.
+        said = _mem(read_field_text)
+        return f"Chose SHIFT but the game kept the party menu open{f': {said}' if said else ''}."
+    return None
+
+
+def _counter_score(reader, mon, foe_types: List[int]) -> float:
+    """How well a party Pokémon matches up against a foe of these types: its best damaging
+    move's multiplier (with STAB) divided by the foe's worst threat to it, both from the
+    ROM type chart (the foe's own types stand in for its moves)."""
+    own_types = [t for t in (getattr(mon.type1, "value", mon.type1), getattr(mon.type2, "value", mon.type2)) if t is not None]
+    offence = 0.0
+    for move, pp in zip(mon.moves or [], mon.move_pp or []):
+        info = reader.move_type_and_power(move) if move and pp else None
+        if not info or not info[1]:
+            continue
+        move_type, _ = info
+        offence = max(offence, reader.type_effectiveness(move_type, foe_types) * (1.5 if move_type in own_types else 1.0))
+    threat = max((reader.type_effectiveness(t, own_types) for t in dict.fromkeys(foe_types)), default=1.0)
+    return offence / max(threat, 0.25)
+
+
+# Only switch when the counter is clearly better than the Pokémon already out.
+SWITCH_COUNTER_MARGIN = 2.0
+
+
+def _best_counter(next_foe: str) -> Optional[Tuple[Any, int, float, float]]:
+    """(party Pokémon to send in, its personality, its score, the active one's score)
+    against next_foe, or
+    None when the one out now is as good (within SWITCH_COUNTER_MARGIN) or unknown."""
+    from server import menu_state as ms
+
+    with memory_lock:
+        reader = env.memory_reader
+        foe_types = reader.species_types(next_foe)
+        party = reader.read_party_pokemon() or []
+        personalities = ms.party_personalities(reader)
+        active = ms.active_battler_personality(reader)
+        if not foe_types or len(personalities) != len(party):
+            return None
+        scored = [
+            (mon, pid, _counter_score(reader, mon, foe_types))
+            for mon, pid in zip(party, personalities)
+            if not mon.is_egg and mon.current_hp * 5 > mon.max_hp * 2  # above 40% HP
+        ]
+    current = next((score for mon, pid, score in scored if pid == active), 0.0)
+    bench = [(mon, pid, score) for mon, pid, score in scored if pid != active]
+    if not bench:
+        return None
+    mon, pid, score = max(bench, key=lambda t: t[2])
+    if score < max(current, 0.5) * SWITCH_COUNTER_MARGIN:
+        return None
+    return (mon, pid, score, current)
+
+
+async def _answer_switch_question(texts: List[str], source: str) -> str:
+    """Answer "Will DAVID change POKéMON?": YES and SHIFT in the clear counter to the
+    trainer's next Pokémon (_best_counter), else NO. Returns a note for the turn report."""
+    from server import menu_state as ms
+
+    foe = _next_foe_from(texts)
+    choice = _best_counter(foe) if foe else None
+    if choice is None:
+        await _macro_press(["B"], source)
+        why = f"nobody counters {foe} clearly better" if foe else "the next Pokémon was not named"
+        return f"kept the same Pokémon in ({why})"
+    mon, personality, score, current = choice
+    name = str(mon.species_name).upper()
+    await _macro_press(["A"], source)  # YES
+    error = await _shift_from_party_menu(personality, name, source)
+    if error is None:
+        return f"switched to {name} to face {foe} (matchup {score:g} vs {current:g})"
+    # Back out of the menu; the game then sends its Pokémon in against the one out now.
+    for _ in range(3):
+        if _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN):
+            break
+        await _macro_press(["B"], source)
+    return f"tried to switch to {name} for {foe} but {error}"
+
+
+def _next_foe_from(texts: List[str]) -> str:
+    """'MAY is about to use SLUGMA.' -> 'SLUGMA' (the latest such line), else ''."""
+    for text in reversed(texts):
+        marker = "about to use "
+        at = text.find(marker)
+        if at != -1:
+            name = text[at + len(marker):].split(".")[0].split("!")[0]
+            return name.strip().upper()
+    return ""
 
 
 @app.post("/mcp/switch_pokemon")
@@ -4786,67 +5680,513 @@ async def mcp_switch_pokemon(request: dict = None):
         error = await _choose_battle_action(ms.ACTION_POKEMON, source)
         if error:
             return _refusal(error)
-
-        def party_menu_ready():
-            return (
-                _mem(ms.callback2_is, ms.CB2_UPDATE_PARTY_MENU)
-                and _mem(ms.task_running, ms.TASK_PARTY_CHOOSE)
-                and not _mem(ms.fade_active)
-            )
-
-        async def give_up(message: str) -> Dict[str, Any]:
+        error = await _shift_from_party_menu(personalities[index], mon["name"], source)
+        if error:
             back = await _back_to_battle_menu(source)
             tail = " Back at the battle menu; nobody was switched." if back else " Could not get back to the battle menu: look at the screen."
-            return _refusal(message + tail)
-
-        if not await _await_game(party_menu_ready, MACRO_MENU_FRAMES):
-            return await give_up("Chose POKEMON but the party menu did not open.")
-        # The menu draws gPlayerParty[slot]; find the slot by personality, which is
-        # unique, rather than trusting the order the model saw.
-        shown = _mem(ms.party_personalities)
-        if personalities[index] not in shown:
-            return await give_up(f"{mon['name']} is not listed in the party menu.")
-        slot = shown.index(personalities[index])
-        await _macro_press(ms.list_presses(_mem(ms.party_menu_slot), slot), source)
-        if _mem(ms.party_menu_slot) != slot:
-            return await give_up(f"Could not put the party cursor on {mon['name']} (it is on slot {_mem(ms.party_menu_slot) + 1}).")
-        await _macro_press(["A"], source)
-        if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_PARTY_SELECTION), MACRO_MENU_FRAMES):
-            said = _mem(read_field_text)
-            return await give_up(f"Pressed A on {mon['name']} but no SHIFT menu opened{f' ({said})' if said else ''}.")
-        actions = _mem(ms.party_menu_actions)
-        if ms.MENU_SHIFT not in actions:
-            return await give_up(f"{mon['name']}'s menu has no SHIFT option.")
-        await _macro_press(ms.list_presses(_mem(ms.read_menu_cursor).cursor, actions.index(ms.MENU_SHIFT)), source)
-        cursor = _mem(ms.read_menu_cursor)
-        if cursor.cursor >= len(actions) or actions[cursor.cursor] != ms.MENU_SHIFT:
-            return await give_up(f"Could not put the cursor on SHIFT (it is on entry {cursor.cursor + 1}).")
-        await _macro_press(["A"], source)  # SHIFT
-
-        if not await _await_game(lambda: _mem(ms.callback2_is, ms.CB2_BATTLE_MAIN), MACRO_MENU_FRAMES * 2):
-            # Still in the party menu: the game refused (e.g. a trapping move) and says why.
-            said = _mem(read_field_text)
-            return await give_up(f"Chose SHIFT but the game kept the party menu open{f': {said}' if said else ''}.")
+            return _refusal(error + tail)
         played = await _play_out_battle(source)
         now_in = _mem(ms.active_battler_personality)
-        said = _quote(played["texts"])
-        logger.info(f"🔁 switch_pokemon: {played['end']} {said}")
+        logger.info(f"🔁 switch_pokemon: {played['end']} {_turn_text(played['texts'])}")
         if now_in != personalities[index]:
-            return _refusal(f"Chose SHIFT to {mon['name']}, but it is not the Pokémon in battle now. {said}", status="STOPPED")
-        view = _read_battle_view()
-        player = view["player"] if view else None
-        hp = f" (HP {player['hp']}/{player['max_hp']})" if player else ""
-        summary = f"Switched: {outgoing} came back and {mon['name']}{hp} is in battle now."
-        if played["end"] == "action":
-            summary += f" {said}. Your turn: use_move, throw_ball, run_from_battle or switch_pokemon."
-        elif played["end"] == "over":
-            summary += f" {said}. The battle is over."
-        else:
-            summary += f" {_battle_end_text(played)}"
-        return {"success": True, "status": "SWITCHED", "pokemon": mon["name"], "summary": summary}
+            return _refusal(
+                f"Chose SHIFT to {mon['name']}, but it is not the Pokémon in battle now. {_battle_report(played)}",
+                status="STOPPED",
+            )
+        summary = f"Switched: {outgoing} came back and {mon['name']} is in battle now. {_battle_report(played)}"
+        return {"success": True, "status": "SWITCHED", "pokemon": mon["name"], "summary": summary, "end": played["end"]}
     except Exception as e:
         logger.error(f"Error in switch_pokemon: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
+
+
+# -- training: train ---------------------------------------------------------
+
+# max_minutes when none is given, and its cap. agents/PokeAgent.py sizes this tool's
+# HTTP timeout from the same two numbers.
+TRAIN_DEFAULT_MINUTES = 4.0
+TRAIN_MAX_MINUTES = 10.0
+# A battle still running when the time is up is finished, for at most this long.
+TRAIN_FINISH_BATTLE_S = 90.0
+# Partner turns in one wild battle before giving up on it; a partner ten levels up
+# needs one to three.
+TRAIN_MAX_TURNS = 12
+# Steps between two encounter tiles without a battle before stopping (a map whose
+# grass has no wild Pokémon, or very bad luck).
+TRAIN_MAX_QUIET_STEPS = 300
+# Presses in a row that did not reach the other tile (a person standing on it, or a
+# press that only turned the player) before trying the next pair of tiles.
+TRAIN_MAX_STUCK = 4
+# Battle ends that are the model's decision: the stop code names them.
+TRAIN_QUESTION_ENDS = ("question", "learn_move", "evolution", "menu")
+
+
+def _train_party() -> List[Tuple[int, Any]]:
+    """[(personality, PokemonData)] in party order; the personality names a Pokémon
+    even when two share a species."""
+    from server import menu_state as ms
+
+    with memory_lock:
+        reader = env.memory_reader
+        return list(zip(ms.party_personalities(reader), reader.read_party_pokemon() or []))
+
+
+def _train_member(party: List[Tuple[int, Any]], wanted: Any) -> Optional[int]:
+    """Party index for a species name, nickname or party number 1-6; None if not found."""
+    from server import menu_state as ms
+
+    key = ms.name_key(wanted)
+    if key.isdigit():
+        index = int(key) - 1
+        return index if 0 <= index < len(party) and not party[index][1].is_egg else None
+    for index, (_, mon) in enumerate(party):
+        if not mon.is_egg and key in (ms.name_key(mon.species_name), ms.name_key(mon.nickname or "")):
+            return index
+    # An earlier form's name ("SHROOMISH" for the BRELOOM it became): objectives and the
+    # model's notes keep the name from before the evolution.
+    with memory_lock:
+        family = {ms.name_key(n) for n in env.memory_reader.species_family(str(wanted))}
+    for index, (_, mon) in enumerate(party):
+        if not mon.is_egg and ms.name_key(mon.species_name) in family:
+            return index
+    return None
+
+
+def _train_can_take_a_turn(party: List[Tuple[int, Any]], trainee_pid: int) -> bool:
+    """The trainee can come in for one hit to share the EXP: above half HP, not fainted."""
+    mon = dict(party).get(trainee_pid)
+    return mon is not None and not mon.is_egg and mon.current_hp * 2 > mon.max_hp
+
+
+def _train_partner(party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: Optional[int]) -> Optional[int]:
+    """Index of the teammate that fights for the trainee: the one asked for, else the
+    highest-level teammate above half HP (the partner _switch_train_line names). None
+    when that Pokémon can't fight now."""
+    able = [
+        i for i, (pid, mon) in enumerate(party)
+        if pid != trainee_pid and not mon.is_egg and mon.max_hp and mon.current_hp * 2 > mon.max_hp
+    ]
+    if wanted_pid is not None:
+        return next((i for i in able if party[i][0] == wanted_pid), None)
+    return max(able, key=lambda i: party[i][1].level) if able else None
+
+
+def _train_weakness(partner_index: Optional[int]) -> List[str]:
+    """The team-weak reasons (read_team_condition), with the partner's PP as the one that
+    counts: the trainee leads but never attacks."""
+    with memory_lock:
+        condition = env.memory_reader.read_team_condition(lead_index=partner_index)
+    return list(condition["reasons"]) if condition["weak"] else []
+
+
+def _heal_way() -> str:
+    from server import game_tools
+
+    snap = _field_snapshot()
+    location = _location_name()
+    way = game_tools.way_to_pokemon_center(location, (snap.x, snap.y) if snap is not None else None)
+    return way or f"you are inside {location}: call heal_at_pokecenter() now."
+
+
+def _mon_text(mon) -> str:
+    return f"{mon.species_name.upper()} Lv{mon.level} HP {mon.current_hp}/{mon.max_hp}"
+
+
+async def _train_battle(
+    trainee_pid: int, wanted_partner_pid: Optional[int], deadline: float,
+    catch: Optional[Tuple[str, int]] = None,
+) -> Tuple[Dict[str, Any], Optional[Tuple[str, str]]]:
+    """Fight the wild battle in progress for the trainee: switch it out for the partner on
+    its first turn (switch_pokemon), then the best move each turn (use_move, which plays
+    the text out). A trainee with the advantage (_trainee_advantage) fights itself until
+    it drops to half HP. Returns (record of the battle, stop) where stop is (code, why)
+    or None. With catch=(species, min level), a wild one of those at that level stops it
+    before the first move, with the catch plan (_catch_plan).
+    """
+    from server import menu_state as ms
+
+    source = "train"
+    before = dict(_train_party())
+    trainee_name = before[trainee_pid].species_name.upper()
+    view = _read_battle_view()
+    foes = [f"{m['name'].upper()} Lv{m['level']}" for m in (view or {}).get("opponents") or []]
+    record: Dict[str, Any] = {"opponents": foes, "turns": 0, "switched": False, "trainee_fought": False}
+    partner_pid = None
+    stop: Optional[Tuple[str, str]] = None
+    if view is not None and view["is_trainer"]:
+        stop = (
+            "trainer_battle",
+            f"a trainer battle started ({', '.join(foes)}): train only fights wild Pokémon. "
+            "Fight it yourself with use_move.",
+        )
+    while stop is None and _read_battle_view() is not None:
+        if time.monotonic() > deadline:
+            stop = ("time", "the time ran out in the middle of a battle: finish it with use_move.")
+            break
+        if record["turns"] >= TRAIN_MAX_TURNS:
+            stop = ("unexpected", f"the battle went on for {TRAIN_MAX_TURNS} turns: finish it yourself.")
+            break
+        view = _read_battle_view()
+        if view is not None and view["menu"] == "busy":
+            # Decide only at the menu: during "Wild X appeared!" gBattleMons still holds
+            # the last battle's Pokémon. Seen in the tests: train read TORCHIC as the one
+            # out, picked its EMBER, and use_move then found SHROOMISH's moves.
+            played = await _play_out_battle(source)
+            if played["end"] in ("action", "over"):
+                continue
+            stop = (
+                played["end"] if played["end"] in TRAIN_QUESTION_ENDS else "unexpected",
+                _battle_report(played),
+            )
+            break
+        if catch is not None and record["turns"] == 0 and not record["switched"] and view is not None:
+            # First decision of the battle: gBattleMons now holds this battle's Pokémon.
+            found = next(
+                (f for f in view.get("opponents") or [] if str(f.get("name", "")).upper() == catch[0] and f.get("level", 0) >= catch[1]),
+                None,
+            )
+            if found is not None:
+                record["opponents"] = [f"{m['name'].upper()} Lv{m['level']}" for m in view.get("opponents") or []]
+                stop = ("catch_target", f"a wild {catch[0]} Lv{found['level']} appeared. " + _catch_plan(view, found))
+                break
+        party = _train_party()
+        advantage = _trainee_advantage(view) if view is not None else None
+        if _mem(ms.active_battler_personality) == trainee_pid and advantage is not None:
+            # The foe is weak to the trainee and can't hit it hard: it fights itself, and
+            # is switched out as soon as it drops to half HP (checked every turn).
+            result = await mcp_use_move({"move": advantage["slot"], "reasoning": f"train: {advantage['name']}"})
+            record["turns"] += 1
+            record["trainee_fought"] = True
+        elif _mem(ms.active_battler_personality) == trainee_pid:
+            index = _train_partner(party, trainee_pid, wanted_partner_pid)
+            if index is None:
+                stop = (
+                    "no_partner",
+                    f"{trainee_name} is in battle and no teammate above half HP can come in for it: "
+                    "fight or run_from_battle yourself.",
+                )
+                break
+            partner_pid = party[index][0]
+            result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {trainee_name} must not fight"})
+            record["switched"] = record["switched"] or bool(result.get("success"))
+        elif (
+            not record.get("trainee_sent_in")
+            and not record["switched"]  # it was out already (switched out for the partner)
+            and not record["trainee_fought"]
+            and _train_can_take_a_turn(party, trainee_pid)
+            and _train_partner(party, trainee_pid, wanted_partner_pid) is not None
+            # The one out now, by its battle HP (the party copy lags a turn): a weak one
+            # fights on rather than make room for a switch nobody can undo.
+            and view is not None and view.get("player")
+            and view["player"]["hp"] * 2 > view["player"]["max_hp"]
+        ):
+            # Only Pokémon that were out in the battle get its EXP. Seen live: SABLEYE led
+            # the party, train("SHROOMISH") had it fight every battle, and SABLEYE went
+            # Lv18 -> 21 while SHROOMISH stayed Lv17. The trainee comes in once (the turn
+            # after, the branch above swaps the partner back in), and only while a
+            # teammate above half HP can take over from it.
+            record["trainee_sent_in"] = True
+            index = next(i for i, (pid, _) in enumerate(party) if pid == trainee_pid)
+            result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {trainee_name} joins for the EXP"})
+        else:
+            partner_pid = _mem(ms.active_battler_personality)
+            best = view.get("best_move") if view else None
+            if not best:
+                name = view["player"]["name"].upper() if view and view.get("player") else "Your Pokémon"
+                stop = ("no_moves", f"{name} has no damaging move with PP left: heal first ({_heal_way()}).")
+                break
+            result = await mcp_use_move({"move": best["slot"], "reasoning": f"train: {best['name']}"})
+            record["turns"] += 1
+        end = result.get("end")
+        if not result.get("success"):
+            if _read_battle_view() is None:
+                break  # the battle ended before the choice (the wild Pokémon fled)
+            stop = ("unexpected", result.get("summary") or result.get("error") or "the battle menu did not respond")
+        elif end in TRAIN_QUESTION_ENDS:
+            stop = (end, result.get("summary") or "")
+        elif end not in ("action", "over"):
+            stop = ("unexpected", result.get("summary") or f"the battle stopped ({end})")
+    after = dict(_train_party())
+    trainee_before, trainee_after = before[trainee_pid], after.get(trainee_pid, before[trainee_pid])
+    outcome = "unfinished" if _read_battle_view() is not None else ms.outcome_name(_mem(ms.read_battle_flow).outcome)
+    record.update({
+        "outcome": outcome,
+        "trainee": trainee_name,
+        "level_before": trainee_before.level,
+        "level_after": trainee_after.level,
+        "exp_gained": (trainee_after.experience or 0) - (trainee_before.experience or 0),
+        "trainee_hp_before": trainee_before.current_hp,
+        "trainee_hp": trainee_after.current_hp,
+        "trainee_max_hp": trainee_after.max_hp,
+    })
+    if partner_pid in after and partner_pid in before:
+        record.update({
+            "partner": after[partner_pid].species_name.upper(),
+            "partner_hp_before": before[partner_pid].current_hp,
+            "partner_hp": after[partner_pid].current_hp,
+            "partner_max_hp": after[partner_pid].max_hp,
+        })
+    logger.info(f"🏋️ train battle: {record} stop={stop}")
+    return record, stop
+
+
+def _train_stop_after_battle(
+    trainee_pid: int, wanted_partner_pid: Optional[int], until_level: Optional[int], deadline: float, minutes: float
+) -> Optional[Tuple[str, str]]:
+    """(code, why) when grinding should stop after a battle, else None."""
+    party = _train_party()
+    trainee = dict(party).get(trainee_pid)
+    if trainee is None:
+        return ("unexpected", "the Pokémon being trained is no longer in the party.")
+    name = trainee.species_name.upper()
+    if until_level is not None and trainee.level >= until_level:
+        return ("until_level", f"{name} reached Lv{trainee.level} (until_level={until_level}).")
+    index = _train_partner(party, trainee_pid, wanted_partner_pid)
+    weak = _train_weakness(index)
+    if weak:
+        return ("team_weak", f"the team is weak ({', '.join(weak)}): heal first. {_heal_way()}")
+    if index is None:
+        return ("no_partner", f"no teammate above half HP is left to fight for {name}: heal first. {_heal_way()}")
+    if time.monotonic() > deadline:
+        return ("time", f"the {minutes:g}-minute limit is up (call train again to keep going).")
+    return None
+
+
+def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, why: str) -> str:
+    """'4 wild battles (WHISMUR Lv6, …): SHROOMISH Lv7→9 (+120 EXP shared), COMBUSKEN 45→31/51. Stopped: …'"""
+    if not battles:
+        return f"No wild battle in {elapsed:.0f} s ({steps} steps in the grass). Stopped: {why}"
+    names = [b["opponents"][0] if b["opponents"] else "?" for b in battles]
+    shown = ", ".join(names[:6]) + (", …" if len(names) > 6 else "")
+    first, last = battles[0], battles[-1]
+    exp = sum(b["exp_gained"] for b in battles)
+    text = (
+        f"{len(battles)} wild battle{'s' if len(battles) != 1 else ''} in {elapsed:.0f} s ({shown}): "
+        f"{first['trainee']} Lv{first['level_before']}→{last['level_after']} (+{exp} EXP shared, "
+        f"HP {last['trainee_hp']}/{last['trainee_max_hp']})"
+    )
+    partners: Dict[str, Tuple[int, int, int]] = {}
+    for b in battles:
+        if "partner" in b:
+            start = partners.get(b["partner"], (b["partner_hp_before"],))[0]
+            partners[b["partner"]] = (start, b["partner_hp"], b["partner_max_hp"])
+    text += "".join(f", {name} {hp0}→{hp1}/{top}" for name, (hp0, hp1, top) in partners.items())
+    return f"{text}. Stopped: {why}"
+
+
+@app.post("/mcp/train")
+async def mcp_train(request: dict = None):
+    """MCP Tool: grind wild battles for one party Pokémon until a stop condition.
+
+    David (2026-11-03): "Can we speed it up between battles? It sits for a while after
+    the battle is over." Measured live: switch-training a Lv7 SHROOMISH with a Lv17
+    COMBUSKEN cost about three ~30 s model decisions per wild battle (walk into the grass,
+    switch_pokemon("COMBUSKEN"), use_move until it ends), and the pause after each battle
+    was the model deciding where to walk next. None of that needs a decision.
+
+    Outside a battle it walks to the nearest two side-by-side encounter tiles (tall
+    grass, or any cave floor) and steps between them until a battle starts. In a wild
+    battle the trainee goes out on turn 1 for the partner (switch_pokemon), which then
+    uses its best move each turn (use_move); both share the EXP. Against a foe it beats
+    with a super-effective move and that can't hit it super-effectively, the trainee
+    fights itself while above half HP (_trainee_advantage). It returns to the model
+    for anything that is a decision or a surprise: until_level reached, the team weak
+    (the TEAM IS WEAK check, with the partner's PP), a question (learn a move, evolve,
+    "Use next POKéMON?"), a trainer battle, the time limit, or a walk or menu that did
+    not go as expected. The game runs at turbo speed for the whole call.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "train is only implemented for Emerald"}
+    try:
+        with _turbo():
+            return await _train(request or {})
+    except Exception as e:
+        logger.error(f"Error in train: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
+    from server import game_tools
+    from server.field_control import DIRECTION_DELTAS
+
+    source = "train"
+    wanted = request.get("trainee", request.get("pokemon"))
+    if wanted is None or str(wanted).strip() == "":
+        return _refusal("trainee is required: the party Pokémon to train, e.g. 'SHROOMISH' (or its party number 1-6).")
+    until_level = request.get("until_level")
+    if until_level is not None and str(until_level).strip() != "":
+        try:
+            until_level = int(until_level)
+        except (TypeError, ValueError):
+            return _refusal(f"until_level must be a level number 2-100, not {until_level!r}.")
+        if not 2 <= until_level <= 100:
+            return _refusal(f"until_level must be a level number 2-100, not {until_level}.")
+    else:
+        until_level = None
+    try:
+        minutes = float(request.get("max_minutes") or TRAIN_DEFAULT_MINUTES)
+    except (TypeError, ValueError):
+        return _refusal(f"max_minutes must be a number of minutes, not {request.get('max_minutes')!r}.")
+    minutes = min(minutes, TRAIN_MAX_MINUTES) if minutes > 0 else TRAIN_DEFAULT_MINUTES
+    catch = None
+    if request.get("catch") is not None and str(request.get("catch")).strip() != "":
+        try:
+            catch = (str(request["catch"]).strip().upper(), int(request.get("catch_min_level") or 1))
+        except (TypeError, ValueError):
+            return _refusal(f"catch_min_level must be a level number, not {request.get('catch_min_level')!r}.")
+
+    party = _train_party()
+    listing = ", ".join(f"{i + 1}. {_mon_text(mon)}" for i, (_, mon) in enumerate(party))
+    index = _train_member(party, wanted)
+    if index is None:
+        return _refusal(f"{wanted} is not in your party. Your party: {listing}.")
+    trainee_pid, trainee = party[index]
+    trainee_name = trainee.species_name.upper()
+    if until_level is not None and trainee.level >= until_level:
+        return _refusal(f"{trainee_name} is already Lv{trainee.level} (until_level={until_level}): nothing to train.")
+    partner_pid = None
+    if request.get("partner") is not None and str(request.get("partner")).strip() != "":
+        p = _train_member(party, request["partner"])
+        if p is None:
+            return _refusal(f"{request['partner']} is not in your party. Your party: {listing}.")
+        if party[p][0] == trainee_pid:
+            return _refusal(f"The partner must be another Pokémon: {trainee_name} is the one being trained and must not fight.")
+        partner_pid = party[p][0]
+
+    in_battle = _mem(lambda r: r.is_in_battle())
+    spots = None
+    if not in_battle:
+        refused = _field_refusal(source)
+        if refused:
+            return refused
+
+        def _spots():
+            with memory_lock:
+                return game_tools.wild_encounter_spots(env)
+
+        spots = await run_in_threadpool(_spots)
+        if not spots["pairs"]:
+            snap = _field_snapshot()
+            location = _location_name()
+            way = await run_in_threadpool(
+                game_tools.way_to_wild_encounters, location, (snap.x, snap.y) if snap is not None else None
+            )
+            return _refusal(f"No tall grass here ({location}), and it isn't a cave: {way}", stopped_because="no_grass")
+    partner_index = _train_partner(party, trainee_pid, partner_pid)
+    weak = _train_weakness(partner_index)
+    if weak:
+        return _refusal(
+            f"Not training: the team is weak ({', '.join(weak)}). Heal first: {_heal_way()}", stopped_because="team_weak"
+        )
+    if partner_index is None:
+        who = f"{_mon_text(dict(party)[partner_pid])} can't" if partner_pid is not None else "No teammate can"
+        return _refusal(
+            f"{who} fight for {trainee_name}: train needs a teammate above half HP to come in for it "
+            f"(your party: {listing}). {_heal_way() if len(party) > 1 else 'Catch a second Pokémon first.'}",
+            stopped_because="no_partner",
+        )
+
+    logger.info(f"🏋️ train {trainee_name} until_level={until_level} max_minutes={minutes:g} partner={partner_pid}")
+    started = time.monotonic()
+    deadline = started + minutes * 60
+    battles: List[Dict[str, Any]] = []
+    stop: Optional[Tuple[str, str]] = None
+    steps = stuck = pair_index = 0
+    quiet_steps = 0
+    last_walk = ""
+    while stop is None:
+        if _mem(lambda r: r.is_in_battle()):
+            record, stop = await _train_battle(trainee_pid, partner_pid, deadline + TRAIN_FINISH_BATTLE_S, catch)
+            battles.append(record)
+            quiet_steps = 0
+            if stop is None:
+                stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes)
+            continue
+        snap = _field_snapshot()
+        if snap is None:
+            stop = ("unexpected", "the player's position could not be read.")
+            break
+        if not snap.field_free:
+            # A battle's opening transition, a fade, or a script: wait for one to settle.
+            if await _await_game(lambda: _mem(lambda r: r.is_in_battle()) or _player_can_walk(), MACRO_TEXT_FRAMES):
+                continue
+            stop = ("unexpected", f"something else has control of the player at {_position_text(snap)}.{_screen_note()}")
+            break
+        # Only once nothing is starting: seen in a test, the last step before the deadline
+        # began an encounter whose intro wasn't yet "in battle", and train handed back
+        # mid-intro. The settle above lets that battle be finished first.
+        if time.monotonic() > deadline:
+            stop = ("time", f"the {minutes:g}-minute limit is up (call train again to keep going).")
+            break
+        if spots is None or spots.get("map_id", snap.map_id) != snap.map_id:
+            if spots is not None:
+                stop = ("unexpected", f"the player ended up on another map ({_position_text(snap)}).")
+                break
+
+            def _spots():
+                with memory_lock:
+                    return game_tools.wild_encounter_spots(env)
+
+            spots = await run_in_threadpool(_spots)
+            if not spots["pairs"]:
+                stop = ("no_grass", f"no tall grass here ({_location_name()}) to keep training in.")
+                break
+        spots.setdefault("map_id", snap.map_id)
+        if pair_index >= len(spots["pairs"]):
+            stop = ("unexpected", f"could not get to the tall grass: {last_walk or 'every spot was blocked'}")
+            break
+        ox, oy = spots["coord_offset"] or (0, 0)
+        here = (snap.x - ox, snap.y - oy)
+        a, b = spots["pairs"][pair_index]
+        if here not in (a, b):
+            walk = await mcp_navigate_to(
+                {"x": a[0], "y": a[1], "variance": "none", "reason": "train: walk to the tall grass", "consider_npcs": True}
+            )
+            snap = _field_snapshot()
+            arrived = snap is not None and (snap.x - ox, snap.y - oy) in (a, b)
+            busy = snap is None or not snap.field_free or _mem(lambda r: r.is_in_battle())
+            if not arrived and not busy:
+                # A wild battle on the way is welcome; anything else means try another spot.
+                last_walk = walk.get("summary") or walk.get("error") or ""
+                pair_index += 1
+            continue
+        target = b if here == a else a
+        button = next(k for k, (dx, dy) in DIRECTION_DELTAS.items() if (here[0] + dx, here[1] + dy) == target)
+        queued = await take_action(ActionRequest(buttons=[button], source=source, check_movement=True))
+        report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(1))
+        after = _field_snapshot()
+        if after is not None and (after.x - ox, after.y - oy) == target:
+            steps += 1
+            quiet_steps += 1
+            stuck = 0
+            if quiet_steps >= TRAIN_MAX_QUIET_STEPS:
+                stop = ("no_encounters", f"no wild Pokémon appeared in {quiet_steps} steps here.")
+        elif after is not None and after.field_free:
+            # Only turned, or someone stands on the tile: give them a moment, then move on.
+            stuck += 1
+            if report and report.get("blocked"):
+                last_walk = report["blocked"]
+            if stuck >= TRAIN_MAX_STUCK:
+                pair_index += 1
+                stuck = 0
+            else:
+                await _await_game(lambda: False, 30)
+
+    code, why = stop
+    elapsed = time.monotonic() - started
+    summary = _train_summary(battles, steps, elapsed, why)
+    logger.info(f"🏋️ train: {summary}")
+    return {
+        "success": True,
+        "status": code.upper(),
+        "summary": summary,
+        "battles": battles,
+        "stopped_because": code,
+        "steps": steps,
+        "elapsed_s": round(elapsed, 1),
+    }
 
 
 # -- people behind counters (nurse, clerk) ---------------------------------
@@ -4981,6 +6321,207 @@ def _field_refusal(tool: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+HEAL_TRIP_MAX_MAPS = 10
+
+
+async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]]:
+    """Walk to the nearest Pokémon Center 1F (game_tools.pokemon_center_route), running
+    from wild battles on the way. Returns (maps entered, why it stopped short or None).
+
+    Seen live: with "TEAM IS WEAK … go_to_exit("south") takes the first step" in its
+    prompt, the model called train (refused: team weak) and navigate_to on its own tile
+    over and over while poison drained SHROOMISH. heal_at_pokecenter() now makes the trip
+    in the same call.
+    """
+    from server import game_tools
+    from server import menu_state as ms
+
+    return await _walk_along(
+        lambda location, position: game_tools.pokemon_center_route(location, position),
+        lambda: bool(_mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE)),
+        "the nearest Pokémon Center",
+        source,
+        f"{source}() again",
+    )
+
+
+async def _walk_along(
+    next_route, arrived, goal: str, source: str, again: str, max_maps: int = HEAL_TRIP_MAX_MAPS
+) -> Tuple[List[str], Optional[str]]:
+    """Walk map to map until arrived() is true, one go_to_exit per map from
+    next_route(location, position) (recomputed on every map, so a detour is
+    corrected). Wild battles on the way are run from; a trainer battle or a YES/NO
+    stops the walk; plain text from a scene that interrupts (Birch's on ROUTE 110) is
+    read through. Returns (maps entered, why it stopped short or None).
+    """
+    from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+
+    entered: List[str] = []
+    reads = 0
+    for _ in range(max_maps * 3):
+        if _mem(lambda r: r.is_in_battle()):
+            view = _read_battle_view()
+            if view is not None and view.get("is_trainer"):
+                return entered, f"a trainer battle started on the way: fight it with use_move, then {again}"
+            ran = await mcp_run_from_battle({"reasoning": f"{source}: on the way to {goal}"})
+            if _mem(lambda r: r.is_in_battle()):
+                return entered, f"could not run from a wild battle on the way ({ran.get('summary') or ran.get('error')})"
+            continue
+        if arrived():
+            return entered, None
+        if not _player_can_walk():
+            status = _field_status()
+            if status in (DIALOGUE_PLAIN, DIALOGUE_BUSY) and reads < 6:
+                reads += 1
+                await _read_dialogue()
+                continue
+            return entered, f"something has the player's attention on the way{_screen_note()}"
+        snap = _field_snapshot()
+        location = _location_name()
+        route = await run_in_threadpool(next_route, location, (snap.x, snap.y) if snap is not None else None)
+        if route == []:
+            return entered, None  # arrived by the map's own measure
+        if not route:
+            return entered, f"{goal} can't be reached on foot from {location}"
+        if len(entered) >= max_maps:
+            return entered, f"{goal} is still {len(route)} maps away"
+        step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
+        if _location_name() != location:
+            entered.append(_location_name())
+        elif not _mem(lambda r: r.is_in_battle()) and _player_can_walk():
+            return entered, f'go_to_exit("{route[0][0]}") did not get there ({step.get("summary") or step.get("error")})'
+    return entered, "the walk took too many steps"
+
+
+GO_TO_MAX_MAPS = 15
+
+
+@app.post("/mcp/go_to")
+async def mcp_go_to(request: dict = None):
+    """MCP Tool: walk to a named place (a town, route, building, cave floor), map after map.
+
+    David (2026-11-04), on what would speed play up: "One call per objective." Each map
+    on the way cost a ~35 s model decision (go_to_exit, then think again); this walks the
+    whole way game_tools.place_route gives, running from wild battles, reading through
+    scenes, and stopping for a trainer battle or a question.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import game_tools
+
+    source = "go_to"
+    request = request or {}
+    target = str(request.get("place") or request.get("target") or "").strip()
+    if not target:
+        return _refusal('place is required: where to go, e.g. "Route 117" or "Mauville City Pokemon Center".')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    snap = _field_snapshot()
+    start = _location_name()
+    if game_tools.arrived_at(start, (snap.x, snap.y) if snap is not None else None, target):
+        return {"success": True, "status": "ARRIVED", "summary": f"You are already on {start} ({target})."}
+
+    def arrived() -> bool:
+        here = _field_snapshot()
+        return game_tools.arrived_at(_location_name(), (here.x, here.y) if here is not None else None, target)
+
+    with _turbo():
+        entered, why = await _walk_along(
+            lambda location, position: game_tools.place_route(location, position, target),
+            arrived,
+            target,
+            source,
+            f'go_to("{target}") again',
+            GO_TO_MAX_MAPS,
+        )
+    walked = f" Walked {' → '.join(entered)}." if entered else ""
+    if why:
+        return _refusal(f"Did not reach {target}: {why}.{walked}")
+    return {
+        "success": True,
+        "status": "ARRIVED",
+        "summary": f"Arrived at {target}: now at {_position_text(_field_snapshot())}.{walked}",
+    }
+
+
+@app.post("/mcp/talk_to")
+async def mcp_talk_to(request: dict = None):
+    """MCP Tool: walk next to the person at (x, y), face them, press A and read what they say.
+
+    Seen live twice: told to talk to Rydel (bike shop) and to Wally (in front of Mauville
+    Gym), the model aimed navigate_to at the person's own tile, which can't be stood on,
+    and shuffled between the tiles around them for many minutes without facing them and
+    pressing A. One call now does all of it; a battle that starts is left to use_move.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server.field_control import DIRECTION_DELTAS
+
+    source = "talk_to"
+    request = request or {}
+    try:
+        x, y = int(request.get("x")), int(request.get("y"))
+    except (TypeError, ValueError):
+        return _refusal("x and y are required: the tile the person stands on (from the map or OBJECTIVES).")
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    snap = _field_snapshot()
+    if snap is None:
+        return _refusal("The player's position could not be read.")
+    # The four tiles around the person, nearest to the player first.
+    sides = sorted(
+        ((x - dx, y - dy, button) for button, (dx, dy) in DIRECTION_DELTAS.items()),
+        key=lambda t: abs(t[0] - snap.x) + abs(t[1] - snap.y),
+    )
+    tried = []
+    for sx, sy, facing in sides:
+        snap = _field_snapshot()
+        if snap is None or (snap.x, snap.y) != (sx, sy):
+            walk = await mcp_navigate_to({"x": sx, "y": sy, "variance": "none", "reason": f"{source}: next to ({x},{y})", "consider_npcs": True})
+            if _mem(lambda r: r.is_in_battle()):
+                return _refusal(f"A battle started on the way to ({x},{y}): fight it with use_move, then talk_to again.")
+            snap = _field_snapshot()
+            if snap is None or (snap.x, snap.y) != (sx, sy):
+                tried.append(f"({sx},{sy}): {str(walk.get('summary') or walk.get('error'))[:80]}")
+                continue
+        from server.menu_state import phone_call_active
+
+        calls = []
+        for _ in range(3):
+            # A POKéNAV call can ring on the walk (seen in a test: ISABEL called as the
+            # player reached Wally, and the A read her call). Finish it, then talk.
+            while _mem(phone_call_active):
+                calls.extend((await _read_dialogue()).get("texts") or [])
+            if snap.facing != facing:
+                await _macro_press([facing], source)  # the person blocks the step, so this only turns
+                snap = _field_snapshot() or snap
+            await _macro_press(["A"], source)
+            if await _await_game(lambda: _mem(lambda r: r.is_in_battle()), 60):
+                return {"success": True, "status": "BATTLE", "summary": f"Talked to the person at ({x},{y}) from ({sx},{sy}); a battle started: use use_move."}
+            if not _mem(phone_call_active):
+                break
+        # A scene can run many boxes before its battle (Wally and his uncle argue first):
+        # keep reading while a script holds the player and no battle has begun.
+        from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+
+        texts: List[str] = []
+        read: Dict[str, Any] = {}
+        for _ in range(6):
+            read = await _read_dialogue()
+            texts.extend(t for t in read.get("texts") or [] if t not in texts)
+            if _mem(lambda r: r.is_in_battle()) or _field_status() not in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
+                break
+        if calls:
+            texts = texts + [f"(a POKéNAV call came first: {_quote(calls, 1)})"]
+        if _mem(lambda r: r.is_in_battle()):
+            return {"success": True, "status": "BATTLE", "summary": f"Talked to ({x},{y}): {_quote(texts)}. A battle started: use use_move."}
+        said = _quote(texts) or "nothing was said (nobody there, or they only turned)"
+        return {"success": True, "status": "TALKED", "summary": f"Talked to the person at ({x},{y}) from ({sx},{sy}): {said}. {read.get('summary', '')}".strip()}
+    return _refusal(f"Could not reach a tile next to ({x},{y}): " + "; ".join(tried))
+
+
 @app.post("/mcp/heal_at_pokecenter")
 async def mcp_heal_at_pokecenter(request: dict = None):
     """MCP Tool: inside a Pokémon Center, talk to the nurse, answer YES, and confirm
@@ -4996,13 +6537,12 @@ async def mcp_heal_at_pokecenter(request: dict = None):
         refused = _field_refusal(source)
         if refused:
             return refused
-        location = _location_name()
+        trip = []
         if not _mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE):
-            if "POKEMON CENTER" in location:
-                return _refusal(f"There is no nurse on {location}: the nurse is on the 1F (ground floor). Take the stairs down.")
-            hint = _exit_hint("POKEMON CENTER")
-            where = f" This map has one: {hint}, then heal_at_pokecenter." if hint else " Go to a town with a POKEMON CENTER first."
-            return _refusal(f"You are not inside a Pokémon Center ({location}).{where}")
+            trip, why = await _walk_to_pokemon_center(source)
+            if why:
+                walked = f" Walked {' → '.join(trip)} first." if trip else ""
+                return _refusal(f"Did not heal: {why}.{walked}")
 
         before = _party_lines()
         spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_NURSE, "nurse", source)
@@ -5035,6 +6575,8 @@ async def mcp_heal_at_pokecenter(request: dict = None):
             summary = "Healed: every party Pokémon has full HP and no status problem. " + summary
         else:
             summary = "NOT healed (game memory shows HP or status not restored). " + summary
+        if trip:
+            summary = f"Walked {' → '.join(trip)}. " + summary
         if closed:
             summary += f" You can walk again at {_position_text(_field_snapshot())}."
         else:
@@ -6148,6 +7690,25 @@ async def mcp_save_memory(request: dict):
 def _coerce_replan_edits_to_list(edits: Any) -> List[Dict[str, Any]]:
     """Normalize ``edits`` from JSON / odd client encodings into ``list[dict]``."""
     return normalize_replan_edits(edits)
+
+
+@app.post("/insert_objective")
+async def insert_objective(request: dict):
+    """Operator endpoint (not an agent tool): insert one objective at an index, e.g. a
+    training step before the current story objective. Body: {category, index, objective}.
+    index defaults to the category's current index."""
+    global direct_objectives_manager
+    if direct_objectives_manager is None or direct_objectives_manager.mode != "categorized":
+        return {"success": False, "error": "needs the categorized objective manager"}
+    category = request.get("category", "story")
+    index = request.get("index")
+    if index is None:
+        index = direct_objectives_manager._get_index_for_category(category)
+    result = direct_objectives_manager.insert_objective(category, int(index), request.get("objective") or {})
+    if result.get("success"):
+        _update_objectives_cache()
+        logger.info(f"➕ insert_objective({category}@{index}): {result.get('inserted')}")
+    return result
 
 
 @app.post("/mcp/replan_objectives")

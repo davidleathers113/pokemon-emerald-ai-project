@@ -572,6 +572,38 @@ def _map_dirs_by_const() -> Dict[str, str]:
     return out
 
 
+@lru_cache(maxsize=1)
+def _map_group_dirs() -> Tuple[Tuple[str, ...], ...]:
+    """data/maps/map_groups.json as ((dir, ...) per group, ...): the ROM's map numbering."""
+    root = _get_pokeemerald_root()
+    if not root:
+        return ()
+    try:
+        with open(root / "data" / "maps" / "map_groups.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ()
+    return tuple(tuple(data.get(group, ())) for group in data.get("group_order", ()))
+
+
+def decomp_map_at(group: int, num: int) -> Optional[Tuple[str, str]]:
+    """(data/maps directory, readable name) of map (group, num) as the ROM numbers it.
+
+    Seen live: map (22, 0) is ROUTE 117 POKEMON DAY CARE, but pokemon_env's MapLocation
+    table called it ROUTE 116 TUNNELERS REST HOUSE; the prompt then showed that house's
+    map and exits, and the AI walked at an exit that wasn't there. 24 of the table's
+    names are off like this. The readable name is registered in ROM_TO_PORYMAP_MAP.
+    """
+    groups = _map_group_dirs()
+    if not (0 <= group < len(groups) and 0 <= num < len(groups[group])):
+        return None
+    map_dir = groups[group][num]
+    const = next((c for c, d in _map_dirs_by_const().items() if d == map_dir), None)
+    readable = _readable_map_name(const) if const else map_dir
+    ROM_TO_PORYMAP_MAP.setdefault(readable, map_dir)
+    return map_dir, readable
+
+
 @lru_cache(maxsize=64)
 def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
     """A map's collision grid from the decomp, one string per row."""
@@ -733,8 +765,14 @@ def _format_trainers(map_dir: str, memory_reader: Any) -> List[str]:
             left.append(f"{name} at ({x}, {y})")
     if not left:
         return ["- every trainer on this map is already beaten"]
+    # Seen live in Rustboro Gym: the model went from trainer to trainer with a worn-down
+    # Torchic. The objectives say where to heal; this keeps the warning next to the names.
+    try:
+        weak = bool(memory_reader.read_team_condition()["weak"])
+    except Exception:
+        weak = False  # a warning that can't be read is left out, never guessed
     return [
-        "- " + "; ".join(left),
+        "- " + "; ".join(left) + (" (heal first: team is weak)" if weak else ""),
         "  (walking into a trainer's line of sight starts the battle; or stand next to them, face them and press A)",
     ]
 

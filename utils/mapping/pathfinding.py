@@ -29,7 +29,13 @@ VARIANCE_TO_STEPS = {
 }
 
 # Pathfinding cost penalties
-GRASS_TILE_COST_MULTIPLIER = 1.5  # 50% penalty for traversing grass (to avoid wild encounters)
+# Penalty for walking through tall grass. Seen live (2026-11-03): with 1.5, go_to_exit on
+# Route 116 cut straight through the grass and a wild battle stopped nearly every walk,
+# though a grass-free way existed. A grass step starts a battle ~11% of the time
+# (Route 116: rate 20 x 16 / 2880) and a battle costs about a minute of model time, versus
+# well under a second per plain step, so a grass step is worth a detour of many tiles.
+# 8 detours freely but still walks into grass when it is the only way or the target.
+GRASS_TILE_COST_MULTIPLIER = 8.0
 
 
 @dataclass
@@ -86,6 +92,10 @@ class Pathfinder:
         self.collision_map = collision_map or {}
         self.allow_diagonal = allow_diagonal
         self.tile_connectivity = {}  # Cache of valid movement directions per tile
+        # Cost of a tall-grass step. The server sets 1.0 while a training objective is
+        # current (David, 2026-11-03: "make sure it doesn't avoid tall grass now. I want it
+        # to battle pokemon") and GRASS_TILE_COST_MULTIPLIER otherwise.
+        self.grass_cost = GRASS_TILE_COST_MULTIPLIER
 
     def find_path(
         self,
@@ -194,6 +204,25 @@ class Pathfinder:
                         doors_and_stairs.append(pos)
             if doors_and_stairs:
                 logger.debug(f"Explicitly unblocked {len(doors_and_stairs)} door/stairs tiles: {doors_and_stairs[:5]}")
+        # Only the warp being walked to may be stepped on: stepping on any other warps the
+        # player away. Seen live: from ROUTE 110 (16,89) the way north ran through the
+        # Cycling Road gate's door at (16,88), and every walk north ended inside the gate.
+        # The tiles are map.json's warp_events ("raw_warps"): the grid's 'D' marks whole
+        # floors in places (MAUVILLE CITY BIKE SHOP), and the builder's "warps" are moved
+        # next to their door. When the goal is a warp (raw or the builder's moved copy), the
+        # raw warp within one tile of it is the one being walked to. A goal that is not a
+        # warp opens no door: seen in a test, train's walk to grass beside ROUTE 117's Day
+        # Care door stepped on the door.
+        goal_is_warp = goal in {
+            (w.get("x"), w.get("y")) for w in map_data.get("warps") or [] if isinstance(w, dict)
+        } or goal in {tuple(p) for p in map_data.get("raw_warps") or []}
+        for pos in map_data.get("raw_warps") or []:
+            pos = tuple(pos)
+            if pos == start:
+                continue
+            if goal_is_warp and abs(pos[0] - goal[0]) + abs(pos[1] - goal[1]) <= 1:
+                continue
+            blocked.add(pos)
 
         # Red: unblock cuttable trees ('t') adjacent to the player (they can use Cut)
         if game_type == "RED" and "grid" in map_data:
@@ -358,10 +387,14 @@ class Pathfinder:
                     "type": "porymap",
                     "grid": porymap["grid"],  # ASCII grid: [['.', '#', ...], ...]
                     "objects": porymap.get("objects", []),
-                    "runtime_objects": map_data.get("object_events", []),
+                    # Live positions (server.game_tools.load_pathfinding_state) win over the
+                    # older map-level copy.
+                    "runtime_objects": porymap.get("runtime_objects") or map_data.get("object_events", []),
                     "width": porymap.get("dimensions", {}).get("width", 0),
                     "height": porymap.get("dimensions", {}).get("height", 0),
                     "warps": porymap.get("warps", []),  # Include warps for pathfinding
+                    # The tiles that really warp (map.json warp_events), see find_path.
+                    "raw_warps": porymap.get("raw_warps", []),
                 }
 
                 # Include raw tiles with elevation if available
@@ -713,7 +746,9 @@ class Pathfinder:
                     if goal_pos and obj_pos == goal_pos:
                         continue
                     blocked.add(obj_pos)
-            elif "objects" in map_data:
+            # The map file's objects too: live positions only cover objects near the
+            # camera, so a far-off trainer would otherwise vanish from the plan.
+            if "objects" in map_data:
                 objects = map_data["objects"]
                 for obj in objects:
                     obj_x = obj.get("x", 0)
@@ -1196,7 +1231,10 @@ class Pathfinder:
                 return self._reconstruct_path(current)
 
             # Check if we've searched too far
-            if current.g_cost > max_distance:
+            # max_distance is a step budget, but g_cost counts a grass step as grass_cost.
+            # Seen live (2026-11-03): with grass at 8x, go_to_exit("west") from Route 116
+            # (44,9) reported "no walkable path" for a ~45-step route that crossed grass.
+            if current.g_cost > max_distance * max(1.0, self.grass_cost):
                 continue
 
             closed_set.add((current.x, current.y))
@@ -1231,7 +1269,7 @@ class Pathfinder:
                         if 0 <= nx < len(row):
                             cell = row[nx]
                             if cell == "~":  # Grass tile
-                                move_cost = GRASS_TILE_COST_MULTIPLIER  # Penalty to discourage grass traversal
+                                move_cost = self.grass_cost
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)

@@ -26,14 +26,19 @@ End the sequence right BEFORE anything you must see first: a YES/NO question, th
 Moving and acting:
 - `go_to_exit(exit, reasoning)` — Go to ANOTHER map: walks to an entry of the EXITS list and through it, e.g. `go_to_exit("north")` or `go_to_exit("OLDALE TOWN")`.
 - `navigate_to(x, y, variance, reason, consider_npcs)` — Walk to a tile on THIS map with pathfinding. Start with `variance="none"`.
-- `use_move(move, reasoning)` — In a battle, use a move by name, e.g. `use_move("EMBER")`; the battle section names the best move.
+- `use_move(move, reasoning)` — In a battle, use a move by name, e.g. `use_move("EMBER")`; the battle section names the best move. It reads through the turn's text and answers at your next turn or when the battle ends, quoting what happened.
 - `switch_pokemon(pokemon, reasoning)`, `throw_ball(ball, reasoning)`, `run_from_battle(reasoning)` — Other battle choices in one call (catching and running: wild battles only).
-- `heal_at_pokecenter(reasoning)` — Inside a Pokémon Center: heals your whole party. `buy_item(item, count, reasoning)` — Inside a Poké Mart: buys from the clerk.
+- `heal_at_pokecenter(reasoning)` — Heals your whole party from anywhere: it walks to the nearest Pokémon Center itself.
+- `go_to(place, reasoning)` — Walk to a named place in one call (a town, route, building or cave floor, as the objectives name it). Use it instead of many go_to_exit calls whenever the objective names somewhere to go.
+- `talk_to(x, y, reasoning)` — Talk to the person at (x, y): it walks next to them, faces them and presses A. Use it whenever an objective says to talk to someone; never navigate_to the tile a person stands on. `buy_item(item, count, reasoning)` — Inside a Poké Mart: buys from the clerk.
+- `train(trainee, until_level, reasoning)` — Level up a Pokémon in one call: it walks into tall grass and wins wild battles with your strongest teammate while the trainee shares the EXP, and answers when it is done or something needs you. Add `catch="SABLEYE", catch_min_level=10` to stop when that wild Pokémon appears, then catch it.
 - `press_buttons(buttons, reasoning)` — Short moves, menus, dialogue, and anything the tools above don't cover (see Plan the Whole Sequence).
 
 If a result says BLOCKED, that direction is a wall, tree or person from where you stand: pressing it again does nothing. Use `go_to_exit`, `navigate_to` or another direction.
 
-Plain text boxes are advanced for you; what was said appears under RESULTS FROM PREVIOUS STEP as "Dialogue read". YES/NO questions and menus are left for you to answer.
+Plain text boxes are advanced for you; what was said appears under RESULTS FROM PREVIOUS STEP as "Dialogue read" (in a battle, "Battle text read"). YES/NO questions and menus are left for you to answer.
+
+If the OBJECTIVES or the state say TEAM IS WEAK, call `heal_at_pokecenter` right away (it walks there itself), before training or fighting any trainer.
 
 Information:
 - `get_walkthrough(part)` — Official Emerald walkthrough, parts 1-21 (Part 1: Littleroot, Part 6: Roxanne, Part 21: Elite Four).

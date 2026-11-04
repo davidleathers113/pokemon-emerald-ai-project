@@ -349,6 +349,11 @@ def _effectiveness_label(move):
     return f"{eff:g}x" + (" STAB" if move['stab'] else "")
 
 
+# In a wild battle nothing is gained by risking a faint: under a quarter of max HP the
+# battle section suggests running or switching instead (David: heal when HP is low).
+WILD_LEAD_LOW_HP_SHARE = 0.25
+
+
 def format_battle_view(view):
     """Compact battle section from memory_reader.read_battle_view() (None -> []).
 
@@ -392,6 +397,12 @@ def format_battle_view(view):
         lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\").")
     elif moves:
         lines.append("No damaging move with PP left: switch Pokémon, use an item, or run.")
+    player = view['player']
+    if not view['is_trainer'] and player['max_hp'] and player['hp'] < player['max_hp'] * WILD_LEAD_LOW_HP_SHARE:
+        lines.append(
+            f"{player['name'].upper()} is low on HP ({player['hp']}/{player['max_hp']}): "
+            "run_from_battle() or switch_pokemon() is safer than attacking."
+        )
     return lines
 
 

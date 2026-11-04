@@ -32,6 +32,8 @@ BATTLE_ALLOWED_TOOL_NAMES = (
     "run_from_battle",  # local macros: whole battle-menu chores checked from memory
     "throw_ball",
     "switch_pokemon",
+    # Not train: after the battle it walks on into more battles, and the battler, like
+    # its missing navigate_to, is meant to end with the battle it was started for.
     "process_memory",
     "process_skill",
     "add_memory",

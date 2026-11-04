@@ -88,6 +88,8 @@ class FieldSnapshot:
     overworld: bool
     extra_windows: List[int] = field(default_factory=list)
     waiting_for_button: bool = False
+    printer_active: bool = False  # a text printer is printing or on its arrow (menu_state.text_printing)
+    phone_call: bool = False  # a POKéNAV call is playing (menu_state.phone_call_active)
 
     @property
     def position(self) -> Tuple[int, int, Tuple[int, int]]:
@@ -119,6 +121,8 @@ def read_field_snapshot(reader) -> FieldSnapshot:
     base = _player_object_base(reader)
     facing = _FACING_TO_BUTTON.get(reader._read_u16(base + 0x18) & 0xF)
     in_battle = bool(reader._read_u8(G_MAIN_IN_BATTLE_BYTE) & IN_BATTLE_MASK)
+    from server.menu_state import phone_call_active, text_printing  # menu_state imports this module
+
     return FieldSnapshot(
         x=int(x),
         y=int(y),
@@ -134,12 +138,19 @@ def read_field_snapshot(reader) -> FieldSnapshot:
             reader._read_u8(S_GLOBAL_SCRIPT_CONTEXT + 1) == SCRIPT_MODE_NATIVE
             and (reader._read_u32(S_GLOBAL_SCRIPT_CONTEXT + 4) | 1) == (WAIT_FOR_A_OR_B_PRESS | 1)
         ),
+        printer_active=text_printing(reader),
+        phone_call=phone_call_active(reader),
     )
 
 
-def npc_at(reader, x: int, y: int) -> bool:
-    """True if a visible object event other than the player stands on (x, y)."""
+def npc_positions(reader) -> List[Tuple[int, int]]:
+    """Map tiles where a visible object event other than the player stands right now.
+
+    Only objects the game has loaded (near the camera) are listed; the map file's static
+    objects cover the rest.
+    """
     player_base = _player_object_base(reader)
+    spots = []
     for i in range(OBJECT_EVENT_COUNT):
         base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
         if base == player_base:
@@ -148,11 +159,13 @@ def npc_at(reader, x: int, y: int) -> bool:
         active, invisible = flags & 0x1, flags & (1 << 13)
         if not active or invisible:
             continue
-        ox = reader._read_s16(base + 0x10) - MAP_OFFSET
-        oy = reader._read_s16(base + 0x12) - MAP_OFFSET
-        if (ox, oy) == (x, y):
-            return True
-    return False
+        spots.append((reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET))
+    return spots
+
+
+def npc_at(reader, x: int, y: int) -> bool:
+    """True if a visible object event other than the player stands on (x, y)."""
+    return (x, y) in npc_positions(reader)
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +243,20 @@ def dialogue_status(snapshot: FieldSnapshot) -> str:
     shows with sFieldMessageBoxMode already back to 0). The map-name popup is also a
     window, but it shows while the player walks freely, so it does not count. A box is
     PLAIN while its text prints or the script waits in `waitbuttonpress`.
+
+    A box whose text is still printing (or on its down arrow) is PLAIN even with another
+    window up: a YES/NO or menu opens only after its question's printer has finished.
+    Seen live: a POKéNAV call (Dad, on Mr. Briney's boat) draws the caller's icon in a
+    second window; read as a CHOICE, nothing ever pressed A and the boat sat at sea.
+    After its last line the call waits for A to hang up with no printer running, so a
+    call is PLAIN throughout (calls never ask a question).
     """
     if snapshot.in_battle or not snapshot.overworld:
         return DIALOGUE_OTHER
+    if snapshot.phone_call:
+        return DIALOGUE_PLAIN
+    if snapshot.printer_active and snapshot.message_box:
+        return DIALOGUE_PLAIN
     if snapshot.extra_windows and (snapshot.message_box or snapshot.controls_locked):
         return DIALOGUE_CHOICE
     if snapshot.message_box or snapshot.waiting_for_button:
@@ -393,11 +417,22 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
 
     Accepts a compass/edge word ("north", "UP", "north edge"), a destination name
     or part of one ("OLDALE TOWN", "oldale", "Professor Birch's Lab"), or the
-    coordinates shown in the EXITS list ("(8, 9)").
+    coordinates shown in the EXITS list ("(8, 9)"), or both ("GRANITE CAVE 1F (4, 21)":
+    the route hint's form where several warps lead to the same map).
     """
     wanted = normalize_name(query)
     if not wanted:
         return []
+    text = query.strip()
+    open_at = text.rfind("(")
+    if open_at > 0 and text.endswith(")"):
+        parts = [p.strip() for p in text[open_at + 1:-1].split(",")]
+        if len(parts) == 2 and all(p.lstrip("-").isdigit() for p in parts):
+            coords = (int(parts[0]), int(parts[1]))
+            named = match_exits(exits, text[:open_at])
+            at = [e for e in named if e["kind"] == "warp" and coords in (e.get("listed_xy"), (e["x"], e["y"]))]
+            if at:
+                return at
     stripped = wanted
     for word in ("EDGEOFTHEMAP", "EDGE", "THE", "GOTO", "EXIT"):
         stripped = stripped.replace(word, "")

@@ -164,16 +164,16 @@ def test_use_move_by_slot_number():
     assert _wait_for_pp(s, 4, 24)
 
 
-def test_use_move_refuses_while_text_plays():
+def test_use_move_leaves_no_text_playing():
+    """It used to return mid-turn and refuse a second call with "press A to continue";
+    now it returns only after the turn (test_battle_flow.py covers the details)."""
     s = server()
     s.load(BATTLE)
-    assert s.call("mcp_use_move", {"move": "EMBER", "reasoning": ""})["success"]
-    deadline = time.time() + 5
-    while _view(s)["menu"] != "busy" and time.time() < deadline:
-        time.sleep(0.05)
     r = s.call("mcp_use_move", {"move": "EMBER", "reasoning": ""})
     print("   ", r)
-    assert r["success"] is False and "press A to continue" in r["error"], r
+    assert r["success"] is True, r
+    view = _view(s)
+    assert view is None or view["menu"] != "busy", view
 
 
 def test_use_move_unknown_move_lists_the_moves():

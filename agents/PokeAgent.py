@@ -167,9 +167,39 @@ def truncate_middle(text: Any, max_chars: int) -> Any:
 
 # Server-side macros (server/app.py): each runs a whole menu chore and answers only
 # when its presses are done, like use_move.
-MACRO_TOOLS = ("heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item")
+MACRO_TOOLS = ("heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to")
 # Tools that press buttons and answer after the presses ran.
 PRESSING_TOOLS = ("press_buttons", "navigate_to", "go_to_exit", "use_move") + MACRO_TOOLS
+# HTTP timeout for a pressing tool: a long walk plus a door warp, or a macro reading a
+# nurse's or clerk's text at slow text speed, can take over a minute.
+PRESSING_TOOL_TIMEOUT_S = 150
+# train grinds for max_minutes (server/app.py TRAIN_DEFAULT_MINUTES, capped at
+# TRAIN_MAX_MINUTES), then finishes the battle it is in (TRAIN_FINISH_BATTLE_S) and its
+# last turn; the request must outlive all of that or the agent gives up on a call that
+# is still pressing buttons.
+TRAIN_DEFAULT_MINUTES = 4.0
+TRAIN_MAX_MINUTES = 10.0
+TRAIN_FINISH_S = 90 + PRESSING_TOOL_TIMEOUT_S
+# heal_at_pokecenter walks up to ~10 maps (server HEAL_TRIP_MAX_MAPS, each a go_to_exit)
+# before it talks to the nurse.
+HEAL_TRIP_TIMEOUT_S = 600
+
+
+def tool_timeout_s(tool_name: str, arguments: Dict[str, Any]) -> float:
+    """Seconds to wait for a tool's HTTP response."""
+    if tool_name in ("heal_at_pokecenter", "go_to"):
+        return HEAL_TRIP_TIMEOUT_S  # both walk several maps (server _walk_along)
+    if tool_name == "train":
+        try:
+            minutes = float(arguments.get("max_minutes") or TRAIN_DEFAULT_MINUTES)
+        except (TypeError, ValueError):
+            minutes = TRAIN_DEFAULT_MINUTES
+        minutes = min(minutes, TRAIN_MAX_MINUTES) if minutes > 0 else TRAIN_DEFAULT_MINUTES
+        return minutes * 60 + TRAIN_FINISH_S
+    if tool_name in PRESSING_TOOLS:
+        return PRESSING_TOOL_TIMEOUT_S
+    # Initial MCP calls may need to load data from disk (memory, porymap data, etc.).
+    return 90
 
 
 def auto_dialogue_enabled() -> bool:
@@ -281,14 +311,7 @@ class MCPToolAdapter:
                            for k, v in arguments.items()}
             logger.info(f"   Args: {args_for_log}")
 
-            # Use longer timeout for initial MCP calls that may need to load data from disk
-            # (memory, porymap data, etc.)
-            timeout = 90  # Increased from 30 to handle startup initialization
-            if tool_name in PRESSING_TOOLS:
-                # These now answer after the presses ran (with the BLOCKED / arrival
-                # report); a long walk plus a door warp, or a macro reading a nurse's
-                # or clerk's text at slow text speed, can take over a minute.
-                timeout = 150
+            timeout = tool_timeout_s(tool_name, arguments)
             response = requests.post(url, json=arguments, timeout=timeout)
             response.raise_for_status()
 

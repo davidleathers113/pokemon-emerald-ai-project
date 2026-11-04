@@ -241,6 +241,60 @@ prompt. That came to 1.1 tiles walked per minute.
     one for DAVID's Torchic), and Rusturf, Roxanne and Maxie/Tabitha are not.
   - New test `test_story_battle_already_won_says_so`; objective-memory 5/5.
 
+## Training: walk into grass, switch-train (2026-11-03)
+- **Grass while training.** David: "make sure it doesn't avoid tall grass now. I want it to
+  battle pokemon".
+  - The pathfinder's grass penalty is now a per-instance `grass_cost`.
+  - `server/app.py` `_set_grass_cost_for` sets it to 1.0 while the story objective is an
+    unmet level goal (`level_*` / `lead_level_*`) and 8× otherwise.
+  - Test `test_grass_is_walked_while_training`; objective-memory 13/13, movement-exits 16/16.
+- **Switch-training.** David: "switch immediately to my stronger pokemon every time so we can
+  quickly defeat the other pokemon and it will share exp".
+  - Gen 3 splits EXP among every Pokémon sent out against the fainted one.
+  - The training objective (`custom_train_shroomish_15`) now says: Shroomish stays first,
+    `switch_pokemon("COMBUSKEN")` on turn 1 of every battle, win with Combusken, and never let
+    Shroomish fight alone.
+  - This was an objective edit only, applied live without a restart.
+
+## Team building before Roxanne (2026-11-03)
+- **Symptom:** David took over for the Roxanne battle and whited out: "Torchic … is extremely
+  weak against rock moves. This is why we need more pokemon."
+  - Torchic is pure Fire; Rock hits it 2×, and all three of Roxanne's Pokémon (Geodude Lv12
+    ×2, Nosepass Lv15) use Rock Tomb.
+  - The built-in objective list goes straight from the city to the gym with no team
+    building. My first plan (train Torchic to 16) addressed offence only.
+- **Fix:**
+  - `agents/objectives/direct_objectives.py` `insert_objective`, plus the operator endpoint
+    `POST /insert_objective` (not an agent tool). It inserts a step at or after the current
+    objective without overwriting later ones; the full list is saved, so restarts keep it.
+  - `server/app.py` `_party_condition`: new completion checks read from the party in memory:
+    `party_has_<species>`, `level_<species>_<n>`, and `lead_level_<n>`.
+  - Live plan inserted before Roxanne, each step checked against memory:
+    1. `custom_catch_shroomish`: catch Shroomish in Petalburg Woods. The ROM gives it catch
+       rate 255; the hint says don't attack it first (Ember would knock it out), and buy balls
+       if short.
+    2. `custom_train_torchic_16`: train to Combusken Lv16 (Fire/Fighting, no longer weak to
+       Rock; learns Double Kick), with which moves to forget.
+    3. `custom_train_shroomish_12`: train Shroomish to Lv12.
+    4. Roxanne's objective now carries the battle plan: Shroomish's Absorb (4×) on each
+       Geodude, Combusken's Double Kick (2×) on Nosepass, and Super Potion below half HP.
+  - Update after David trained Torchic to Combusken himself: the catch hint now says not to
+    attack Shroomish at all (Peck and Ember are 2× on it). When the wild Pokémon in battle is
+    the species a `party_has_` objective wants, `_catch_target_line` puts "CATCH THIS ONE …
+    throw_ball now; ignore the 'Best move' line" at the top of the state. Test
+    `test_battle_against_the_wanted_pokemon_says_catch_it` (wild Shroomish fixture; silent for
+    other species and trainer battles); objective-memory 11/11.
+  - Data sources: encounter tables and levels from Serebii (Bulbapedia blocks the fetch tool);
+    catch rates and types from the ROM's `gSpeciesInfo`. Route 115's Lv23–26 grass was ruled
+    out by the walking graph: 0 of its 20 grass tiles can be reached on foot from Rustboro.
+- *Verified:*
+  - Objective-memory 10/10, including `test_party_conditions_for_team_building` on
+    `test_wild_two_party.state` and `test_insert_objective_goes_before_the_current_one_and_persists`.
+  - Live: the AI's story objective is now "Catch a SHROOMISH", with the walking route from
+    Route 116 back to Petalburg Woods.
+  - Also fixed: the route to "Route 116" went into ROUTE 116 TUNNELERS REST HOUSE; an exact
+    map name now wins (movement-exits 16/16).
+
 ## Trainers not yet beaten are listed with their tiles (2026-11-03)
 - **Symptom:** in Rustboro Gym with "Defeat Gym trainers", the AI crept up one tile per
   decision. It didn't know where anyone stood.
@@ -570,6 +624,226 @@ prompt. That came to 1.1 tiles walked per minute.
     dialogue-agent 8/8, dialogue-auto-advance 6/6, phase4-agent 14/14, phase4-backend 14/14.
   - Each address was checked by printing it next to a screenshot on these fixtures.
 
+## Battles play out to the next decision (2026-11-03)
+- **Symptom (David: "taking 30 seconds between each click"):** seen live in Rustboro Gym,
+  after each `use_move` the model spent a separate ~30 s decision pressing A through
+  "TORCHIC used EMBER!", "It's not very effective…", "Foe GEODUDE fainted!", "DAVID got
+  $160 for winning!". It also alternated use_move / press A on a finished battle's text
+  for minutes. use_move returned as soon as the move was chosen, and the pre-decision
+  auto-advance only read field text (WEAKNESSES L9, M20).
+- **Fix (`server/app.py`):** `use_move` now plays the turn out with the macros' loop
+  (`_play_out_battle`: A only while a text printer waits for A and no YES/NO is up) and
+  answers at the next decision:
+  - FIGHT/BAG/POKEMON/RUN open → `status: YOUR_TURN`, the turn's messages quoted in order
+    (`What happened: "TORCHIC used GROWL! · Foe WURMPLE's ATTACK fell! · …"`) and
+    `Now: TORCHIC HP 24/33; foe WURMPLE HP 15/15.`
+  - battle over (gMain.inBattle clear, back on the map) → `status: BATTLE_OVER`, won / lost /
+    ran / caught from gBattleOutcome, the position and party HP, plus any field text box
+    still open (a gym leader's words).
+  - a question → `status: STOPPED` with it quoted: "Use next POKéMON?", a trainer's "Will
+    DAVID change POKéMON?", deleting a move to learn one, the nickname question (auto-advance
+    only), the party menu the game opens after a faint, or an evolution.
+  - Called while text still plays, it presses through to the menu first and then attacks
+    (it used to refuse with "press A to continue").
+  - `run_from_battle`, `throw_ball` and `switch_pokemon` end with the same report.
+  - Bounded by `MACRO_BATTLE_FRAMES` (4800 frames), a wall-clock guard and 40 presses.
+- **Fix (auto-advance, `/mcp/auto_advance_dialogue`):** in a battle whose screen shows text
+  or an animation (no battle menu open) and no YES/NO, it plays the text out the same way
+  (90 s cap; the agent's request times out at 120 s) and never answers a question, not even
+  the nickname one. "Battle text read (…)" goes to RESULTS FROM PREVIOUS STEP. When the
+  battle ends into field text (the trainer's last words), that is read too.
+- **Memory reads (`server/menu_state.py`), each checked on a fixture:**
+  - Battle messages are read from gDisplayedStringBattle (0x02022E2C, decoded with the
+    field-message decoder) only while window 0's text printer (B_WIN_MSG,
+    sTextPrinters[0].active) is printing. The same buffer also holds the "What will TORCHIC
+    do?" prompt, the move menu's PP/TYPE lines and healthbox names ("TORCHIC♂"); the first
+    version quoted those.
+  - Battle-script YES/NO: the opcode at gBattlescriptCurrInstr is yesnoboxlearnmove 0x5A,
+    yesnoboxstoplearningmove 0x5B or yesnobox 0x67 (indexes found by matching the .sym's
+    Cmd_* addresses in the ROM's gBattleScriptingCommandsTable at 0x0831BD10).
+    **Found while testing:** "Use next POKéMON?" is this script yesnobox, not the
+    PlayerHandleYesNoInput controller the macros checked (yes_no_prompt read False there),
+    so the old loop did not recognise it as a question (inferred: it would have waited out
+    its frame budget; not run on the old code).
+  - Evolution: gMain.callback2 = CB2_EvolutionSceneUpdate (0x0813E3A4); its text is
+    gStringVar4.
+- `agents/tools/registry.py` (use_move description) and `SIMPLE.md` (use_move line; "Battle
+  text read") say so.
+- **Test change (`test_battle_view.py`):** `test_use_move_refuses_while_text_plays` asserted
+  the old mid-turn return; it is now `test_use_move_leaves_no_text_playing`.
+- *Verified:* new `local_tests/test_battle_flow.py`, checked from memory each time:
+  - EMBER on Lyle's WURMPLE: one call returns `BATTLE_OVER`, the messages in order from
+    "TORCHIC used EMBER!" to "DAVID got $48 for winning!", gBattleOutcome 1, Lyle's trainer
+    flag set, player free to walk (no A left).
+  - GROWL: returns `YOUR_TURN` with the action menu open in memory, and HP matching
+    gBattleMons; no "What will…" in the quote.
+  - GROWL pressed by hand, then use_move("EMBER") mid-text: plays to the menu, uses EMBER
+    (PP GROWL 39, EMBER 24), battle won.
+  - "Use next POKéMON?": test_wild_two_party.state with the battling Torchic set to 1 HP and
+    poisoned in RAM (no fixture reaches a battle question naturally), GROWL → `STOPPED`,
+    "TORCHIC fainted!" then the question quoted; the yesnobox is still up.
+  - Auto-advance: from "Wild SHROOMISH appeared!" one A, texts exactly ["Wild SHROOMISH
+    appeared!", "Go! TORCHIC!"], action menu open; at "Use next POKéMON?" 0 presses and the
+    question still up; at the action menu 0 presses.
+  - Suites, all ten at once in parallel on the final code: battle-flow 14/14 (both fixes),
+    macros 20/20, battle-view 11/11, movement-exits 16/16, movement-feedback 6/6,
+    objective-memory 7/7, dialogue-agent 8/8, dialogue-auto-advance 6/6, phase4-agent 14/14,
+    phase4-backend 14/14.
+  - Not verified: a live run with the model; the trainer switch question, learn-a-move and
+    evolution stops (no fixture reaches them, WEAKNESSES L10).
+
+## Heal before trainers when the team is weak (2026-11-03)
+- **Symptom (David: "It should go to the pokemon center between trainers if the HP or PP
+  are low"):** seen live in Rustboro Gym, the model went from trainer to trainer with a
+  worn-down Torchic (WEAKNESSES M21, W3).
+- **Fix (`pokemon_env/memory_reader.py`):** `assess_team_condition` / `read_team_condition`:
+  weak when any party Pokémon has fainted, any other is under 50% of max HP
+  (`TEAM_LOW_HP_SHARE`), or every damaging move (power > 0) of the lead is at ≤ 25% of its
+  base PP (`TEAM_LOW_PP_SHARE`; base PP and power from gBattleMoves in ROM, 0x0831C898).
+  Eggs are ignored.
+- **Fix (`server/game_tools.py`):** `way_to_pokemon_center`: the nearest "… POKEMON CENTER
+  1F" on foot by the same walking graph as the story route hints (the BFS is now
+  `_walk_paths`, shared with `_far_map_hint`); "" when already inside one.
+- **Fix (`server/app.py`, `_note_team_condition`):** outside a battle, while weak, the story
+  objective's navigation hint starts with e.g. `TEAM IS WEAK (TORCHIC 15/35 HP): heal before
+  any trainer — heal_at_pokecenter() inside RUSTBORO CITY POKEMON CENTER 1F; the way:
+  go_to_exit("RUSTBORO CITY POKEMON CENTER 1F"), then heal_at_pokecenter().` (inside the
+  Center: "call heal_at_pokecenter() now"). On a battle objective the description starts
+  with "HEAL FIRST (team is weak), then:". It runs after the route hint so it comes first;
+  legacy objectives get the same; with no objective loaded it goes at the top of the state.
+  Nothing in a battle.
+- **Fix (`utils/mapping/porymap_state.py`):** the TRAINERS line ends with "(heal first: team
+  is weak)" while weak.
+- **Fix (`utils/state_formatter.py`):** in a wild battle, a lead under 25% HP gets
+  "run_from_battle() or switch_pokemon() is safer than attacking".
+- `SIMPLE.md`: one line, "If the OBJECTIVES or the state say TEAM IS WEAK, heal …".
+- Not done: navigate_to / go_to_exit don't steer around trainers' sight lines while weak.
+- *Verified (`test_battle_flow.py`):* the rules on hand-made parties (17/35 HP weak, 18/35
+  not; SCRATCH 8/35 + EMBER 6/25 PP weak, SCRATCH 9/35 not; a fainted lead hands "lead" to
+  the next); from memory, the Pokémon Center fixture healthy, then weak at 15/35 (RAM);
+  outside in Rustboro City the line names `go_to_exit("RUSTBORO CITY POKEMON CENTER 1F")`;
+  inside the Center "call heal_at_pokecenter() now"; healthy adds nothing; from the gym
+  fixture's tile the way is RUSTBORO CITY → RUSTBORO CITY POKEMON CENTER 1F with
+  `go_to_exit("RUSTBORO CITY")`; mid-battle (gym fixture, party HP 1 in RAM) no objective
+  line, but TRAINERS says "(heal first: team is weak)".
+
+## Grinding in one call: `train` (2026-11-03)
+- *Review fix (before going live):* on a full-suite run, the last step before the deadline
+  started an encounter whose intro wasn't yet "in battle", and `train` returned "time's up"
+  mid-intro. The time check now runs only after any transition has settled, so a battle
+  `train` itself started is finished first. The time-limit test also accepts the designed
+  `no_partner` stop, since encounters are random. test_train_macro 15/15 on two runs (3 and
+  5 battles a minute).
+- **Symptom (David: "Can we speed it up between battles? It sits for a while after the
+  battle is over."):** measured live, switch-training a Lv7 SHROOMISH with a Lv17
+  COMBUSKEN cost about three model decisions per wild battle (walk into the grass,
+  `switch_pokemon("COMBUSKEN")`, `use_move` until it ends), ≈ 90 s of model time per
+  battle; the pause after each battle was the model deciding where to walk next
+  (WEAKNESSES M27).
+- **Fix (`server/app.py`, `/mcp/train`):** `train(trainee, partner=None, until_level=None,
+  max_minutes=4)` runs the loop server-side:
+  - Outside a battle it walks (navigate_to) to the nearest pair of side-by-side encounter
+    tiles and steps between them with the per-press movement check until gMain.inBattle.
+    A press that doesn't reach the other tile (someone on it) is retried, then the next
+    pair is tried.
+  - In a wild battle it plays the opening text out first (gBattleMons still holds the
+    *last* battle's Pokémon during "Wild X appeared!"; seen in the tests, the first version
+    picked TORCHIC's EMBER for SHROOMISH), switches the trainee out on its first turn
+    (`mcp_switch_pokemon`; default partner = highest-level teammate above half HP, as
+    `_switch_train_line` picks), then uses the partner's best move (`best_move` of the
+    battle view, highest expected damage) with `mcp_use_move` each turn.
+  - Stops and returns on: until_level reached; team weak (`read_team_condition` with the
+    partner's PP counted: new `lead_index` argument); a question or menu (learn move,
+    evolution, "Use next POKéMON?", party menu); a trainer battle (not fought); no healthy
+    partner while the trainee is out; max_minutes (a battle in progress is finished, up to
+    90 s more); anything unexpected (couldn't reach the grass, another map, a script took
+    control, 12 turns in one battle, 300 steps without a battle). Every wait is bounded
+    by frames and wall clock.
+  - Refuses without pressing anything: no grass and not a cave (with the way to the
+    nearest map that has some, e.g. "RUSTBORO CITY → ROUTE 116. go_to_exit("RUSTBORO
+    CITY") takes the first step"), a weak team (with the way to heal), no partner, bad
+    arguments.
+  - Returns `{success, status, summary, battles: [...], stopped_because, steps,
+    elapsed_s}`; each battle records opponents, outcome, the trainee's level/EXP/HP before
+    and after and the partner's HP. Summary e.g. "5 wild battles in 64 s (SILCOON Lv5,
+    WURMPLE Lv5, …): SHROOMISH Lv6→7 (+105 EXP shared, HP 26/26), TORCHIC 33→28/35.
+    Stopped: the 1-minute limit is up".
+  - **Advantage rule** (David: "You don't need to switch train when the other pokemon is
+    weak against shroomish"): the trainee fights itself, without switching, when its best
+    move with PP left is ≥2x against the foe, none of the foe's types is ≥2x against the
+    trainee's (ROM type chart, `type_effectiveness`), and it is above half HP
+    (`_trainee_advantage`). Checked every turn, so it is switched out once under half.
+    The in-battle hint then reads `SHROOMISH has the advantage over GEODUDE (ABSORB 4x):
+    fight with use_move("ABSORB") — no switch needed.` instead of SWITCH-TRAINING.
+- **Fix (`server/game_tools.py`):** encounter tiles come from porymap metatile behaviors
+  (pokeemerald TILE_FLAG_HAS_ENCOUNTERS): tall/long/ash grass anywhere, the cave floor
+  (`MB_CAVE`) only on `MAP_TYPE_UNDERGROUND` maps. Sand and the Abandoned Ship's indoor
+  tiles are left out: beaches and the ship have no land Pokémon. `way_to_wild_encounters`
+  reuses the walking graph of `way_to_pokemon_center`.
+- **Level-up stall (`server/menu_state.py`, `_play_out_battle`):** seen live at 18:23
+  ("switch_pokemon did nothing: The battle did not reach a menu in time; the screen last
+  said … "SHROOMISH grew to LV. 10!"", then the auto-advance ran out its limit too) and
+  reproduced in testing: the stat panel after "X grew to LV. N!" waits for a key
+  without a text printer, so use_move, the battle macros and the auto-advance waited out
+  their whole 4800-frame budget (80 s) after **every level-up**. Read on
+  test_wild_two_party.state: gBattlescriptCurrInstr 0x082DABC9 holds opcode 0x6C
+  (drawlvlupbox) until two A presses (opcode found from memory at the stall, not from
+  the .sym). The shared play-out loop (`BattleFlow.level_up_box`) now presses A while
+  that opcode is current; the KO turn with a level-up takes 4 s.
+- **Turbo while macros wait (`_turbo()`):** the game loop ran at GAME_FPS (60) whenever
+  nothing was queued, so battle animations and text between a macro's presses played at
+  normal speed. `_play_out_battle`, `_await_game`, `_await_battle_menu` and the whole
+  `train` call now hold a counter that the loop counts as busy (TURBO_FPS). Their waits
+  were already frame budgets, so turbo doesn't shorten them in game time. Measured on
+  test_wild_two_party.state, one wild battle through use_move (EMBER KO plus Torchic's
+  level-up): **18.4–19.0 s before, 5.2–5.3 s after** (two runs each).
+- **Battle quotes at turbo (`_record_battle_message`):** with turbo, test_battle_flow's
+  auto-advance test lost "Go! TORCHIC!": the play-out sampled the message window every
+  30 ms and a message that doesn't wait for A printed and was replaced in between. The
+  game loop now records each battle message as it starts printing (per frame, only a
+  byte read unless the battle message window is printing), and the play-out quotes
+  from that log.
+- **Objective text:** `_switch_train_line` outside a battle puts `TRAINING: call
+  train("SHROOMISH", until_level=12) now …` at the top of the state (nothing while the
+  team is weak, or with no teammate); an unmet `level_<species>_<n>` condition ends with
+  `Outside a battle, call train("SHROOMISH", until_level=12).` The in-battle SWITCH-TRAINING
+  line is unchanged. `use_move` / `switch_pokemon` results now carry `end` (how the
+  play-out stopped).
+- **Agent:** `train` registered in `agents/tools/registry.py` (all guide scaffolds),
+  `MACRO_TOOLS`, and SIMPLE.md (one line). `PokeAgent.tool_timeout_s` gives train
+  max_minutes × 60 + 240 s (the server caps max_minutes at 10, same numbers). Not added to
+  the battle subagent: after its battle train walks on into more battles, and that
+  subagent has no walking tools on purpose.
+- *Verified (`local_tests/test_train_macro.py`, new fixture `test_train_woods.state`):*
+  - One-minute run in Petalburg Woods: 5 wild battles in 64 s (three runs: 64, 70, 60 s;
+    the last on the final code, with a TAILLOW among them), each with SHROOMISH switched
+    out on turn 1, still at full HP, +19–25 EXP each; SHROOMISH's EXP in memory rose by
+    the sum (105), Lv6→7; TORCHIC (also leveled 11→12) 33→28/35; stopped on the time
+    limit, free to walk. ≈ 4.3–5.0 battles/min with zero model decisions, against ~3
+    decisions (≈ 90 s of model time) per battle before.
+  - Level-up panel: SCRATCH KO on test_wild_two_party.state, "TORCHIC grew to LV. 12!"
+    quoted, BATTLE_OVER in 4.1 s (was 80+ s).
+  - Advantage rule (foe types written in gBattleMons): Rock/Ground → "SHROOMISH has the
+    advantage … (ABSORB 4x)" and train lets SHROOMISH win itself (EXP gained, no switch);
+    Flying (Taillow) and Normal (Whismur) → SWITCH-TRAINING / train switches to TORCHIC;
+    Rock/Ground but SHROOMISH at 11/23 → switch.
+  - Cave (test_rusturf_tunnel.state, with the blocked-floor renderer fix): no pair uses
+    the blocked (6,11); 4 wild battles in 45 s (GEODUDE, WHISMUR ×3), +126 EXP shared.
+  - test_objective_memory's switch-training test now expects the advantage line for
+    TORCHIC vs a Bug-type (it asserted "" before the rule) and checks SWITCH-TRAINING
+    with the foe's types set to Normal in RAM.
+  - until_level: SHROOMISH's level byte set one below its EXP's level in RAM → one battle,
+    Lv5→6, stopped "SHROOMISH reached Lv6".
+  - "Use next POKéMON?" (Torchic 1 HP + poison, Silcoon 500 HP in RAM): stops with the
+    question quoted and still up.
+  - Trainer battle: the battle step stops without a press; train itself refuses there
+    first (TORCHIC alone, no partner).
+  - Refusals: Pokémon Center (no grass, way to ROUTE 116), weak team (TORCHIC 10/33, way
+    to heal), unknown trainee/partner, already at until_level; nothing pressed.
+  - Not verified: a live run with the model; learn-a-move and evolution stops through
+    train (no fixture is one level away; they reuse use_move's detection); a trainer
+    spotting the player mid-step.
+
 ## Model calls (`utils/agent_infrastructure/vlm_backends.py`, OpenAI backend only)
 - `max_output_tokens` is 1024 for local endpoints (observed p95 is 685; one runaway reply
   reached 5,957 tokens in 6m50s).
@@ -619,6 +893,178 @@ prompt. That came to 1.1 tiles walked per minute.
 - A held arrow keeps walking (the `normal` speed preset); taps no longer just turn the player.
 
 **`hints/emerald_hints.json`**: 7 hints seeded into the AI's memory, deduplicated by title.
+
+## Story scenes the game has recorded say so (2026-11-03)
+- **Symptom:** story objective "Exit Gym - Devon Researcher reports theft" stayed open with
+  FLAG_DEVON_GOODS_STOLEN (0x8E) already set, and the agent wandered. Same stall as the
+  Pokédex, Great Ball and Woods Grunt. Story events pass inside auto-advanced dialogue or
+  while David plays, and most story steps had no memory check at all.
+- **Fix (`server/app.py`, `pokemon_env/memory_reader.py`):** every story objective from
+  index 39 was checked against the existing checks. For each one that wasn't covered, the
+  map script that plays the event was read (pret/pokeemerald `data/maps/<Map>/scripts.inc`,
+  plus `data/scripts` and `src` to make sure nothing clears the flag or moves the var back).
+  Only conditions the script clearly ties to one flag or var were mapped.
+  - `read_game_var(var_id)`: reads SaveBlock1 `vars[]` at +0x139C (pret `include/global.h`:
+    `/*0x139C*/ u16 vars[VARS_COUNT]`, right after the 300 flag bytes at +0x1270), VARS_START
+    0x4000. Special vars (0x8000+) aren't in the save and return None.
+  - `_CONDITION_FLAGS`, 26 more: Steven found / letter delivered, sailed to Dewford /
+    Slateport (the towns' arrival flags; only the boat gets you there at that point),
+    shipyard checked, the museum scene (entered, Archie, goods delivered: all
+    FLAG_DELIVERED_DEVON_GOODS, set at the end of that one scene), Meteor Falls, Archie
+    leaving Mt. Chimney, the Wynaut egg, Castform, the Route 120 Steven/Kecleon/Devon Scope
+    scene, the Fortree Gym Kecleon, the submarine escape, Kyogre waking and Archie's
+    regret, Steven leading to the Cave of Origin, Wallace's Sky Pillar order, Archie and
+    Maxie leaving, Wallace's thanks (same talk as HM07), the League guards, the Hall of
+    Fame (FLAG_SYS_GAME_CLEAR). Battling: the Aqua Hideout Master Ball item flag and
+    Steven at Meteor Falls.
+  - New `_CONDITION_VARS` {condition: (var, minimum, text)}, 9: Mr. Stone met
+    (VAR_DEVON_CORP_3F_STATE 1), Blue Orb stolen (VAR_MT_PYRE_STATE 1), four Space Center
+    steps (VAR_MOSSDEEP_SPACE_CENTER_STATE 2 after the three grunts upstairs, 3 after Maxie
+    and Tabitha give up), Kyogre vs Groudon seen and Rayquaza woken
+    (VAR_SOOTOPOLIS_CITY_STATE 2 / 5), Rayquaza calming Sootopolis (VAR_SKY_PILLAR_STATE 2).
+    Only vars that never move backward were used.
+  - **Bug found on the way:** `maxie_tabitha_defeated` checked trainer flags 734 and 514,
+    which are never set. That fight is a `DoSpecialTrainerBattle` with Steven; it ends in
+    `HandleSpecialTrainerBattleEnd` (src/battle_tower.c), which doesn't call
+    `SetBattledTrainersFlags`. It now uses VAR_MOSSDEEP_SPACE_CENTER_STATE ≥ 3.
+  - `_CONDITION_TRAINERS`: museum grunts (both, fought back to back by the script) and
+    "find Archie in the Seafloor Cavern" (his trainer flag).
+  - New `_CONDITION_MOVES`: Rock Smash, Surf, Fly, Dive and Waterfall taught = a party
+    Pokémon knows the move.
+  - "Heal at <town> Pokémon Center" steps (`healed_*`, `*_heal_done`,
+    `elite_four_final_heal`, 23 of them) use the `party_healed` check. The game doesn't
+    record where you healed, and a full-HP team is the point of each one.
+- **Left unmapped (56 story steps from index 39), and why:**
+  - *Map-name mismatch, not a memory problem (about 40):* navigate steps whose target
+    doesn't end a ROM map name, so the location rule can't fire. For example "Dewford
+    Gym" vs DEWFORD TOWN GYM, "Granite Cave" vs GRANITE CAVE 1F, "Devon Corporation",
+    "Meteor Falls", "Mt. Pyre", "Weather Institute", "Victory Road", the other `*_gym_entered`
+    steps, `*_traversed`, `*_exited`, the underwater and Sky Pillar floor steps. Fix with
+    target aliases in `arrived_at`, not flags.
+  - *Puzzles* (`gym_puzzle_solved`, Lavaridge/Fortree/Mossdeep/Sootopolis/Seafloor
+    puzzles): no flag or var records them.
+  - *Groups of optional trainers* (Dewford and Petalburg gym trainers, Mt. Chimney summit,
+    Weather Institute, Mt. Pyre summit, Seafloor grunts): the game doesn't say which ones
+    are required. "All" would rarely be true and "any" too early. The boss's own check
+    follows each one.
+  - `briney_cottage_reached`: FLAG_LANDMARK_MR_BRINEY_HOUSE means "ever entered", and the
+    house is on Route 104, passed long before. `cable_car_used`: VAR_CABLE_CAR_STATION_STATE
+    goes back to 0 after each ride; the ride count is an encrypted game stat.
+    `champion_chamber_entered`: VAR_ELITE_4_STATE is reset to 0 in `data/event_scripts.s`.
+    `sky_pillar_entered`: the door-open var (4) comes before entering, and the next value
+    (5) is the summit.
+  - `badge_check_passed`: the walkthrough puts the badge gate before Victory Road, but the
+    guards are in the League building after it (that event is `elite_four_entered`).
+    `bike_registered`: stored as SaveBlock1's registered item, not a flag or var.
+    `gym_blocked_discovered`, `aqua_hideout_blocked`, `battle_frontier_unlocked`,
+    `battle_frontier_explored`: nothing in the scripts records them.
+  - Battling: catching Rayquaza, Kyogre, Groudon or the Regis sets the same
+    FLAG_DEFEATED_* as knocking them out, so the flag can't say "caught". The roaming
+    Lati@s catch sets no flag (FLAG_CAUGHT_LATIAS_OR_LATIOS is the Southern Island one).
+    Species catches, shopping, team levels and "organize team" aren't game events.
+- *Verified:*
+  - Var offset on fixtures: VAR_STARTER_MON = 1 (Torchic) on `test_after_woods_grunt.state`.
+    VAR_BIRCH_LAB_STATE = 3 on `test_movement_route101.state` (starter, no Pokédex) and 5
+    wherever FLAG_SYS_POKEDEX_GET is set. VAR_PETALBURG_WOODS_STATE is 0 in
+    `test_battle_wurmple.state` (before the Grunt) and 1 after it. VAR_PETALBURG_GYM_STATE
+    is 2 after the Wally tutorial. VAR_RUSTURF_TUNNEL_STATE and VAR_ROUTE116_STATE are 0 on
+    every fixture, all before the theft (no fixture has FLAG_DEVON_GOODS_STOLEN), matching
+    the story. `local_tools/story_progress.py` uses the same offset.
+  - New tests in `test_objective_memory.py`:
+    - `test_game_vars_read_from_saveblock1`.
+    - `test_story_scenes_recorded_in_flags_and_vars`: before the theft nothing is true.
+      With FLAG_DEVON_GOODS_STOLEN set in RAM the theft step says ALREADY TRUE, and so
+      does Mr. Stone with VAR_DEVON_CORP_3F_STATE = 1. Maxie + Tabitha stays open at
+      Space Center state 2.
+    - `test_heal_steps_and_hm_steps_read_the_party`.
+    - `test_every_mapped_condition_is_an_objective`: every key of every table is a real
+      completion_condition, and no condition is in two tables.
+  - Suites run one at a time: objective-memory 18/18, movement-exits 17/17, macros 20/20,
+    train-macro 15/15.
+
+## Places reached earlier, and POKéNAV calls (2026-11-03, WEAKNESSES M38, M39)
+- `server/game_tools.py`: `first_visit_flag(target)` gives the flag the game sets on the
+  first arrival at a place (FLAG_VISITED_* for towns, FLAG_LANDMARK_* for buildings and
+  caves), matched by name from flags.h. `_note_conditions_met_in_memory` uses it for
+  `_reached`/`_entered` navigate steps, so a step counts as done after the player moves on.
+  Checked against all 45 such story steps: 13 have a flag, and every match names the right
+  place. `returned_` steps are left to the map name.
+- `server/field_control.py`, `server/menu_state.py`: the snapshot also reads whether a text
+  printer is active and whether the POKéNAV call task (`ExecuteMatchCall`, 0x081960E0) runs.
+  `dialogue_status` returns PLAIN for both, ahead of the "extra window means a choice" rule.
+- Fixtures: `test_after_briney.state` (at sea, cottage visited, Dewford not yet) and
+  `test_boat_peeko_box.state` (Dad's call, first box).
+- Operator: with David in Granite Cave, story steps 043–046 were completed, the Flash step
+  was removed at his request, and the Steven steps now target GRANITE CAVE STEVENS ROOM
+  instead of B2F.
+- Suites run one at a time: objective-memory 19/19, dialogue-auto-advance 7/7,
+  dialogue-agent 8/8, battle-flow 14/14, macros 20/20, movement-feedback 6/6,
+  movement-exits 21/21, train-macro 15/15.
+
+## Catching at a level (2026-11-03, David: "catch a level 10+ Sableye")
+- Objective `level_<species>_<n>` with no such species in the party now means "catch one
+  at Lv<n>+". The condition note names the call:
+  `train("<lead>", catch="<SPECIES>", catch_min_level=<n>)`.
+- `train(catch=, catch_min_level=)`: walks the encounter tiles as usual and stops
+  (`catch_target`) at the first decision of a battle against the wanted species at that
+  level, before any move. A lower one is fought as usual.
+- `_catch_target_line` (via `_catch_wanted`): in battle with the wanted species it gives a
+  `_catch_plan`: a sleep or paralysis move first if the active Pokémon has one with PP and
+  the foe has no status, then the best ball in the bag (Ultra, then Great, then Poké).
+  When the one in front is under the level, it says "NOT THIS ONE … run_from_battle".
+- Why the plan: a full-HP Sableye (catch rate 45) breaks out of about 94% of Poké Balls.
+  Paralyzed and in a Great Ball it is about 13% a throw. The bag had 5 Poké and 2 Great
+  Balls, and Dewford has no Poké Mart.
+- Encounter data from pret `src/data/wild_encounters.json`: Granite Cave B2F has Sableye
+  at 20%, Lv10–12; B1F has it at 10%, Lv9–11.
+- Operator: story step `dewford_049b` "Catch a Sableye at Lv10 or higher on Granite Cave
+  B2F" (`level_sableye_10`), after the letter and before returning to Dewford.
+- Tests: `test_train_stops_for_the_pokemon_to_catch`,
+  `test_catch_at_a_level_names_the_one_and_turns_down_the_rest`. Two assertions were
+  updated because they encoded the old behaviour: "not in the party, so no hint" became
+  the catch hint, and "Poke Ball" became the Great Ball the fixture's bag holds.
+  Objective-memory 20/20, train-macro 16/16.
+
+## One-way ledges in routes; naming the ladder (2026-11-03, WEAKNESSES M40)
+- `server/game_tools.py`: `_route_areas` (ledge tiles ← → ↑ ↓ are walls) and
+  `_ledge_jumps` (from the tile behind each ledge to the tile beyond it, one way).
+  `_walk_exits` and `_walk_paths` use them; in the BFS a jump costs no map step and adds
+  nothing to the path. `arrived_at` still uses the two-way `_walk_areas`.
+- `_walk_exits`: when warps to one map arrive in different parts of it, the go_to_exit
+  argument is "NAME (x, y)". `server/field_control.py` `match_exits` accepts that form.
+- Operator: David delivered the letter himself; steps 048/049 were completed. Story step
+  `dewford_049c` "Train Sableye to Lv15 in Granite Cave" (`level_sableye_15`) comes before
+  the return to Dewford.
+- Suites run one at a time: movement-exits 22/22, objective-memory 20/20, macros 20/20,
+  train-macro 16/16, movement-feedback 6/6.
+
+## Team plan for the Route 110 rival and Wattson (2026-11-04, WEAKNESSES M41–M43)
+- Data from pret: rival (Torchic player) LOMBRE 18 / SLUGMA 18 / MARSHTOMP 20; Wattson
+  VOLTORB 20 / ELECTRIKE 20 / MAGNETON 22 / MANECTRIC 24 (all Shock Wave); Route 112 is
+  75% NUMEL (Lv14-16, catch rate 255, MAGNITUDE at 19). SHROOMISH becomes BRELOOM at 23
+  and learns MACH PUNCH.
+- Story steps added: `slateport_064b` train Shroomish to 23 (Route 110); rival battle
+  hint with the switch plan; `mauville_071b` Sableye to 22; `mauville_071c` catch Numel
+  (Route 112); `mauville_071d` Numel to 19.
+- Code: `species_family` (evolutions from ROM); train sends a benched trainee in for
+  the EXP; the trainee fights alone unless the foe is a threat.
+- Suites: objective-memory 21/21, train-macro 17/17, macros 20/20, battle-flow 14/14.
+
+## Faster play: go_to and the stall watcher (2026-11-04, David: "do 1 and 2")
+- Measured first (two hours of the AI's log, duplicates removed): ~35 s per decision, and
+  about half of the walk/train calls left the player on the same tile.
+- `go_to(place)`: walks to a named place map after map (`game_tools.place_route`: exact
+  map name first, then the nearest map holding the target's words). The loop is shared
+  with heal_at_pokecenter (`_walk_along`): it runs from wild battles, reads through plain
+  scene text (Birch's on Route 110 used to stop the heal walk), and stops for a trainer
+  battle or a question. The story route hint now ends with `Or go_to("…") walks the whole
+  way in one call.` Registered in the tool list and SIMPLE.md; timeout 600 s.
+- `local_tools/stall_watch.py`: polls the newest decisions every 15 s; on SAME_TILE (3
+  walk/train calls ending on one tile, a call that ran over 60 s counting as progress),
+  REPEAT (same call and arguments 4 times) or DOWN (server silent 3 polls) it pauses the
+  agent and prints one line for a watcher.
+- Tests: `test_go_to_walks_map_after_map` (Route 101 → Oldale Pokémon Center; Day Care →
+  Route 117), `local_tests/test_stall_watch.py` (4). Macros 22/22.
 
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.

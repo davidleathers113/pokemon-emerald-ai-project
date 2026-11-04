@@ -51,7 +51,11 @@ S_MENU = 0x0203CD90
 S_TEXT_PRINTERS = 0x020201B0
 TEXT_PRINTER_SIZE = 0x24
 TEXT_PRINTER_COUNT = 32
-TEXT_WAITING_STATES = (1, 2)
+# RENDER_STATE_WAIT (1), _CLEAR (2) and _SCROLL_START (3) all show the down arrow and wait
+# for a key (src/text.c). Seen in a test: "Wild SHROOMISH's EFFECT SPORE paralyzed
+# TORCHIC! It may be unable to move!" is long enough to scroll, sat in state 3, and with
+# only 1 and 2 counted use_move waited out its whole budget and reported a timeout.
+TEXT_WAITING_STATES = (1, 2, 3)
 # gPaletteFade: bit 7 of the byte at +7 is set while a screen fade runs.
 G_PALETTE_FADE_FLAGS = 0x02037FD4 + 7
 PALETTE_FADE_ACTIVE = 0x80
@@ -81,7 +85,9 @@ TASK_CAUGHT_DEX_PAGE = 0x080C0088       # Task_HandleCaughtMonPageInput (waits f
 
 G_BATTLER_CONTROLLER_FUNCS = 0x03005D60
 CONTROLLER_CHOOSE_ACTION = 0x08057588   # HandleInputChooseAction
-CONTROLLER_YES_NO = 0x080599D4          # PlayerHandleYesNoInput ("Use next POKéMON?")
+# PlayerHandleYesNoInput. Seen on test_wild_two_party.state: "Use next POKéMON?" is the
+# battle script's yesnobox (BATTLE_YES_NO_OPCODES), not this controller.
+CONTROLLER_YES_NO = 0x080599D4
 G_BATTLE_OUTCOME = 0x0202433A
 B_OUTCOME_WON, B_OUTCOME_LOST, B_OUTCOME_DREW, B_OUTCOME_RAN = 1, 2, 3, 4
 B_OUTCOME_PLAYER_TELEPORTED, B_OUTCOME_MON_FLED, B_OUTCOME_CAUGHT = 5, 6, 7
@@ -89,12 +95,31 @@ G_BATTLESCRIPT_CURR_INSTR = 0x02024214
 G_BATTLE_COMMUNICATION = 0x02024332     # [0] MULTIUSE_STATE, [1] CURSOR_POSITION
 G_DISPLAYED_STRING_BATTLE = 0x02022E2C
 DISPLAYED_STRING_BATTLE_SIZE = 300
+# Battle messages print in window 0 (B_WIN_MSG); sTextPrinters is indexed by window.
+# The same string buffer also feeds the "What will TORCHIC do?" prompt (window 1), the
+# move menu's PP/TYPE lines and the healthbox names ("TORCHIC♂"), so a buffer read only
+# counts as a battle message while window 0's printer is active.
+B_WIN_MSG = 0
 # The nickname YES/NO runs `trygivecaughtmonnick` inside this script; its state 1
 # waits for input, and B there means NO (Cmd_trygivecaughtmonnick).
 BS_TRY_NICKNAME_CAUGHT_MON = 0x082DBDA5
 BS_GIVE_CAUGHT_MON_END = 0x082DBDC2
 BS_ASK_TO_LEARN_MOVE = 0x082DABE3
 BS_ASK_TO_LEARN_MOVE_END = 0x082DAC10   # BattleScript_ForgotAndLearnedNewMove, the next label
+# Battle script commands that put up a YES/NO and wait for the player: yesnoboxlearnmove
+# (0x5A), yesnoboxstoplearningmove (0x5B) and yesnobox (0x67, "Will DAVID change
+# POKéMON?" before a trainer's next Pokémon). Opcodes read from the ROM's
+# gBattleScriptingCommandsTable (0x0831BD10) by matching the .sym's Cmd_* addresses.
+# While one runs, gBattlescriptCurrInstr points at its opcode, and A would answer YES.
+BATTLE_YES_NO_OPCODES = (0x5A, 0x5B, 0x67)
+# drawlvlupbox: the stat panel after "X grew to LV. N!" waits for a key press of its
+# own (gMain.newKeys), not through a text printer, so text_waiting stays False under it.
+# Seen on test_wild_two_party.state: gBattlescriptCurrInstr 0x082DABC9 (in
+# BattleScript_LevelUp) held opcode 0x6C until two A presses closed both panels; until
+# then use_move sat out its whole 4800-frame budget after every level-up.
+BATTLE_LEVEL_UP_BOX_OPCODE = 0x6C
+ROM_START, ROM_END = 0x08000000, 0x0A000000
+CB2_EVOLUTION_SCENE = 0x0813E3A4          # CB2_EvolutionSceneUpdate (after a battle)
 G_BATTLER_PARTY_INDEXES = 0x0202406E     # u16[4]
 G_BATTLE_MONS = 0x02024084
 BATTLE_MON_SIZE = 0x58
@@ -194,6 +219,22 @@ def text_waiting_for_button(reader) -> bool:
     return False
 
 
+# The task that plays a POKéNAV call in the field (src/match_call.c). A call is lines
+# of text and an A to hang up; it never asks a question.
+TASK_MATCH_CALL = 0x081960E0  # ExecuteMatchCall
+
+
+def phone_call_active(reader) -> bool:
+    return task_running(reader, TASK_MATCH_CALL)
+
+
+def text_printing(reader) -> bool:
+    """True while any text printer is still active: printing, or waiting on the arrow."""
+    return any(
+        reader._read_u8(S_TEXT_PRINTERS + i * TEXT_PRINTER_SIZE + 0x1B) for i in range(TEXT_PRINTER_COUNT)
+    )
+
+
 def fade_active(reader) -> bool:
     return bool(reader._read_u8(G_PALETTE_FADE_FLAGS) & PALETTE_FADE_ACTIVE)
 
@@ -216,26 +257,40 @@ class BattleFlow:
     choosing_action: bool        # FIGHT/BAG/POKEMON/RUN is waiting for the player
     yes_no_prompt: bool          # the battle's own YES/NO ("Use next POKéMON?")
     nickname_prompt: bool        # "Give a nickname to the captured X?" waiting for input
-    learn_move_prompt: bool
+    learn_move_prompt: bool      # inside the "trying to learn X ... delete a move?" script
     dex_page: bool               # the caught Pokémon's Pokédex page, waiting for A/B
     text_waiting: bool
     outcome: int
     text: str
     tasks: List[int] = field(default_factory=list)
+    script_question: bool = False  # a battle-script YES/NO is up (BATTLE_YES_NO_OPCODES)
+    level_up_box: bool = False     # the level-up stat panel (BATTLE_LEVEL_UP_BOX_OPCODE)
+    evolving: bool = False         # the evolution scene that follows a battle
+    message_printing: bool = False  # the message window's text printer is active
+
+    @property
+    def asking(self) -> bool:
+        """A YES/NO is up: A would answer it. "Use next POKéMON?" is a script yesnobox."""
+        return self.yes_no_prompt or self.script_question or self.nickname_prompt
 
 
 def read_battle_flow(reader) -> BattleFlow:
     from server.field_control import G_MAIN_IN_BATTLE_BYTE, IN_BATTLE_MASK
 
     controller = reader._read_u32(G_BATTLER_CONTROLLER_FUNCS)
+    # The player's battlers are 0 and, in a double battle, 2 (B_POSITION_PLAYER_RIGHT).
+    # Seen live: against PLUSLE and MINUN, after SABLEYE's move use_move waited for
+    # battler 0's menu while COMBUSKEN (battler 2) was the one choosing, and timed out.
+    partner_controller = reader._read_u32(G_BATTLER_CONTROLLER_FUNCS + 4 * 2)
     instr = reader._read_u32(G_BATTLESCRIPT_CURR_INSTR)
     multiuse_state = reader._read_u8(G_BATTLE_COMMUNICATION)
+    opcode = reader._read_u8(instr) if ROM_START <= instr < ROM_END else None
     tasks = active_task_funcs(reader)
     return BattleFlow(
         in_battle=bool(reader._read_u8(G_MAIN_IN_BATTLE_BYTE) & IN_BATTLE_MASK),
         in_battle_screen=callback2_is(reader, CB2_BATTLE_MAIN),
-        choosing_action=_is(controller, CONTROLLER_CHOOSE_ACTION),
-        yes_no_prompt=_is(controller, CONTROLLER_YES_NO),
+        choosing_action=_is(controller, CONTROLLER_CHOOSE_ACTION) or _is(partner_controller, CONTROLLER_CHOOSE_ACTION),
+        yes_no_prompt=_is(controller, CONTROLLER_YES_NO) or _is(partner_controller, CONTROLLER_YES_NO),
         nickname_prompt=BS_TRY_NICKNAME_CAUGHT_MON <= instr < BS_GIVE_CAUGHT_MON_END and multiuse_state == 1,
         learn_move_prompt=BS_ASK_TO_LEARN_MOVE <= instr < BS_ASK_TO_LEARN_MOVE_END,
         dex_page=any(_is(f, TASK_CAUGHT_DEX_PAGE) for f in tasks),
@@ -243,6 +298,10 @@ def read_battle_flow(reader) -> BattleFlow:
         outcome=reader._read_u8(G_BATTLE_OUTCOME),
         text=decode_field_message(reader._read_bytes(G_DISPLAYED_STRING_BATTLE, DISPLAYED_STRING_BATTLE_SIZE)),
         tasks=tasks,
+        script_question=opcode in BATTLE_YES_NO_OPCODES,
+        level_up_box=opcode == BATTLE_LEVEL_UP_BOX_OPCODE,
+        evolving=callback2_is(reader, CB2_EVOLUTION_SCENE),
+        message_printing=bool(reader._read_u8(S_TEXT_PRINTERS + B_WIN_MSG * TEXT_PRINTER_SIZE + 0x1B)),
     )
 
 

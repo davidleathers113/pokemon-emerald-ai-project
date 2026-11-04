@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 # Expand this allowlist as additional dynamic maps are supported.
 DYNAMIC_MAP_LOCATIONS = {
     "MAUVILLE CITY GYM",
+    # Rusturf Tunnel's scripts rewrite its metatiles as the story opens the tunnel.
+    # Seen live (2026-11-03): at (6,10) the static grid showed (6,11) as open floor but
+    # the game blocked the step, and navigate_to failed 5 times in a row.
+    "RUSTURF TUNNEL",
+    "RUSTURF TUNNEL ALT",
     # "FORTREE CITY GYM",
 }
 

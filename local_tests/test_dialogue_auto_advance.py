@@ -83,6 +83,28 @@ def test_single_box_dialogue_is_read_and_closed():
     assert (snap.x, snap.y) == (3, 5), snap
 
 
+def test_pokenav_call_with_the_callers_icon_is_read_through():
+    """Seen live: Dad's POKéNAV call on Mr. Briney's boat draws the caller's icon in a
+    second window; it read as a YES/NO, nothing pressed A, and the boat sat at sea.
+    test_boat_peeko_box.state is that call, waiting on its first box."""
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_boat_peeko_box.state")
+    assert _status(s) == "plain"
+    said = []
+    for _ in range(4):  # each "… … …" pause is a box of its own: about 40 presses in all
+        r = s.call("mcp_auto_advance_dialogue", {"max_presses": 15})
+        said += r["texts"]
+        if not r["capped"]:
+            break
+    print("   ", r)
+    assert any("Registered DAD NORMAN" in t for t in said), said  # hung up, then the POKéNAV note
+    from server.menu_state import phone_call_active
+
+    with s.srv.memory_lock:
+        assert not phone_call_active(s.srv.env.memory_reader)
+        assert tuple(s.srv.env.memory_reader._read_current_map()) != (0, 20), "the boat should have sailed on"
+
+
 def test_nothing_happens_without_a_text_box():
     s = server()
     s.load(ROUTE101)

@@ -30,6 +30,11 @@ from utils.mapping import map_stitcher_singleton
 
 logger = logging.getLogger(__name__)
 
+
+def _squash_map_name(name: str) -> str:
+    """'ROUTE_117_POKEMON_DAY_CARE' / 'Route117_PokemonDayCare' -> 'ROUTE117POKEMONDAYCARE'."""
+    return "".join(c for c in str(name).upper() if c.isalnum())
+
 # gBattleTypeFlags bits (pret/pokeemerald include/constants/battle.h).
 BATTLE_TYPE_DOUBLE = 1 << 0
 BATTLE_TYPE_LINK = 1 << 1
@@ -48,6 +53,47 @@ BATTLE_MENU_BY_CONTROLLER = {
     0x08057824 + 1: "target",  # HandleInputChooseTarget
     0x08058138 + 1: "reorder",  # HandleMoveSwitching (SELECT in the move menu; A swaps moves)
 }
+
+# Team condition. Seen live: in Rustboro Gym the model fought trainer after trainer
+# with a worn-down Torchic; David: "It should go to the pokemon center between
+# trainers if the HP or PP are low".
+# Under half HP a Pokémon is a hit or two from fainting against a gym-level foe.
+TEAM_LOW_HP_SHARE = 0.5
+# At a quarter of base PP the lead has only a few attacks left (EMBER 25 -> 6).
+TEAM_LOW_PP_SHARE = 0.25
+
+
+def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]:
+    """Is the team too worn down to fight a trainer? Eggs are ignored.
+
+    Weak when any Pokémon has fainted, any other is under TEAM_LOW_HP_SHARE of its
+    max HP, or every damaging move (power > 0) of the lead (the first Pokémon able to
+    battle) is at or under TEAM_LOW_PP_SHARE of its base PP. `move_data(move enum
+    name)` returns gBattleMoves' {"power", "pp", ...} or None for an empty slot.
+    """
+    members = [p for p in party if not p.is_egg]
+    reasons: List[str] = []
+    for mon in members:
+        name = mon.species_name.upper()
+        if mon.current_hp == 0:
+            reasons.append(f"{name} fainted")
+        elif mon.current_hp < mon.max_hp * TEAM_LOW_HP_SHARE:
+            reasons.append(f"{name} {mon.current_hp}/{mon.max_hp} HP")
+    lead = next((p for p in members if p.current_hp > 0), None)
+    if lead is not None:
+        damaging = []
+        for move, pp in zip(lead.moves, lead.move_pp):
+            data = move_data(move)
+            if data and data["power"] > 0 and data["pp"] > 0:
+                damaging.append((move.replace("_", " "), pp, data["pp"]))
+        if damaging and all(pp <= base * TEAM_LOW_PP_SHARE for _, pp, base in damaging):
+            reasons.extend(f"{move} {pp}/{base} PP" for move, pp, base in damaging)
+    return {
+        "weak": bool(reasons),
+        "reasons": reasons,
+        "lead": lead.species_name.upper() if lead is not None else None,
+    }
+
 
 @dataclass
 class MemoryAddresses:
@@ -194,6 +240,12 @@ class MemoryAddresses:
     
     # Save block addresses for flags
     SAVE_BLOCK1_FLAGS_OFFSET = 0x1270  # Approximate offset for flags in SaveBlock1
+    # Story progress vars: pret/pokeemerald include/global.h struct SaveBlock1,
+    # "/*0x139C*/ u16 vars[VARS_COUNT]" right after the 300 flag bytes; vars.h numbers
+    # them from VARS_START.
+    SAVE_BLOCK1_VARS_OFFSET = 0x139C
+    VARS_START = 0x4000
+    VARS_END = 0x40FF
 
 @dataclass
 class PokemonDataStructure:
@@ -1182,6 +1234,17 @@ class PokemonEmeraldReader:
             try:
                 location = MapLocation(map_id)
                 location_name = location.name.replace('_', ' ')
+                # The MapLocation table is wrong for 24 ids (a block of houses is off by
+                # one group): trust the decomp's map_groups.json, which numbers the ROM's
+                # maps, whenever the table's name doesn't name that map.
+                from utils.mapping.porymap_state import decomp_map_at
+
+                decomp = decomp_map_at(map_bank, map_num)
+                if decomp is not None:
+                    table = location.name[:-4] if location.name.endswith("_ALT") else location.name
+                    if _squash_map_name(table) != _squash_map_name(decomp[0]):
+                        logger.info(f"Location 0x{map_id:04X}: table says {location_name}, decomp says {decomp[1]}")
+                        location_name = decomp[1]
                 logger.info(f"Location resolved: map_id=0x{map_id:04X} → {location_name}")
                 return location_name
             except ValueError:
@@ -1423,6 +1486,53 @@ class PokemonEmeraldReader:
         raw = bytes(self.read_memory(ADDRESSES["gSpeciesNames"] + 11 * species_id, 11))
         return EmeraldCharmap().decode(raw).title() or name
 
+    def species_types(self, name: str) -> List[int]:
+        """'SLUGMA' -> [10, 10]: the species' two TYPE_* ids from the ROM's gSpeciesInfo
+        (28-byte entries, types at +6/+7; checked: SLUGMA 10/10, MARSHTOMP 11/4).
+        [] for a name the ROM does not know."""
+        self.species_family(name)  # fills the name -> id cache
+        species_id = self._species_names_cache.get(str(name).upper())
+        if species_id is None:
+            return []
+        raw = bytes(self.read_memory(ADDRESSES["gSpeciesInfo"] + 28 * species_id, 28))
+        return [raw[6], raw[7]]
+
+    def move_type_and_power(self, move_name: str) -> Optional[Tuple[int, int]]:
+        """'MEGA_DRAIN' (the party reader's spelling) -> (TYPE_* id, power) from gBattleMoves."""
+        try:
+            move_id = Move[str(move_name).upper().replace(" ", "_")].value
+        except KeyError:
+            return None
+        data = self._rom_battle_move(move_id)
+        return data["type"], data["power"]
+
+    def species_family(self, name: str) -> List[str]:
+        """'SHROOMISH' -> ['SHROOMISH', 'BRELOOM']: the species and every form it evolves
+        into, upper-case, from the ROM's gSpeciesNames and gEvolutionTable (cached).
+
+        An objective that names a Pokémon ("train Shroomish to Lv23") is still about it
+        after it evolves; read by species name it would read as gone from the party.
+        """
+        names = getattr(self, "_species_names_cache", None)
+        if names is None:
+            names = self._species_names_cache = {
+                self._battle_species_name(i).upper(): i for i in range(411, 0, -1)
+            }
+        wanted = str(name).upper()
+        start = names.get(wanted)
+        if start is None:
+            return [wanted]
+        by_id = {i: n for n, i in names.items()}
+        family, queue = [start], [start]
+        while queue:
+            raw = bytes(self.read_memory(ADDRESSES["gEvolutionTable"] + 40 * queue.pop(), 40))
+            for slot in range(5):
+                method, _, target = struct.unpack_from("<HHH", raw, 8 * slot)
+                if method and 0 < target <= 411 and target not in family:
+                    family.append(target)
+                    queue.append(target)
+        return [by_id.get(i, wanted) for i in family]
+
     def _read_battle_mon(self, battler: int) -> Optional[Dict[str, Any]]:
         """gBattleMons[battler] (struct BattlePokemon), or None if the slot is empty."""
         base = self.addresses.BATTLE_MONS + battler * self.addresses.BATTLE_MON_SIZE
@@ -1546,6 +1656,26 @@ class PokemonEmeraldReader:
             "moves": moves,
             "best_move": best,
         }
+
+    def read_team_condition(self, lead_index: Optional[int] = None) -> Dict[str, Any]:
+        """assess_team_condition on the party, with move power and base PP from ROM.
+
+        lead_index (0-based party slot) names the Pokémon whose PP counts instead of the
+        first one able to battle: in switch-training (train) the trainee leads but never
+        attacks, and the teammate that comes in for it is the one using up its PP.
+        """
+
+        def move_data(name: str) -> Optional[Dict[str, int]]:
+            try:
+                move_id = Move[name].value
+            except KeyError:
+                return None
+            return self._rom_battle_move(move_id) if move_id else None
+
+        party = self.read_party_pokemon()
+        if lead_index is not None and 0 <= lead_index < len(party):
+            party = [party[lead_index]] + party[:lead_index] + party[lead_index + 1:]
+        return assess_team_condition(party, move_data)
 
     @staticmethod
     def _legacy_battle_mon(mon: Dict[str, Any], moves: List[str], move_pp: List[int]) -> Dict[str, Any]:
@@ -3866,6 +3996,24 @@ class PokemonEmeraldReader:
             return bool(flag_byte & (1 << bit_idx))
         except Exception:
             return False
+
+    def read_game_var(self, var_id: int) -> Optional[int]:
+        """A saved game var (VAR_* 0x4000-0x40FF) from SaveBlock1, or None when unreadable.
+
+        Story scenes record their progress in these as well as in flags (VAR_ROUTE116_STATE,
+        VAR_MOSSDEEP_SPACE_CENTER_STATE, ...). Special vars (0x8000+) live in RAM, not the
+        save, so they are refused.
+        """
+        if not self.addresses.VARS_START <= var_id <= self.addresses.VARS_END:
+            return None
+        try:
+            save_block_1_ptr = self._read_u32(self.addresses.SAVE_BLOCK1_PTR)
+            if save_block_1_ptr == 0:
+                return None
+            vars_addr = save_block_1_ptr + self.addresses.SAVE_BLOCK1_VARS_OFFSET
+            return self._read_u16(vars_addr + 2 * (var_id - self.addresses.VARS_START))
+        except Exception:
+            return None
 
     def read_flags(self) -> Dict[str, bool]:
         """Read game flags to track progress and visited locations"""

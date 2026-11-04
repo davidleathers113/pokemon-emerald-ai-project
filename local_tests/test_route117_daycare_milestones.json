@@ -1,0 +1,312 @@
+{
+  "milestones": {
+    "GAME_RUNNING": {
+      "completed": true,
+      "timestamp": 1793683389.611562,
+      "first_completed": 1793683389.611562,
+      "split_time": 0.0,
+      "split_formatted": "00:00:00",
+      "total_time": 0.0,
+      "total_formatted": "00:00:00"
+    },
+    "PLAYER_NAME_SET": {
+      "completed": true,
+      "timestamp": 1793683431.6195064,
+      "first_completed": 1793683431.6195064,
+      "split_time": 42.00794434547424,
+      "split_formatted": "00:00:42",
+      "total_time": 42.00794434547424,
+      "total_formatted": "00:00:42"
+    },
+    "STARTER_CHOSEN": {
+      "completed": true,
+      "timestamp": 1793683431.6203256,
+      "first_completed": 1793683431.6203256,
+      "split_time": 0.0008192062377929688,
+      "split_formatted": "00:00:00",
+      "total_time": 42.008763551712036,
+      "total_formatted": "00:00:42"
+    },
+    "LITTLEROOT_TOWN": {
+      "completed": true,
+      "timestamp": 1793683464.5939875,
+      "first_completed": 1793683464.5939875,
+      "split_time": 32.97448110580444,
+      "split_formatted": "00:00:32",
+      "total_time": 74.98242545127869,
+      "total_formatted": "00:01:14"
+    },
+    "ROUTE_101": {
+      "completed": true,
+      "timestamp": 1793685342.246416,
+      "first_completed": 1793685342.246416,
+      "split_time": 1877.6524286270142,
+      "split_formatted": "00:31:17",
+      "total_time": 1952.6348540782928,
+      "total_formatted": "00:32:32"
+    },
+    "OLDALE_TOWN": {
+      "completed": true,
+      "timestamp": 1793692664.3193805,
+      "first_completed": 1793692664.3193805,
+      "split_time": 9232.699054956436,
+      "split_formatted": "02:33:52",
+      "total_time": 9274.707818508148,
+      "total_formatted": "02:34:34"
+    },
+    "ROUTE_103": {
+      "completed": true,
+      "timestamp": 1793694940.7457352,
+      "first_completed": 1793694940.7457352,
+      "split_time": 2276.4263546466827,
+      "split_formatted": "00:37:56",
+      "total_time": 11551.134173154831,
+      "total_formatted": "03:12:31"
+    },
+    "RIVAL_BATTLE_WON": {
+      "completed": true,
+      "timestamp": 1793705844.7141395,
+      "first_completed": 1793705844.7141395,
+      "split_time": 10903.96840429306,
+      "split_formatted": "03:01:43",
+      "total_time": 22455.10257744789,
+      "total_formatted": "06:14:15"
+    },
+    "BIRCH_LAB_VISITED": {
+      "completed": true,
+      "timestamp": 1793705850.1690974,
+      "first_completed": 1793705850.1690974,
+      "split_time": 22418.548771858215,
+      "split_formatted": "06:13:38",
+      "total_time": 22460.557535409927,
+      "total_formatted": "06:14:20"
+    },
+    "RECEIVED_POKEDEX": {
+      "completed": true,
+      "timestamp": 1793705882.619358,
+      "first_completed": 1793705882.619358,
+      "split_time": 37.90521860122681,
+      "split_formatted": "00:00:37",
+      "total_time": 22493.007796049118,
+      "total_formatted": "06:14:53"
+    },
+    "ROUTE_102": {
+      "completed": true,
+      "timestamp": 1793709296.36551,
+      "first_completed": 1793709296.36551,
+      "split_time": 3413.7461519241333,
+      "split_formatted": "00:56:53",
+      "total_time": 25906.75394797325,
+      "total_formatted": "07:11:46"
+    },
+    "PETALBURG_CITY": {
+      "completed": true,
+      "timestamp": 1793711501.7547975,
+      "first_completed": 1793711501.7547975,
+      "split_time": 2205.3892874717712,
+      "split_formatted": "00:36:45",
+      "total_time": 28112.143235445023,
+      "total_formatted": "07:48:32"
+    },
+    "DAD_FIRST_MEETING": {
+      "completed": true,
+      "timestamp": 1793713290.5471592,
+      "first_completed": 1793713290.5471592,
+      "split_time": 1788.7923617362976,
+      "split_formatted": "00:29:48",
+      "total_time": 29900.93559718132,
+      "total_formatted": "08:18:20"
+    },
+    "GYM_EXPLANATION": {
+      "completed": true,
+      "timestamp": 1793713290.5532546,
+      "first_completed": 1793713290.5532546,
+      "split_time": 0.006095409393310547,
+      "split_formatted": "00:00:00",
+      "total_time": 29900.941692590714,
+      "total_formatted": "08:18:20"
+    },
+    "ROUTE_104_SOUTH": {
+      "completed": true,
+      "timestamp": 1793714123.0526183,
+      "first_completed": 1793714123.0526183,
+      "split_time": 832.4993636608124,
+      "split_formatted": "00:13:52",
+      "total_time": 30733.441056251526,
+      "total_formatted": "08:32:13"
+    },
+    "PETALBURG_WOODS": {
+      "completed": true,
+      "timestamp": 1793714977.259472,
+      "first_completed": 1793714977.259472,
+      "split_time": 854.2068536281586,
+      "split_formatted": "00:14:14",
+      "total_time": 31587.647909879684,
+      "total_formatted": "08:46:27"
+    },
+    "TEAM_AQUA_GRUNT_DEFEATED": {
+      "completed": true,
+      "timestamp": 1793714977.2614243,
+      "first_completed": 1793714977.2614243,
+      "split_time": 0.0019524097442626953,
+      "split_formatted": "00:00:00",
+      "total_time": 31587.64986228943,
+      "total_formatted": "08:46:27"
+    },
+    "ROUTE_104_NORTH": {
+      "completed": true,
+      "timestamp": 1793717944.589213,
+      "first_completed": 1793717944.589213,
+      "split_time": 2967.327788591385,
+      "split_formatted": "00:49:27",
+      "total_time": 34554.97765088081,
+      "total_formatted": "09:35:54"
+    },
+    "RUSTBORO_CITY": {
+      "completed": true,
+      "timestamp": 1793720300.6216495,
+      "first_completed": 1793720300.6216495,
+      "split_time": 2356.032436609268,
+      "split_formatted": "00:39:16",
+      "total_time": 36911.01008749008,
+      "total_formatted": "10:15:11"
+    },
+    "RUSTBORO_GYM_ENTERED": {
+      "completed": true,
+      "timestamp": 1793720854.7995539,
+      "first_completed": 1793720854.7995539,
+      "split_time": 554.1779043674469,
+      "split_formatted": "00:09:14",
+      "total_time": 37465.18799185753,
+      "total_formatted": "10:24:25"
+    },
+    "STONE_BADGE": {
+      "completed": true,
+      "timestamp": 1793733868.468124,
+      "first_completed": 1793733868.468124,
+      "split_time": 13013.668570041656,
+      "split_formatted": "03:36:53",
+      "total_time": 50478.856561899185,
+      "total_formatted": "14:01:18"
+    },
+    "ROUTE_116": {
+      "completed": true,
+      "timestamp": 1793734201.6601746,
+      "first_completed": 1793734201.6601746,
+      "split_time": 333.1920506954193,
+      "split_formatted": "00:05:33",
+      "total_time": 50812.048612594604,
+      "total_formatted": "14:06:52"
+    },
+    "RUSTURF_TUNNEL": {
+      "completed": true,
+      "timestamp": 1793735199.309463,
+      "first_completed": 1793735199.309463,
+      "split_time": 997.6492884159088,
+      "split_formatted": "00:16:37",
+      "total_time": 51809.69790101051,
+      "total_formatted": "14:23:29"
+    },
+    "DEVON_CORP_3F_MR_STONE": {
+      "completed": true,
+      "timestamp": 1793737719.4999022,
+      "first_completed": 1793737719.4999022,
+      "split_time": 2520.190439224243,
+      "split_formatted": "00:42:00",
+      "total_time": 54329.88834023476,
+      "total_formatted": "15:05:29"
+    },
+    "MR_BRINEYS_HOUSE": {
+      "completed": true,
+      "timestamp": 1793739908.6760445,
+      "first_completed": 1793739908.6760445,
+      "split_time": 2189.1761422157288,
+      "split_formatted": "00:36:29",
+      "total_time": 56519.064482450485,
+      "total_formatted": "15:41:59"
+    },
+    "DEWFORD_TOWN": {
+      "completed": true,
+      "timestamp": 1793740181.05904,
+      "first_completed": 1793740181.05904,
+      "split_time": 272.38299560546875,
+      "split_formatted": "00:04:32",
+      "total_time": 56791.447478055954,
+      "total_formatted": "15:46:31"
+    },
+    "ROUTE_106": {
+      "completed": true,
+      "timestamp": 1793740210.6271217,
+      "first_completed": 1793740210.6271217,
+      "split_time": 29.568081617355347,
+      "split_formatted": "00:00:29",
+      "total_time": 56821.01555967331,
+      "total_formatted": "15:47:01"
+    },
+    "DEWFORD_GYM_ENTERED": {
+      "completed": true,
+      "timestamp": 1793748591.0952575,
+      "first_completed": 1793748591.0952575,
+      "split_time": 8380.46813583374,
+      "split_formatted": "02:19:40",
+      "total_time": 65201.48369550705,
+      "total_formatted": "18:06:41"
+    },
+    "KNUCKLE_BADGE": {
+      "completed": true,
+      "timestamp": 1793749457.4059443,
+      "first_completed": 1793749457.4059443,
+      "split_time": 866.3106868267059,
+      "split_formatted": "00:14:26",
+      "total_time": 66067.79438233376,
+      "total_formatted": "18:21:07"
+    },
+    "SLATEPORT_CITY": {
+      "completed": true,
+      "timestamp": 1793750477.010116,
+      "first_completed": 1793750477.010116,
+      "split_time": 10266.382994413376,
+      "split_formatted": "02:51:06",
+      "total_time": 67087.39855408669,
+      "total_formatted": "18:38:07"
+    },
+    "OCEANIC_MUSEUM_AQUA": {
+      "completed": true,
+      "timestamp": 1793752006.4765987,
+      "first_completed": 1793752006.4765987,
+      "split_time": 1529.4664826393127,
+      "split_formatted": "00:25:29",
+      "total_time": 68616.865036726,
+      "total_formatted": "19:03:36"
+    },
+    "ROUTE_110": {
+      "completed": true,
+      "timestamp": 1793752652.9036613,
+      "first_completed": 1793752652.9036613,
+      "split_time": 646.4270625114441,
+      "split_formatted": "00:10:46",
+      "total_time": 69263.29209923744,
+      "total_formatted": "19:14:23"
+    },
+    "RIVAL_BATTLE_ROUTE_110": {
+      "completed": true,
+      "timestamp": 1793752652.90636,
+      "first_completed": 1793752652.90636,
+      "split_time": 0.002698659896850586,
+      "split_formatted": "00:00:00",
+      "total_time": 69263.29479789734,
+      "total_formatted": "19:14:23"
+    },
+    "MAUVILLE_CITY": {
+      "completed": true,
+      "timestamp": 1793762968.455477,
+      "first_completed": 1793762968.455477,
+      "split_time": 10315.549117088318,
+      "split_formatted": "02:51:55",
+      "total_time": 79578.84391498566,
+      "total_formatted": "22:06:18"
+    }
+  },
+  "last_updated": 1793767405.1415281,
+  "version": "1.0"
+}

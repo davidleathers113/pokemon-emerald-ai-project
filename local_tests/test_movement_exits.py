@@ -57,6 +57,14 @@ def test_go_to_exit_by_destination_name():
     s = server()
     s.load(ROUTE101)
     r = s.call("mcp_go_to_exit", {"exit": "Oldale Town", "reasoning": "to Oldale"})
+    with s.srv.memory_lock:
+        interrupted = not r["success"] and s.srv.env.memory_reader.is_in_battle()
+    if interrupted:
+        # About 1 full-suite run in 3, a random wild encounter in the grass beside (13,2)
+        # stopped the walk ("the game left the overworld"). That's the game, not the
+        # tool: leave the battle and walk again.
+        assert s.call("mcp_run_from_battle", {"reasoning": "test"})["success"], r
+        r = s.call("mcp_go_to_exit", {"exit": "Oldale Town", "reasoning": "to Oldale"})
     assert r["success"] is True and _location(s) == "OLDALE TOWN", r
 
 
@@ -144,6 +152,53 @@ def test_navigate_to_a_door_reports_the_new_map():
     assert r["summary"].startswith("Went through a door/warp: now at") and "POKEMON CENTER 1F" in r["summary"], r
 
 
+def test_walks_never_step_on_a_door_they_are_not_going_to():
+    """Seen live: from ROUTE 110 (16,89), right below the Cycling Road gate's door at
+    (16,88), every navigate_to north ended inside ROUTE 110 SEASIDE CYCLING ROAD SOUTH
+    ENTRANCE. test_route110_gate.state is that tile. The door you ask for still works."""
+    s = server()
+    here = Path(__file__).resolve().parent
+    s.load(here / "test_route110_gate.state")
+    r = s.call("mcp_navigate_to", {"x": 34, "y": 54, "variance": "none", "reason": "north to the rival"})
+    print("   ", r.get("summary"))
+    assert _location(s) == "ROUTE 110", (_location(s), r)
+    s.load(here / "test_route110_gate.state")
+    r = s.call("mcp_navigate_to", {"x": 16, "y": 88, "variance": "none", "reason": "the gate itself"})
+    assert "CYCLING ROAD SOUTH ENTRANCE" in _location(s), (_location(s), r)
+    # The grid marks MAUVILLE CITY BIKE SHOP's whole floor 'D'; blocking by that letter
+    # walled the player in at (4,5). Only map.json's warp tiles count.
+    s.load(here / "test_bike_shop.state")
+    r = s.call("mcp_go_to_exit", {"exit": "MAUVILLE CITY", "reasoning": "test"})
+    print("   ", r.get("summary"))
+    assert _location(s) == "MAUVILLE CITY", (_location(s), r)
+    # Seen in a test: walking toward grass beside ROUTE 117's Day Care door, the path
+    # ran over the door (the warp tiles were dropped on the way to the planner).
+    s.load(here / "test_route117_blocked.state")
+    s.call("mcp_navigate_to", {"x": 50, "y": 1, "variance": "none", "reason": "test"})
+    assert _location(s) == "ROUTE 117", _location(s)
+    s.load(here / "test_route117_blocked.state")
+    s.call("mcp_go_to_exit", {"exit": "ROUTE 117 POKEMON DAY CARE", "reasoning": "test"})
+    assert _location(s) == "ROUTE 117 POKEMON DAY CARE", _location(s)  # asked for: still works
+
+
+def test_people_hidden_by_the_story_do_not_block_walks():
+    """Seen live: five TEAM AQUA grunts and PROF BIRCH from a finished Route 110 scene
+    (their hide flags set) stood in the pathfinder's object list across the only way
+    north, so every walk toward the rival found "no complete path"."""
+    from server import game_tools
+
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_route110_gate.state")
+    with s.srv.memory_lock:
+        state, _, _ = game_tools.load_pathfinding_state(s.srv.env)
+        objects = state["map"]["porymap"]["objects"]
+        path = game_tools.pathfinder.find_path((16, 89), (34, 56), state, consider_npcs=True, allow_partial=False)
+    flags = {o.get("flag") for o in objects}
+    assert "FLAG_HIDE_ROUTE_110_TEAM_AQUA" not in flags and "FLAG_HIDE_ROUTE_110_BIRCH" not in flags, flags
+    assert any(o.get("graphics_id") == "OBJ_EVENT_GFX_CAMPER" for o in objects)  # trainers still count
+    assert path, "the way north to the rival must be found"
+
+
 def test_navigate_to_across_an_exit_mat_reports_the_new_map():
     """Seen live: in the Oldale Mart, navigate_to(4,8) from (3,7) stepped on the exit mat
     and the warp cut the walk short. The result said "STOPPED ... on OLDALE TOWN MART: an
@@ -189,6 +244,155 @@ def test_navigate_to_toward_a_neighbouring_map_names_the_exit_call():
     assert "go_to_exit" not in r["summary"], r
 
 
+def test_collision_bit_blocks_floor_tiles():
+    """Seen live in Rusturf Tunnel: (6,11) is CAVE floor with collision 1. The game refused
+    the step, the map drew '.', and navigate_to failed 5 times in a row."""
+    from pokemon_env.enums import MetatileBehavior
+    from utils.mapping.map_formatter import format_tile_to_symbol
+
+    assert format_tile_to_symbol((521, MetatileBehavior.CAVE, 1, 0)) == "#"
+    assert format_tile_to_symbol((513, MetatileBehavior.CAVE, 0, 3)) == "."
+    assert format_tile_to_symbol((1, MetatileBehavior.TALL_GRASS, 1, 3)) == "#"
+    assert format_tile_to_symbol((1, MetatileBehavior.TALL_GRASS, 0, 3)) == "~"
+    assert format_tile_to_symbol((1, MetatileBehavior.NORMAL, 1, 0)) == "#"
+
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_rusturf_tunnel.state")  # (6,10), live
+    r = s.call("mcp_navigate_to", {"x": 7, "y": 11, "variance": "none", "reason": ""})
+    print("   ", r)
+    assert r["success"] is False, r  # refused up front instead of pressing into the wall
+
+
+def test_routes_treat_hm_obstacles_as_walls():
+    """Seen live: the heal-first route from inside Rusturf Tunnel (23,5) led east to
+    Verdanturf, through two BREAKABLE_ROCKs at (24,4)/(24,5) that need Rock Smash."""
+    from server import game_tools
+
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_rusturf_tunnel.state")
+    assert {(24, 4), (24, 5)} <= game_tools._obstacle_tiles("RusturfTunnel")
+    way = game_tools.way_to_pokemon_center("RUSTURF TUNNEL ALT", (23, 5))
+    print("   ", way)
+    assert "VERDANTURF" not in way and "RUSTBORO CITY POKEMON CENTER 1F" in way, way
+    saved = game_tools.flag_reader
+    try:
+        game_tools.flag_reader = lambda flag: True  # every hide flag set: rocks gone for good
+        assert not game_tools._obstacle_tiles("RusturfTunnel")
+    finally:
+        game_tools.flag_reader = saved
+
+
+def test_long_route_across_grass_is_still_found():
+    """Seen live: with grass steps costing 8x, go_to_exit("west") from Route 116 (44,9)
+    said "no walkable path" because the search cap counted cost, not steps."""
+    from server import game_tools
+
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_route116_east.state")  # (39,10)
+    s.call("mcp_press_buttons", {"buttons": ["RIGHT"] * 5, "reasoning": "east"})
+    snap = s.snapshot()
+    assert snap.x >= 43, snap
+    with s.srv.memory_lock:
+        plan = game_tools.plan_exit_route(s.srv.env, "west")
+    assert plan.get("success"), plan.get("error")
+    assert len(plan["buttons"]) >= snap.x, len(plan["buttons"])
+
+
+def test_go_to_exit_replans_around_a_person_in_the_way():
+    """Seen live: a person at (38,10) on Route 116 blocked every go_to_exit("west") from
+    (39,10); each call planned the same path through them."""
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_route116_east.state")  # (39,10)
+    r = s.call("mcp_go_to_exit", {"exit": "west", "reasoning": "to Rustboro"})
+    print("   ", r.get("summary"))
+    snap = s.snapshot()
+    # Either it left for Rustboro, or a wild battle stopped it somewhere past the person.
+    assert r.get("success") or (snap.x, snap.y) not in ((39, 10), (37, 10)), r
+    assert "occupied by someone" not in str(r.get("summary")), r
+
+
+def test_route_names_the_ladder_when_two_lead_to_the_same_map():
+    """Seen live: the AI climbed GRANITE CAVE B1F's ladder at (4,21) to 1F (17,11), east of
+    a row of east-facing ledges; Steven's Room (5,10) is west of them, reached only from
+    the ladder at 1F (35,2). Counted two-way, the ledges made the door look a walk away.
+    Ledges are one-way in routes now, and where two ladders lead to one map the hint
+    names the ladder, in a form go_to_exit takes."""
+    from server.field_control import match_exits
+    from server.game_tools import way_to_place
+
+    hint = way_to_place("GRANITE CAVE 1F ALT", (16, 11), "Granite Cave Steven's Room")
+    print("   ", hint)
+    assert "is through an exit of this map" not in hint, hint  # the door is beyond the ledges
+    assert 'go_to_exit("GRANITE CAVE B 1F (17, 11)")' in hint, hint
+    # West of the ledges the door is just a walk.
+    near = way_to_place("GRANITE CAVE 1F ALT", (8, 6), "Granite Cave Steven's Room")
+    assert near.startswith("GRANITE CAVE STEVENS ROOM is through an exit of this map"), near
+    hint = way_to_place("GRANITE CAVE B1F ALT", (6, 13), "Granite Cave Steven's Room")
+    print("   ", hint)
+    assert "GRANITE CAVE 1F (4, 21)" not in hint, hint
+    exits = [
+        {"kind": "warp", "x": 25, "y": 13, "listed_xy": (25, 13), "name": "GRANITE CAVE 1F"},
+        {"kind": "warp", "x": 4, "y": 21, "listed_xy": (4, 21), "name": "GRANITE CAVE 1F"},
+        {"kind": "warp", "x": 29, "y": 13, "listed_xy": (29, 13), "name": "GRANITE CAVE B 2F"},
+    ]
+    assert match_exits(exits, "GRANITE CAVE 1F (4, 21)") == [exits[1]]
+    assert match_exits(exits, "GRANITE CAVE 1F") == exits[:2]  # the name alone still matches both
+    assert match_exits(exits, "(29, 13)") == [exits[2]]
+
+
+def test_equally_far_places_pick_the_nearer_exit():
+    """Seen live: at ROUTE 110 (16,92), seven tiles from Slateport, the heal hint sent the
+    AI north to MAUVILLE (about 90 tiles); both are one map away, and the search just met
+    Mauville first. The model wouldn't make the trek and dithered in place."""
+    from server.game_tools import pokemon_center_route
+
+    south = pokemon_center_route("ROUTE 110", (16, 92))
+    print("   ", south)
+    assert south[0][0] == "south" and south[-1][1] == "SLATEPORT CITY POKEMON CENTER 1F", south
+    north = pokemon_center_route("ROUTE 110", (16, 8))
+    assert north[0][0] == "north" and north[-1][1] == "MAUVILLE CITY POKEMON CENTER 1F", north
+
+
+def test_maps_are_named_as_the_rom_numbers_them():
+    """Seen live: inside ROUTE 117's Day Care (map 22,0) the prompt said ROUTE 116 TUNNELERS
+    REST HOUSE and showed that house's exits; the AI walked at a door that wasn't there.
+    pokemon_env's MapLocation table is off for 24 ids; the decomp's map_groups.json wins."""
+    from utils.mapping.porymap_state import decomp_map_at
+
+    assert decomp_map_at(22, 0) == ("Route117_PokemonDayCare", "ROUTE 117 POKEMON DAY CARE")
+    assert decomp_map_at(0, 9) is not None and decomp_map_at(99, 0) is None
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_route117_daycare.state")
+    assert _location(s) == "ROUTE 117 POKEMON DAY CARE", _location(s)
+    r = s.call("mcp_go_to_exit", {"exit": "ROUTE 117", "reasoning": "test"})
+    assert _location(s) == "ROUTE 117", (_location(s), r)
+    s.load(ROUTE101)
+    assert _location(s) == "ROUTE 101"  # a name the table had right is unchanged
+
+
+def test_loose_target_names_match_their_map():
+    from server.game_tools import arrived_at
+
+    assert arrived_at("RUSTURF TUNNEL ALT", None, "Rusturf Tunnel")
+    assert arrived_at("DEWFORD TOWN GYM", None, "Dewford Gym")
+    assert arrived_at("GRANITE CAVE 1F", None, "Granite Cave")
+    assert not arrived_at("RUSTBORO CITY GYM", None, "Rustboro City")
+    assert not arrived_at("ROUTE 104 MR BRINEYS HOUSE", None, "Route 104")
+    # Seen live: "Visit Devon Corporation" never counted inside DEVON CORP 3F.
+    assert arrived_at("RUSTBORO CITY DEVON CORP 3F", None, "Devon Corporation")
+    assert arrived_at("RUSTBORO CITY DEVON CORP 1F", None, "Devon Corporation")
+    # Seen live: in MAUVILLE CITY BIKE SHOP the model walked out to find "Rydel's Cycles".
+    assert arrived_at("MAUVILLE CITY BIKE SHOP", None, "Rydel's Cycles")
+    assert not arrived_at("MAUVILLE CITY", None, "Rydel's Cycles")
+    assert not arrived_at("MT CHIMNEY", None, "Mt. Pyre")  # short words never stretch
+    # Seen live: "Mr. Briney's Cottage" is ROUTE 104 MR BRINEYS HOUSE.
+    assert arrived_at("ROUTE 104 MR BRINEYS HOUSE", None, "Mr. Briney's Cottage")
+    from server.game_tools import way_to_place
+
+    briney = way_to_place("RUSTBORO CITY", (12, 17), "Mr. Briney's Cottage")
+    assert briney.endswith("takes the first step.") and "ROUTE 104 MR BRINEYS HOUSE" in briney, briney
+
+
 def test_exit_list_says_when_an_edge_cannot_be_walked():
     """Seen live: Route 104's "south edge of the map -> ROUTE 105" (all sea) sent the
     model south from the very spot where its objective was already done."""
@@ -212,8 +416,18 @@ def test_way_to_an_objective_target():
     far = way_to_place("ROUTE 104", (39, 62), "Rustboro City")
     assert "PETALBURG WOODS → ROUTE 104 → RUSTBORO CITY" in far, far
     assert way_to_place("RUSTBORO CITY GYM", (5, 19), "Rustboro Gym") == ""  # already there
+    # Seen live: "Route 116" routed into ROUTE 116 TUNNELERS REST HOUSE; the exact name wins.
+    route = way_to_place("RUSTBORO CITY GYM", (5, 17), "Route 116")
+    assert route.endswith('go_to_exit("RUSTBORO CITY") takes the first step.'), route
+    assert "RUSTBORO CITY → ROUTE 116." in route and "TUNNELERS" not in route, route
+    # Seen live: the 2F matched too and the route led upstairs, away from the nurse.
+    center = way_to_place("PETALBURG WOODS", (7, 14), "Rustboro City Pokemon Center")
+    assert center.count("go_to_exit") == 1 and center.endswith('takes the first step.'), center
+    assert "RUSTBORO CITY POKEMON CENTER 1F. go_to_exit" in center and "2F" not in center, center
     assert way_to_place("ROUTE 104", (39, 62), "Route 104 North") == ""  # on the route; halves are arrived_at's job
-    assert way_to_place("RUSTBORO CITY", (13, 21), "Mr. Briney's Cottage") == ""  # no map by that name
+    # A name no map has gets no route. (This used "Mr. Briney's Cottage" until COTTAGE was
+    # taught to match HOUSE; see test_loose_target_names_match_their_map.)
+    assert way_to_place("RUSTBORO CITY", (13, 21), "Battle Frontier Lounge") == ""
     # Seen live: inside the gym, "In Rustboro City Gym" in the reason produced
     # go_to_exit("RUSTBORO CITY") and pulled the model out of the gym.
     from server.game_tools import exit_hint_for_text
