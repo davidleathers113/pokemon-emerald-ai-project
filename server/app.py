@@ -3507,6 +3507,25 @@ def _note_team_condition(guidance: Optional[Dict[str, Any]]) -> Optional[str]:
     return line
 
 
+TRAIN_WALKS_NOTE = "train walks to reachable grass by itself: don't navigate_to the grass first."
+
+
+def _note_train_walks_itself(guidance: Dict[str, Any]) -> None:
+    """Objective text that names train( gets TRAIN_WALKS_NOTE.
+
+    Seen live: a walkthrough hint said "In Route 112 grass call train(…)", and the model
+    tried navigate_to into the grass first (failing on unreachable tiles) instead of
+    calling train, which finds reachable grass itself.
+    """
+    entries = [guidance.get("story"), guidance.get("dynamics"), *(guidance.get("battling_group") or [])]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        text = f"{entry.get('description') or ''} {entry.get('navigation_hint') or ''}"
+        if "train(" in text and "walks to reachable grass" not in text:
+            entry["navigation_hint"] = f"{entry.get('navigation_hint') or ''} {TRAIN_WALKS_NOTE}".strip()
+
+
 def _note_conditions_met_in_memory(guidance: Dict[str, Any]) -> None:
     """Say so on an objective whose completion condition the game has already recorded.
 
@@ -4075,6 +4094,10 @@ async def mcp_get_game_state():
                             _note_way_to_story_target(categorized_guidance)
                         except Exception as e:
                             logger.warning(f"objective route hint failed: {e}")
+                        try:
+                            _note_train_walks_itself(categorized_guidance)
+                        except Exception as e:
+                            logger.warning(f"train note failed: {e}")
                         try:
                             _set_grass_cost_for(categorized_guidance)
                         except Exception as e:
@@ -6185,6 +6208,27 @@ def _train_stop_after_battle(
     return None
 
 
+# Heal trips train may make on its own in one call (more would let it ping-pong).
+TRAIN_MAX_HEALS = 1
+
+
+async def _train_heal_trip(origin: str) -> Tuple[bool, str]:
+    """heal_at_pokecenter, then go_to back to `origin` (the map train was called on).
+
+    Seen live: train refused three times in a row with "the team is weak … call
+    heal_at_pokecenter()", the model alternated train and heal attempts, and the stall
+    watcher paused it; each refusal cost a ~35 s decision. (ok, note for the report).
+    """
+    healed = await mcp_heal_at_pokecenter({})
+    if not healed.get("success"):
+        return False, f"tried to heal first: {healed.get('error') or healed.get('summary')}"
+    center = _location_name()
+    back = await mcp_go_to({"place": origin, "reasoning": "train: back to the grass after healing"})
+    if not back.get("success"):
+        return False, f"healed at {center}, but did not get back to {origin}: {back.get('error') or back.get('summary')}"
+    return True, f"healed at {center} and came back to {origin}"
+
+
 def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, why: str) -> str:
     """'4 wild battles (WHISMUR Lv6, …): SHROOMISH Lv7→9 (+120 EXP shared), COMBUSKEN 45→31/51. Stopped: …'"""
     if not battles:
@@ -6315,6 +6359,20 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             return _refusal(f"No tall grass here ({location}), and it isn't a cave: {way}", stopped_because="no_grass")
     partner_index = _train_partner(party, trainee_pid, partner_pid)
     weak = _train_weakness(partner_index)
+    heal_notes: List[str] = []
+    origin = _location_name()
+    if weak and not in_battle:
+        # Heal first, then come back here and train (TRAIN_MAX_HEALS per call).
+        ok, note = await _train_heal_trip(origin)
+        if not ok:
+            return _refusal(f"Not training: the team is weak ({', '.join(weak)}); {note}", stopped_because="team_weak")
+        heal_notes.append(note)
+        party = _train_party()
+        spots = await run_in_threadpool(_spots)
+        if not spots["pairs"]:
+            return _refusal(f"{note}, but no tall grass can be walked to from here now.", stopped_because="no_grass")
+        partner_index = _train_partner(party, trainee_pid, partner_pid)
+        weak = _train_weakness(partner_index)
     if weak:
         return _refusal(
             f"Not training: the team is weak ({', '.join(weak)}). Heal first: {_heal_way()}", stopped_because="team_weak"
@@ -6342,6 +6400,14 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             quiet_steps = 0
             if stop is None:
                 stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes)
+            if stop is not None and stop[0] == "team_weak" and len(heal_notes) < TRAIN_MAX_HEALS:
+                await _await_game(_player_can_walk, MACRO_TEXT_FRAMES)  # the battle's end, back on the map
+                ok, note = await _train_heal_trip(origin)
+                if ok:
+                    heal_notes.append(note)
+                    stop, spots, pair_index, stuck = None, None, 0, 0  # find the grass again
+                else:
+                    stop = ("team_weak", f"{stop[1]} {note}")
             continue
         snap = _field_snapshot()
         if snap is None:
@@ -6416,6 +6482,8 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     code, why = stop
     elapsed = time.monotonic() - started
     summary = _train_summary(battles, steps, elapsed, why)
+    if heal_notes:
+        summary = f"On the way: {'; '.join(heal_notes)}. {summary}"
     logger.info(f"🏋️ train: {summary}")
     return {
         "success": True,

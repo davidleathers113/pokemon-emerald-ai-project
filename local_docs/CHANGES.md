@@ -1361,6 +1361,24 @@ prompt. That came to 1.1 tiles walked per minute.
   badge flag cleared (RAM) nothing is clearable, the areas are split and the walk stops
   short.
 
+## train heals a weak team itself (2026-11-04, WEAKNESSES M57)
+- Seen live: three train refusals in a row ("the team is weak … heal first"), the model
+  alternating train and heal_at_pokecenter, the watcher pausing it.
+- `_train_heal_trip(origin)`: mcp_heal_at_pokecenter, then mcp_go_to(origin). mcp_train
+  uses it once per call (`TRAIN_MAX_HEALS`): at the start when the team is weak outside
+  a battle (then re-reads party, grass and partner), and after a battle that stops on
+  team_weak (then finds the grass again). The summary begins "On the way: healed at X and
+  came back to Y." A trip that fails hands back with the reason ("tried to heal first:
+  Did not heal: a trainer battle started on the way …"). In a battle, the refusal stands.
+- `_note_train_walks_itself`: any objective whose description or hint names train( gets
+  "train walks to reachable grass by itself: don't navigate_to the grass first."
+- *Verified:* from ROUTE 117 (0,8) (test_verdanturf_east.state, then east) with COMBUSKEN at
+  10 HP (RAM): "healed at VERDANTURF TOWN POKEMON CENTER 1F and came back to ROUTE 117",
+  COMBUSKEN healed, training went on (2 runs). From PETALBURG WOODS a ROUTE 104 trainer
+  stops the trip and the refusal says so. On the way: from test_marill_in_party.state
+  (18,14) the trip could cross an unbeaten trainer at (8,12) depending on his facing, so
+  that start was not used.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

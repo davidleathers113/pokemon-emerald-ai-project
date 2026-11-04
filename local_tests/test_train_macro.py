@@ -142,18 +142,49 @@ def test_train_only_picks_grass_it_can_walk_to():
         assert game_tools.pathfinder.find_path(start, tile, state, consider_npcs=True, allow_partial=False), tile
 
 
-def test_train_refuses_a_weak_team_and_says_where_to_heal():
+def test_train_heals_a_weak_team_itself_and_comes_back():
+    """Seen live: train refused three times in a row ("the team is weak … call
+    heal_at_pokecenter()"), the model alternated train and heal, and the stall watcher
+    paused it. Now train makes one heal trip itself and comes back. (Until 2026-11-04 this
+    test asserted the refusal.) RAM: TORCHIC (slot 2) down to 10/33, under half."""
     s = server()
+    # ROUTE 117 (0,8), next to VERDANTURF TOWN: test_verdanturf_east.state then east. (From
+    # test_marill_in_party.state's (18,14) the heal walk can cross the sight of an unbeaten
+    # trainer at (8,12), depending on where he faces.) RAM: COMBUSKEN (slot 2) at 10 HP.
+    s.load(HERE / "test_verdanturf_east.state")
+    assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
+    _write(s, 16, PARTY + 100 + 0x56, 10)
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True, r
+    assert r["summary"].startswith("On the way: healed at ") and "came back to ROUTE 117" in r["summary"], r
+    # Training went on after the heal, not "team weak" again. (What stops it next varies:
+    # the fixture carries a Repel from how it was made, and unbeaten Route 117 trainers
+    # may spot the player on the way to the grass, depending on where they face.)
+    assert r["stopped_because"] != "team_weak", r
+    combusken = _by_name(s, "COMBUSKEN")
+    assert combusken.current_hp * 2 > combusken.max_hp, combusken  # healed (a battle since may cost a little)
+    # When the heal trip itself is stopped (from PETALBURG WOODS a ROUTE 104 trainer spots
+    # the player on the way), train hands back and says why.
     s.load(WOODS)
-    before = s.snapshot()
-    # RAM: TORCHIC (slot 2) down to 10/33, under half.
     _write(s, 16, PARTY + 100 + 0x56, 10)
     r = s.call("mcp_train", {"trainee": "SHROOMISH", "reasoning": "test"})
+    print("   ", r.get("error"))
+    assert r["success"] is False and r["stopped_because"] == "team_weak", r
+    assert "tried to heal first: Did not heal: a trainer battle started on the way" in r["error"], r
+
+
+def test_train_refuses_a_weak_team_in_a_battle():
+    """In a battle there is no heal trip to make: the old refusal stands. RAM: in
+    test_wild_two_party.state's wild battle, SHROOMISH (the partner for a TORCHIC trainee)
+    down to 5/23."""
+    s = server()
+    s.load(WILD_TWO)
+    _write(s, 16, PARTY + 100 + 0x56, 5)
+    r = s.call("mcp_train", {"trainee": "TORCHIC", "reasoning": "test"})
     print("   ", r)
     assert r["success"] is False and r["stopped_because"] == "team_weak", r
-    assert "the team is weak (TORCHIC 10/33 HP)" in r["error"] and "heal_at_pokecenter()" in r["error"], r
-    after = s.snapshot()
-    assert (after.x, after.y) == (before.x, before.y) and not _in_battle(s), (before, after)
+    assert "the team is weak" in r["error"] and "heal_at_pokecenter()" in r["error"], r
 
 
 def test_train_refuses_bad_arguments():
@@ -267,6 +298,22 @@ def test_trainer_battle_is_not_fought():
 
 
 # -- the objective text points at train ------------------------------------------
+
+
+def test_a_hint_that_names_train_says_it_walks_itself():
+    """Seen live: a hint said "In Route 112 grass call train(…)" and the model tried
+    navigate_to into the grass first."""
+    s = server()
+    note = s.srv.TRAIN_WALKS_NOTE
+    guidance = {
+        "story": {"description": "Train Numel", "navigation_hint": 'In Route 112 grass call train("NUMEL", until_level=19).'},
+        "battling_group": [{"description": "Beat the Route 112 trainers", "navigation_hint": "Walk north."}],
+    }
+    s.srv._note_train_walks_itself(guidance)
+    assert guidance["story"]["navigation_hint"].endswith(note), guidance["story"]
+    assert note not in guidance["battling_group"][0]["navigation_hint"], guidance["battling_group"][0]
+    s.srv._note_train_walks_itself(guidance)  # never twice
+    assert guidance["story"]["navigation_hint"].count(note) == 1, guidance["story"]
 
 
 def test_training_objective_recommends_train():
