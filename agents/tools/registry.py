@@ -822,8 +822,14 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "parameters": {
             "type_": "OBJECT",
             "properties": {
-                "trainee": {"type_": "STRING", "description": "The party Pokemon to level up, e.g. 'SHROOMISH'."},
-                "until_level": {"type_": "INTEGER", "description": "Stop once the trainee reaches this level."},
+                "trainee": {
+                    "type_": "STRING",
+                    "description": "The party Pokemon to level up, e.g. 'SHROOMISH', or 'LOWEST': always your lowest-level one.",
+                },
+                "until_level": {
+                    "type_": "INTEGER",
+                    "description": "Stop once the trainee reaches this level (with 'LOWEST': once all of them have).",
+                },
                 "partner": {
                     "type_": "STRING",
                     "description": "Who fights for it (default: your highest-level Pokemon above half HP).",

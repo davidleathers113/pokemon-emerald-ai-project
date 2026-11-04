@@ -534,6 +534,37 @@ def test_train_makes_the_trainee_lead_before_its_battles():
     assert _party(s)[0].species_name.upper() == "SHROOMISH"
 
 
+def test_train_lowest_follows_the_party_rule_battle_by_battle():
+    """train("LOWEST"): David (2026-11-04) "the lowest-level Pokémon is the one trained";
+    the trainee is maintain_party's pick before every battle, and until_level means all
+    of them. test_jagged_pass_top.state (live): NUMEL 19, AZUMARILL 20, ELECTRIKE 20,
+    SABLEYE 26, COMBUSKEN 29, BRELOOM 38 (fainted), at the grass. RAM: every HP full;
+    NUMEL's and AZUMARILL's level bytes at 18, under their EXP's levels (19, 20), so the
+    first EXP either gains puts it back at its real level (the game recomputes the level
+    from EXP) and the other one becomes the lowest."""
+    s = server()
+    s.load(HERE / "test_jagged_pass_top.state", wild_encounters=True)
+    for i, mon in enumerate(_party(s)):
+        _write(s, 16, PARTY + i * 100 + 0x56, mon.max_hp)
+    r = s.call("mcp_train", {"trainee": "LOWEST", "until_level": 19, "reasoning": "test"})
+    assert r["success"] is False and "Every Pokémon able to battle is Lv19 or higher already" in r["error"], r
+    numel, azumarill = (next(i for i, p in enumerate(_party(s)) if p.species_name.upper() == n) for n in ("NUMEL", "AZUMARILL"))
+    _write(s, 8, PARTY + numel * 100 + 0x54, 18)
+    _write(s, 8, PARTY + azumarill * 100 + 0x54, 18)
+    r = s.call("mcp_train", {"trainee": "LOWEST", "until_level": 19, "max_minutes": 4, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    for battle in r.get("battles", []):
+        print("      ", battle)
+    assert r["success"], r
+    trainees = [b["trainee"] for b in r["battles"]]
+    assert set(trainees[:2]) == {"NUMEL", "AZUMARILL"}, trainees  # one battle each, then the other
+    assert f"{trainees[0]} then {trainees[1]} trained" in r["summary"], r["summary"]
+    assert r["stopped_because"] == "until_level", r
+    assert "every Pokémon able to battle is Lv19 or higher" in r["summary"], r["summary"]
+    assert "Levels: " in r["summary"] and "NUMEL Lv18→19" in r["summary"] and "AZUMARILL Lv18→" in r["summary"], r["summary"]
+    assert _party(s)[0].species_name.upper() in ("NUMEL", "AZUMARILL")
+
+
 def test_trainee_not_leading_still_gets_the_exp():
     """Seen live: SABLEYE led, train("SHROOMISH") had SABLEYE fight every battle, and only
     SABLEYE levelled (only Pokémon that were out share the EXP). test_wild_two_party.state

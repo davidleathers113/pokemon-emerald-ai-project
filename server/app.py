@@ -6648,15 +6648,20 @@ async def _train_battle(
 
 
 def _train_stop_after_battle(
-    trainee_pid: int, wanted_partner_pid: Optional[int], until_level: Optional[int], deadline: float, minutes: float
+    trainee_pid: int, wanted_partner_pid: Optional[int], until_level: Optional[int], deadline: float, minutes: float,
+    lowest: bool = False,
 ) -> Optional[Tuple[str, str]]:
-    """(code, why) when grinding should stop after a battle, else None."""
+    """(code, why) when grinding should stop after a battle, else None. With lowest (train
+    "LOWEST") the trainee is the lowest-level Pokémon able to battle, so its level
+    reaching until_level means every one of them has."""
     party = _train_party()
     trainee = dict(party).get(trainee_pid)
     if trainee is None:
         return ("unexpected", "the Pokémon being trained is no longer in the party.")
     name = trainee.species_name.upper()
     if until_level is not None and trainee.level >= until_level:
+        if lowest:
+            return ("until_level", f"every Pokémon able to battle is Lv{until_level} or higher (the lowest, {name}, is Lv{trainee.level}).")
         return ("until_level", f"{name} reached Lv{trainee.level} (until_level={until_level}).")
     index = _train_partner(party, trainee_pid, wanted_partner_pid)
     weak = _train_weakness(index)
@@ -6671,6 +6676,11 @@ def _train_stop_after_battle(
 
 # Heal trips train may make on its own in one call (more would let it ping-pong).
 TRAIN_MAX_HEALS = 1
+# train(trainee=TRAIN_LOWEST): the party rule picks the trainee before every battle.
+TRAIN_LOWEST = "LOWEST"
+# Plain-text boxes (Match Calls, signs) train reads through in one call before it hands
+# back: a text that keeps coming back is someone talking, for the model to see.
+TRAIN_MAX_TEXT_READS = 6
 
 
 async def _train_heal_from_bag() -> Optional[str]:
@@ -6726,11 +6736,16 @@ def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, wh
     shown = ", ".join(names[:6]) + (", …" if len(names) > 6 else "")
     first, last = battles[0], battles[-1]
     exp = sum(b["exp_gained"] for b in battles)
-    text = (
-        f"{len(battles)} wild battle{'s' if len(battles) != 1 else ''} in {elapsed:.0f} s ({shown}): "
-        f"{first['trainee']} Lv{first['level_before']}→{last['level_after']} (+{exp} EXP shared, "
-        f"HP {last['trainee_hp']}/{last['trainee_max_hp']})"
-    )
+    head = f"{len(battles)} wild battle{'s' if len(battles) != 1 else ''} in {elapsed:.0f} s ({shown}): "
+    trainees = list(dict.fromkeys(b["trainee"] for b in battles))
+    if len(trainees) > 1:
+        # train("LOWEST") hands over to whichever is lowest: each one's level is listed after.
+        text = head + f"{' then '.join(trainees)} trained (+{exp} EXP shared)"
+    else:
+        text = head + (
+            f"{first['trainee']} Lv{first['level_before']}→{last['level_after']} (+{exp} EXP shared, "
+            f"HP {last['trainee_hp']}/{last['trainee_max_hp']})"
+        )
     partners: Dict[str, Tuple[int, int, int]] = {}
     for b in battles:
         if "partner" in b:
@@ -6806,12 +6821,25 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
 
     party = _train_party()
     listing = ", ".join(f"{i + 1}. {_mon_text(mon)}" for i, (_, mon) in enumerate(party))
-    index = _train_member(party, wanted)
+    # trainee="LOWEST": David's rule (2026-11-04) picks the trainee, before every battle:
+    # the lowest-level Pokémon able to battle (_party_rule_target, maintain_party's own
+    # choice), so a training objective and the party rule never disagree. until_level
+    # then means every Pokémon able to battle has reached it.
+    lowest = ms.name_key(wanted) == TRAIN_LOWEST
+    index = _party_rule_target([mon for _, mon in party]) if lowest else _train_member(party, wanted)
     if index is None:
+        if lowest:
+            return _refusal(f"No Pokémon is able to battle (fainted ones and eggs don't count). Your party: {listing}.")
         return _refusal(f"{wanted} is not in your party. Your party: {listing}.")
     trainee_pid, trainee = party[index]
     trainee_name = trainee.species_name.upper()
+    levels_before = {pid: (mon.species_name.upper(), mon.level) for pid, mon in party}
     if until_level is not None and trainee.level >= until_level:
+        if lowest:
+            return _refusal(
+                f"Every Pokémon able to battle is Lv{until_level} or higher already (the lowest, {trainee_name}, "
+                f"is Lv{trainee.level}): nothing to train."
+            )
         return _refusal(f"{trainee_name} is already Lv{trainee.level} (until_level={until_level}): nothing to train.")
     partner_pid = None
     if request.get("partner") is not None and str(request.get("partner")).strip() != "":
@@ -6885,12 +6913,18 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             stopped_because="no_partner",
         )
 
-    if not in_battle:
-        # The trainee leads while it trains. Seen live (2026-11-04, train("AZUMARILL") on
-        # Jagged Pass, the party rule's lowest-level NUMEL leading): each battle switched
-        # AZUMARILL in, the foe hit it for free on the switch (82→65→50→32 HP over three
-        # battles, the "team is weak" stop), and the lead that started took a third of
-        # the EXP. Not when it holds the Exp. Share: then it earns from the bench.
+    async def lead_with_trainee() -> None:
+        """The trainee leads while it trains. Seen live (2026-11-04, train("AZUMARILL") on
+        Jagged Pass, the party rule's lowest-level NUMEL leading): each battle switched
+        AZUMARILL in, the foe hit it for free on the switch (82→65→50→32 HP over three
+        battles, the "team is weak" stop), and the lead that started took a third of the
+        EXP. Not when it holds the Exp. Share: then it earns from the bench. With LOWEST
+        the party rule itself (maintain_party) does it, the Exp. Share included."""
+        if lowest:
+            kept = await maintain_party({})
+            if kept.get("changed"):
+                heal_notes.append(kept["summary"].rstrip("."))
+            return
         party = _train_party()
         at = next((i for i, (pid, _) in enumerate(party) if pid == trainee_pid), None)
         if at not in (None, 0) and party[at][1].held_item != ms.ITEM_EXP_SHARE:
@@ -6899,27 +6933,38 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                 heal_notes.append(f"made {trainee_name} the lead so it starts each battle")
             else:
                 logger.info(f"🏋️ train: set_lead {trainee_name} failed: {led.get('error') or led.get('summary')}")
+
+    if not in_battle:
+        await lead_with_trainee()
+    new_trainee = False  # LOWEST: another Pokémon became the lowest; it leads before the next battle
     logger.info(f"🏋️ train {trainee_name} until_level={until_level} max_minutes={minutes:g} partner={partner_pid}")
     started = time.monotonic()
     deadline = started + minutes * 60
     battles: List[Dict[str, Any]] = []
     stop: Optional[Tuple[str, str]] = None
     steps = stuck = pair_index = 0
-    quiet_steps = 0
+    quiet_steps = texts_read = 0
     last_walk = ""
     while stop is None:
         if _mem(lambda r: r.is_in_battle()):
             record, stop = await _train_battle(trainee_pid, partner_pid, deadline + TRAIN_FINISH_BATTLE_S, catch)
             battles.append(record)
             quiet_steps = 0
+            if lowest:
+                party = _train_party()
+                pick = _party_rule_target([mon for _, mon in party])
+                if pick is not None and party[pick][0] not in (trainee_pid, partner_pid):
+                    trainee_pid = party[pick][0]
+                    trainee_name = party[pick][1].species_name.upper()
+                    new_trainee = True
             if stop is None:
-                stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes)
+                stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes, lowest)
             if stop is not None and stop[0] == "team_weak":
                 await _await_game(_player_can_walk, MACRO_TEXT_FRAMES)  # the battle's end, back on the map
                 note = await _train_heal_from_bag()
                 if note:
                     heal_notes.append(note)
-                    stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes)
+                    stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes, lowest)
                     if stop is None:
                         continue
             if stop is not None and stop[0] == "team_weak" and trips < TRAIN_MAX_HEALS:
@@ -6936,11 +6981,30 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             stop = ("unexpected", "the player's position could not be read.")
             break
         if not snap.field_free:
+            # Plain text is read through, and training goes on: a Match Call (seen live,
+            # ISABEL about PLUSLE on Jagged Pass: train stopped, and the model then pressed
+            # A on nothing four times) or a sign on the way ("This mysterious machine…",
+            # seen in a test on Jagged Pass). Questions and menus still stop it.
+            from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+
+            if texts_read < TRAIN_MAX_TEXT_READS and (
+                _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY) or _mem(ms.phone_call_active)
+            ):
+                texts_read += 1
+                read = await _read_dialogue()
+                said = _quote(read.get("texts") or [], 1)
+                if said and f"read through {said}" not in heal_notes:
+                    heal_notes.append(f"read through {said}")
+                continue
             # A battle's opening transition, a fade, or a script: wait for one to settle.
             if await _await_game(lambda: _mem(lambda r: r.is_in_battle()) or _player_can_walk(), MACRO_TEXT_FRAMES):
                 continue
             stop = ("unexpected", f"something else has control of the player at {_position_text(snap)}.{_screen_note()}")
             break
+        if new_trainee:
+            new_trainee = False
+            await lead_with_trainee()
+            continue  # the menus moved nothing on the map, but read it again
         # Only once nothing is starting: seen in a test, the last step before the deadline
         # began an encounter whose intro wasn't yet "in battle", and train handed back
         # mid-intro. The settle above lets that battle be finished first.
@@ -7004,6 +7068,13 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     code, why = stop
     elapsed = time.monotonic() - started
     summary = _train_summary(battles, steps, elapsed, why)
+    if lowest:
+        # Several Pokémon may have been trained: each one's level change, by the party.
+        grew = [
+            f"{levels_before[pid][0]} Lv{levels_before[pid][1]}→{mon.level}"
+            for pid, mon in _train_party() if pid in levels_before and mon.level != levels_before[pid][1]
+        ]
+        summary += f" Levels: {', '.join(grew)}." if grew else " No Pokémon levelled up."
     if heal_notes:
         summary = f"On the way: {'; '.join(heal_notes)}. {summary}"
     logger.info(f"🏋️ train: {summary}")
@@ -7293,7 +7364,11 @@ async def _ride_cable_car(source: str, dest_name: str) -> Dict[str, Any]:
     if not people:
         return _refusal(f"The Cable Car attendant is not near ({x},{y}).")
     talked = await mcp_talk_to({"x": people[0][0], "y": people[0][1], "reasoning": f"{source}: ride the Cable Car"})
-    if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO), MACRO_TEXT_FRAMES):
+    # Read on until the question's YES/NO is up (_talk_until, as for the nurse). Seen in
+    # a test run under load: one wait ended a moment before the YES/NO started, the ride
+    # gave up, and the walk then stopped at "Would you like to be on it?".
+    asked, _ = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+    if not asked:
         await _close_dialogue(source)
         return _refusal(f"The attendant did not ask to ride ({talked.get('summary') or talked.get('error')}).")
     cursor = _mem(ms.read_menu_cursor)
