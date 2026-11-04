@@ -3444,7 +3444,13 @@ def _trainee_advantage(view: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         )
     hits_needed = math.ceil(target["hp"] / best["damage"])
     hits_taken = math.ceil(player["hp"] / foe_best) if foe_best else math.inf
-    return best if hits_needed <= TRAINEE_SOLO_HITS and hits_needed < hits_taken else None
+    # Who moves first counts too (_loses_race): a faster trainee that needs as many hits
+    # as the foe lands the last one first. Seen live (2026-11-04): AZUMARILL (Water, 4x
+    # on NUMEL) left two of three Jagged Pass battles to BRELOOM and shared the EXP.
+    loses = env.memory_reader._loses_race(
+        hits_needed, hits_taken, player.get("stats", {}).get("speed", 0), target.get("stats", {}).get("speed", 0)
+    )
+    return best if hits_needed <= TRAINEE_SOLO_HITS and not loses else None
 
 
 def _switch_train_line(guidance: Dict[str, Any]) -> str:
@@ -6661,6 +6667,34 @@ def _train_stop_after_battle(
 TRAIN_MAX_HEALS = 1
 
 
+async def _train_heal_from_bag() -> Optional[str]:
+    """Heal the members that make the team weak (fainted, under half HP) or carry a status
+    with the bag's medicine, cheapest first (_heal_with_medicine). Returns the note for
+    the summary ('used SUPER POTION on AZUMARILL (32→82 HP); 9 SUPER POTIONs left'), or
+    None when nothing was used.
+
+    emerald-new (2026-11-04), David's "Potions + Jagged Pass": train stopped with "the
+    team is weak (AZUMARILL 32/82 HP)" on Jagged Pass and walked to Lavaridge below the
+    one-way ledges, a 10-15 minute loop back; the bag is the heal that keeps it training.
+    PP can't be restored this way: a team weak for PP still goes to a Pokémon Center.
+    """
+    from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
+
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    needy = [
+        i for i, p in enumerate(party)
+        if not p.is_egg and (p.current_hp < p.max_hp * TEAM_LOW_HP_SHARE or int(p.status) & STATUS_ANY)
+    ]
+    if not needy:
+        return None
+    lines, used, error = await _heal_with_medicine(needy, "train")
+    if not lines:
+        return f"no medicine in the bag helped ({error})" if error else None
+    note = "used " + ", ".join(lines) + "; " + _left_text(used)
+    return note + (f" ({error})" if error else "")
+
+
 async def _train_heal_trip(origin: str) -> Tuple[bool, str]:
     """heal_at_pokecenter, then go_to back to `origin` (the map train was called on).
 
@@ -6735,6 +6769,7 @@ async def mcp_train(request: dict = None):
 
 async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     from server import game_tools
+    from server import menu_state as ms
     from server.field_control import DIRECTION_DELTAS
 
     source = "train"
@@ -6809,12 +6844,22 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     partner_index = _train_partner(party, trainee_pid, partner_pid)
     weak = _train_weakness(partner_index)
     heal_notes: List[str] = []
+    trips = 0  # Pokémon Center trips (TRAIN_MAX_HEALS); healing from the bag isn't counted
     origin = _location_name()
+    if weak and not in_battle:
+        # The bag first: a Pokémon Center may be a long walk (below one-way ledges).
+        note = await _train_heal_from_bag()
+        if note:
+            heal_notes.append(note)
+            party = _train_party()
+            partner_index = _train_partner(party, trainee_pid, partner_pid)
+            weak = _train_weakness(partner_index)
     if weak and not in_battle:
         # Heal first, then come back here and train (TRAIN_MAX_HEALS per call).
         ok, note = await _train_heal_trip(origin)
         if not ok:
             return _refusal(f"Not training: the team is weak ({', '.join(weak)}); {note}", stopped_because="team_weak")
+        trips += 1
         heal_notes.append(note)
         party = _train_party()
         spots = await run_in_threadpool(_spots)
@@ -6834,6 +6879,20 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             stopped_because="no_partner",
         )
 
+    if not in_battle:
+        # The trainee leads while it trains. Seen live (2026-11-04, train("AZUMARILL") on
+        # Jagged Pass, the party rule's lowest-level NUMEL leading): each battle switched
+        # AZUMARILL in, the foe hit it for free on the switch (82→65→50→32 HP over three
+        # battles, the "team is weak" stop), and the lead that started took a third of
+        # the EXP. Not when it holds the Exp. Share: then it earns from the bench.
+        party = _train_party()
+        at = next((i for i, (pid, _) in enumerate(party) if pid == trainee_pid), None)
+        if at not in (None, 0) and party[at][1].held_item != ms.ITEM_EXP_SHARE:
+            led = await mcp_set_lead({"pokemon": str(at + 1), "reasoning": f"train: {trainee_name} fights first"})
+            if led.get("success"):
+                heal_notes.append(f"made {trainee_name} the lead so it starts each battle")
+            else:
+                logger.info(f"🏋️ train: set_lead {trainee_name} failed: {led.get('error') or led.get('summary')}")
     logger.info(f"🏋️ train {trainee_name} until_level={until_level} max_minutes={minutes:g} partner={partner_pid}")
     started = time.monotonic()
     deadline = started + minutes * 60
@@ -6849,10 +6908,18 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             quiet_steps = 0
             if stop is None:
                 stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes)
-            if stop is not None and stop[0] == "team_weak" and len(heal_notes) < TRAIN_MAX_HEALS:
+            if stop is not None and stop[0] == "team_weak":
                 await _await_game(_player_can_walk, MACRO_TEXT_FRAMES)  # the battle's end, back on the map
+                note = await _train_heal_from_bag()
+                if note:
+                    heal_notes.append(note)
+                    stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes)
+                    if stop is None:
+                        continue
+            if stop is not None and stop[0] == "team_weak" and trips < TRAIN_MAX_HEALS:
                 ok, note = await _train_heal_trip(origin)
                 if ok:
+                    trips += 1
                     heal_notes.append(note)
                     stop, spots, pair_index, stuck = None, None, 0, 0  # find the grass again
                 else:
@@ -7081,6 +7148,9 @@ HEAL_TRIP_MAX_MAPS = 10
 # _walk_along: scripted scenes (a trainer spotting the player) waited out, each up to
 # MACRO_TEXT_FRAMES, before the walk reports that something has the player's attention.
 WALK_SCENE_WAITS = 3
+# _walk_along: go_to_exit calls that stopped short on a map, retried after a beat (a
+# person walking their beat may have stepped into the way), before the walk gives up.
+WALK_BLOCKED_RETRIES = 2
 
 
 async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]]:
@@ -7111,8 +7181,10 @@ async def _walk_along(
     next_route(location, position) (recomputed on every map, so a detour is
     corrected). Wild battles on the way are run from; a trainer battle or a YES/NO
     stops the walk; plain text from a scene that interrupts (Birch's on ROUTE 110) is
-    read through. Returns (maps entered, why it stopped short or None).
+    read through. A route step named game_tools.RIDE_EXIT rides the Cable Car.
+    Returns (maps entered, why it stopped short or None).
     """
+    from server import game_tools
     from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
 
     entered: List[str] = []
@@ -7120,7 +7192,7 @@ async def _walk_along(
     # 113") crossed ROUTE 111 → ROUTE 112 → ROUTE 111 … fifteen times before its map budget
     # ran out. Taking the same exit off the same map twice in one walk is a loop.
     crossed = set()
-    reads = waits = 0
+    reads = waits = blocked = 0
     for _ in range(max_maps * 3):
         if _mem(lambda r: r.is_in_battle()):
             view = _read_battle_view()
@@ -7168,16 +7240,68 @@ async def _walk_along(
                 f'the way loops: go_to_exit("{route[0][0]}") from {location} was taken once already on this walk. '
                 f"The way planned now is {' → '.join(name for _, name in route)}"
             )
-        step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
+        if route[0][0] == game_tools.RIDE_EXIT:
+            step = await _ride_cable_car(source, route[0][1])
+        else:
+            step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
         if _location_name() != location:
             crossed.add((location, route[0][0]))
             entered.append(_location_name())
         elif not _mem(lambda r: r.is_in_battle()) and _player_can_walk():
+            # Seen in a test (ROUTE 112 from Lavaridge): a Hiker who walks up and down a
+            # two-tile corridor stepped into the path. People move; try again after a beat.
+            if blocked < WALK_BLOCKED_RETRIES:
+                blocked += 1
+                await _await_game(lambda: False, 60)
+                continue
             return entered, f'go_to_exit("{route[0][0]}") did not get there ({step.get("summary") or step.get("error")})'
     return entered, "the walk took too many steps"
 
 
 GO_TO_MAX_MAPS = 15
+# The Cable Car ride: the car's scene, the warp and the walk out of the car (~20 s at
+# normal speed), in game frames.
+CABLE_CAR_RIDE_FRAMES = 3600
+
+
+async def _ride_cable_car(source: str, dest_name: str) -> Dict[str, Any]:
+    """In a Cable Car station: talk to the attendant, answer YES, and wait to stand in the
+    other station (game_tools.CABLE_CAR_STATIONS). A go_to step, like go_to_exit's result.
+
+    emerald-new (2026-11-04): go_to("Jagged Pass") from Lavaridge entered the pass at the
+    bottom, below one-way ledges; the way to its upper part is this ride to Mt. Chimney.
+    pret Route112_CableCarStation scripts.inc: MSGBOX_YESNO, then "Please step this way"
+    (MSGBOX_DEFAULT), the car's scene (special CableCar) and ExitCableCar's walk.
+    """
+    from server import game_tools
+    from server import menu_state as ms
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    here = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
+    ride = game_tools.CABLE_CAR_STATIONS.get(here)
+    if ride is None:
+        return _refusal(f"There is no Cable Car on {_location_name()}.")
+    (x, y), _ = ride
+    # The attendant's map tile, or one step off it where the ride's scripts leave them.
+    people = _mem(lambda r: ms.people_near(r, x, y, 1))
+    if not people:
+        return _refusal(f"The Cable Car attendant is not near ({x},{y}).")
+    talked = await mcp_talk_to({"x": people[0][0], "y": people[0][1], "reasoning": f"{source}: ride the Cable Car"})
+    if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO), MACRO_TEXT_FRAMES):
+        await _close_dialogue(source)
+        return _refusal(f"The attendant did not ask to ride ({talked.get('summary') or talked.get('error')}).")
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor == 1 and cursor.cursor == 1:
+        await _macro_press(["UP"], source)
+        cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor != 1 or cursor.cursor != 0:
+        return _refusal(f"The attendant's YES/NO cursor is not on YES (cursor {cursor.cursor}).")
+    await _macro_press(["A"], source)  # YES
+    await _read_dialogue()  # "Please step this way."
+    arrived = await _await_game(lambda: _location_name() == dest_name and _player_can_walk(), CABLE_CAR_RIDE_FRAMES)
+    if not arrived:
+        return _refusal(f"Answered YES to the Cable Car but did not arrive at {dest_name}.{_screen_note()}")
+    return {"success": True, "status": "ARRIVED", "summary": f"Rode the Cable Car to {dest_name}."}
 
 
 @app.post("/mcp/go_to")
@@ -8005,6 +8129,257 @@ async def maintain_party(request: dict = None):
     del _pause_events[:-PAUSE_EVENTS_KEPT]
     logger.info(f"👥 maintain_party: {summary}")
     return {"changed": bool(result.get("success")), "summary": summary + "."}
+
+
+# -- medicine from the bag: use_item, and train healing on the spot -------------------
+
+# pret include/constants/items.h ids, the HP each restores (src/data/items.h holdEffectParam;
+# MEDICINE_FULL = all of it), the status1 bits it cures, whether it revives, and its Poké
+# Mart price (used only to pick the cheapest that does the job). Herbs are left out: they
+# lower friendship. STATUS1_TOXIC_POISON (0x80) is cured with POISON.
+MEDICINE_FULL = 10 ** 6
+STATUS_SLEEP, STATUS_POISON, STATUS_BURN, STATUS_FREEZE, STATUS_PARALYSIS = 0x7, 0x88, 0x10, 0x20, 0x40
+STATUS_ANY = STATUS_SLEEP | STATUS_POISON | STATUS_BURN | STATUS_FREEZE | STATUS_PARALYSIS
+MEDICINE: Dict[int, Tuple[int, int, bool, int]] = {
+    # item id: (HP restored, status cured, revives, price)
+    13: (20, 0, False, 300),                         # POTION
+    14: (0, STATUS_POISON, False, 100),              # ANTIDOTE
+    15: (0, STATUS_BURN, False, 250),                # BURN HEAL
+    16: (0, STATUS_FREEZE, False, 250),              # ICE HEAL
+    17: (0, STATUS_SLEEP, False, 250),               # AWAKENING
+    18: (0, STATUS_PARALYSIS, False, 200),           # PARALYZE HEAL
+    19: (MEDICINE_FULL, STATUS_ANY, False, 3000),    # FULL RESTORE
+    20: (MEDICINE_FULL, 0, False, 2500),             # MAX POTION
+    21: (200, 0, False, 1200),                       # HYPER POTION
+    22: (50, 0, False, 700),                         # SUPER POTION
+    23: (0, STATUS_ANY, False, 600),                 # FULL HEAL
+    24: (0, 0, True, 1500),                          # REVIVE (to half HP)
+    25: (0, 0, True, 4000),                          # MAX REVIVE (full HP)
+    26: (50, 0, False, 200),                         # FRESH WATER
+    27: (60, 0, False, 300),                         # SODA POP
+    28: (80, 0, False, 350),                         # LEMONADE
+    29: (100, 0, False, 500),                        # MOOMOO MILK
+}
+# Items one use_item pass may spend on one Pokémon (Potions on a big HP bar add up).
+MEDICINE_MAX_USES_PER_MON = 6
+# Presses through the bag's medicine texts ("X's HP was restored by N points.").
+MEDICINE_TEXT_PRESSES = 8
+
+
+def _medicine_for(mon, bag: Dict[int, int]) -> Optional[int]:
+    """The item a Pokémon needs most from what the bag holds ({item id: count}), else None.
+
+    Fainted: the cheapest revive. A status: the cheapest item that cures it. Missing HP:
+    the cheapest item that restores all of it; when none does, the one restoring the most
+    (cheapest of those). emerald-new (2026-11-04), David's "Potions + Jagged Pass": train
+    heals with the cheapest item that does the job before it walks to a Pokémon Center.
+    """
+    have = {i: MEDICINE[i] for i, n in bag.items() if n > 0 and i in MEDICINE}
+    if mon.is_egg or not mon.max_hp:
+        return None
+    if mon.current_hp == 0:
+        revives = [i for i, (_, _, revive, _) in have.items() if revive]
+        return min(revives, key=lambda i: have[i][3], default=None)
+    status = int(mon.status) & STATUS_ANY
+    if status:
+        cures = [i for i, (_, cured, _, _) in have.items() if cured & status]
+        if cures:
+            return min(cures, key=lambda i: have[i][3])
+    missing = mon.max_hp - mon.current_hp
+    if missing <= 0:
+        return None
+    heals = [i for i, (hp, _, _, _) in have.items() if hp > 0]
+    enough = [i for i in heals if have[i][0] >= missing]
+    if enough:
+        return min(enough, key=lambda i: have[i][3])
+    return min(heals, key=lambda i: (-have[i][0], have[i][3]), default=None)
+
+
+def _bag_counts() -> Dict[int, int]:
+    """{item id: quantity} for the ITEMS pocket (where medicine goes)."""
+    with memory_lock:
+        items = env.memory_reader.read_full_inventory().get("items", [])
+    counts: Dict[int, int] = {}
+    for item in items:
+        counts[item["item_id"]] = counts.get(item["item_id"], 0) + int(item.get("quantity") or 0)
+    return counts
+
+
+def _party_mon(index: int):
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    return party[index] if index < len(party) else None
+
+
+def _hp_status_text(mon) -> str:
+    status = "" if not int(mon.status) & STATUS_ANY else f" {mon.status_name}"
+    return f"{mon.current_hp}/{mon.max_hp} HP{status}"
+
+
+async def _use_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
+    """START → BAG → ITEMS → the item → USE → party slot `index`, through its text and
+    out of the menus. None when the item was used, else why not.
+
+    The same screens teach_move walks (Task_ItemContext_* for USE, then the party
+    chooser); a medicine that would do nothing says "It won't have any effect." and
+    leaves the chooser open, which is reported, not retried.
+    """
+    from server import menu_state as ms
+
+    pocket = ms.ITEMS_POCKET
+    before = _party_mon(index)
+    before_count = _bag_counts().get(item_id, 0)
+
+    async def leave(message: str) -> str:
+        closed = await _close_field_menus(source)
+        return message + ("" if closed else " Could not close every menu: look at the screen.")
+
+    await _macro_press(["START"], source)
+    if not await _await_game(lambda: _mem(ms.start_menu_open), MACRO_MENU_FRAMES):
+        return await leave("The START menu did not open.")
+    actions = _mem(ms.start_menu_actions)
+    if ms.MENU_ACTION_BAG not in actions:
+        return await leave("The START menu has no BAG.")
+    if not await _step_cursor(ms.start_menu_cursor, actions.index(ms.MENU_ACTION_BAG), source):
+        return await leave("Could not put the START menu cursor on BAG.")
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES * 2):
+        return await leave("Chose BAG but the bag did not open.")
+    for press in ms.pocket_presses(_mem(ms.bag_pocket), pocket):
+        await _macro_press([press], source)
+        await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES)
+    listed = _mem(lambda r: ms.bag_pocket_item_ids(r, pocket))
+    if _mem(ms.bag_pocket) != pocket or item_id not in listed:
+        return await leave(f"Could not find the {_item_name(item_id)} in the ITEMS pocket.")
+    if not await _step_cursor(lambda r: ms.bag_cursor_index(r, pocket), listed.index(item_id), source):
+        return await leave(f"Could not put the bag cursor on the {_item_name(item_id)}.")
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(lambda r: ms.task_running(r, *ms.TASK_BAG_CONTEXT)), MACRO_MENU_FRAMES):
+        return await leave(f"Pressed A on the {_item_name(item_id)} but its USE menu did not open.")
+    if _mem(lambda r: r._read_u16(ms.G_SPECIAL_VAR_ITEM_ID)) != item_id or _mem(ms.read_menu_cursor).cursor != 0:
+        return await leave(f"The bag's menu is not USE on the {_item_name(item_id)}.")
+    await _macro_press(["A"], source)  # USE: medicine opens the party chooser
+    if not await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES * 2):
+        return await leave(f"Chose USE on the {_item_name(item_id)} but the party screen did not open.")
+    if not await _step_cursor(ms.party_menu_slot, index, source):
+        return await leave(f"Could not put the party cursor on slot {index + 1}.")
+    await _macro_press(["A"], source)
+
+    def spent() -> bool:
+        return _bag_counts().get(item_id, 0) < before_count
+
+    # The HP bar fills, "X's HP was restored by N points." prints, and A goes back to the
+    # bag; or "It won't have any effect." and A goes back to the chooser, nothing spent.
+    pressed = False
+    for _ in range(MEDICINE_TEXT_PRESSES):
+        if await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES):
+            break
+        if pressed and _mem(_party_ready) and not spent():
+            break  # back at the chooser after the no-effect text: A here would choose again
+        await _macro_press(["A"], source)
+        pressed = True
+    used = spent()
+    closed = await _close_field_menus(source)
+    shut = "" if closed else " Could not close every menu: look at the screen."
+    if not used:
+        # (Not the screen's text: by now the text window holds leftover bytes.)
+        who = f"{before.species_name.upper()} ({_hp_status_text(before)})" if before is not None else f"slot {index + 1}"
+        return f"The {_item_name(item_id)} was not used on {who}: it would have no effect." + shut
+    return shut or None
+
+
+def _medicine_line(name: str, item_id: int, before, after) -> str:
+    """'SUPER POTION on AZUMARILL (32→82 HP)'."""
+    if before.current_hp == 0 or after.current_hp != before.current_hp:
+        what = f"{before.current_hp}→{after.current_hp} HP"
+    else:
+        what = f"{before.status_name}→{after.status_name}"
+    return f"{_item_name(item_id)} on {name} ({what})"
+
+
+def _left_text(used: List[int]) -> str:
+    """'9 SUPER POTIONs left, 0 POTIONs left' for each item used."""
+    counts = _bag_counts()
+    return ", ".join(f"{counts.get(i, 0)} {_item_name(i)}{'' if counts.get(i, 0) == 1 else 's'} left" for i in dict.fromkeys(used))
+
+
+async def _heal_with_medicine(indexes: List[int], source: str) -> Tuple[List[str], List[int], Optional[str]]:
+    """Use bag medicine on each of these party slots until it needs no more or nothing in
+    the bag helps (_medicine_for). Returns (lines like 'SUPER POTION on X (32→82 HP)',
+    the item ids used, why it stopped early or None)."""
+    from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
+
+    lines: List[str] = []
+    used: List[int] = []
+    for index in indexes:
+        for _ in range(MEDICINE_MAX_USES_PER_MON):
+            mon = _party_mon(index)
+            if mon is None:
+                break
+            item_id = _medicine_for(mon, _bag_counts())
+            if item_id is None:
+                break
+            weak = mon.current_hp < mon.max_hp * TEAM_LOW_HP_SHARE or int(mon.status) & STATUS_ANY
+            if not weak and mon.max_hp - mon.current_hp < MEDICINE[item_id][0]:
+                break  # topping up past half HP only with none of the item wasted
+            error = await _use_from_bag(index, item_id, source)
+            after = _party_mon(index)
+            if error:
+                return lines, used, error
+            lines.append(_medicine_line(mon.species_name.upper(), item_id, mon, after))
+            used.append(item_id)
+    return lines, used, None
+
+
+@app.post("/mcp/use_item")
+async def mcp_use_item(request: dict = None):
+    """MCP Tool: outside battle, use a medicine from the bag on a party Pokémon.
+
+    emerald-new (2026-11-04), David's "Potions + Jagged Pass": "Stopped: the team is weak
+    (AZUMARILL 32/82 HP)", and the heal walk went below Jagged Pass's one-way ledges, a
+    10-15 minute Lavaridge + Cable Car loop, where a Super Potion would have done. With no
+    item named it picks the cheapest that does the job (_medicine_for). By hand: START →
+    BAG → ITEMS → the item → USE → the Pokémon → A through the text.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import menu_state as ms
+
+    source = "use_item"
+    request = request or {}
+    wanted_item, wanted_mon = str(request.get("item") or "").strip(), request.get("pokemon")
+    if wanted_mon is None or str(wanted_mon).strip() == "":
+        return _refusal('pokemon is required, e.g. use_item("SUPER POTION", "AZUMARILL"), or no item for the cheapest that helps.')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    index = _train_member([(0, p) for p in party], wanted_mon)
+    if index is None:
+        names = ", ".join(f"{i + 1}. {p.species_name.upper()}" for i, p in enumerate(party))
+        return _refusal(f"{wanted_mon} is not in your party ({names}), or it is an egg.")
+    mon = party[index]
+    name = mon.species_name.upper()
+    counts = _bag_counts()
+    medicine = ", ".join(f"{_item_name(i)} x{n}" for i, n in counts.items() if i in MEDICINE and n > 0) or "none"
+    if wanted_item:
+        key = ms.name_key(wanted_item)
+        item_id = next((i for i, n in counts.items() if n > 0 and ms.name_key(_item_name(i)) == key), None)
+        if item_id is None:
+            return _refusal(f"There is no {wanted_item} in the ITEMS pocket. Medicine in the bag: {medicine}.")
+    else:
+        item_id = _medicine_for(mon, counts)
+        if item_id is None:
+            needs = "nothing" if mon.current_hp == mon.max_hp and not int(mon.status) & STATUS_ANY else "something the bag has none of"
+            return _refusal(f"{name} ({_hp_status_text(mon)}) needs {needs}. Medicine in the bag: {medicine}.")
+    with _turbo():
+        error = await _use_from_bag(index, item_id, source)
+    if error:
+        return _refusal(f"{error}{_screen_note()}")
+    after = _party_mon(index) or mon
+    line = _medicine_line(name, item_id, mon, after)
+    return {"success": True, "status": "USED", "summary": f"Used {line}; {_left_text([item_id])}."}
 
 
 @app.post("/mcp/buy_item")

@@ -142,17 +142,64 @@ def test_train_only_picks_grass_it_can_walk_to():
         assert game_tools.pathfinder.find_path(start, tile, state, consider_npcs=True, allow_partial=False), tile
 
 
+def _no_medicine(s):
+    """RAM: every medicine in the ITEMS pocket down to 0 (its quantity XOR'd with the
+    save's key, as the game stores it), so train can only heal at a Pokémon Center."""
+    from server import app
+    from server import menu_state as ms
+
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        slots = reader._read_u32(ms.G_BAG_POCKETS)
+        capacity = reader._read_u8(ms.G_BAG_POCKETS + 4)
+        key = reader._get_security_key() & 0xFFFF
+        medicine = [i for i in range(capacity) if reader._read_u16(slots + 4 * i) in app.MEDICINE]
+    for i in medicine:
+        _write(s, 16, slots + 4 * i + 2, key)
+
+
+def _put_in_bag(s, item_id, quantity):
+    from test_party_rule import _put_in_bag as put
+
+    put(s, item_id, quantity)
+
+
+def test_train_heals_from_the_bag_before_walking_to_a_pokemon_center():
+    """emerald-new (2026-11-04), David's "Potions + Jagged Pass": train stopped with "the
+    team is weak (AZUMARILL 32/82 HP)" and walked to Lavaridge below Jagged Pass's one-way
+    ledges, a 10-15 minute loop. With medicine in the bag it heals on the spot and trains
+    on. Same place as the next test; RAM: COMBUSKEN (slot 2) at 10 HP, no medicine but 3
+    SUPER POTIONs (id 22)."""
+    s = server()
+    s.load(HERE / "test_verdanturf_east.state")
+    assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
+    _no_medicine(s)
+    _put_in_bag(s, 22, 3)
+    _write(s, 16, PARTY + 100 + 0x56, 10)
+    top = _by_name(s, "COMBUSKEN").max_hp
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True, r
+    want = f"On the way: used SUPER POTION on COMBUSKEN (10→{min(top, 60)} HP)"
+    assert r["summary"].startswith(want), r["summary"]
+    assert "healed at" not in r["summary"] and r["stopped_because"] != "team_weak", r
+    assert "SUPER POTIONs left" in r["summary"] or "SUPER POTION left" in r["summary"], r
+
+
 def test_train_heals_a_weak_team_itself_and_comes_back():
     """Seen live: train refused three times in a row ("the team is weak … call
     heal_at_pokecenter()"), the model alternated train and heal, and the stall watcher
     paused it. Now train makes one heal trip itself and comes back. (Until 2026-11-04 this
-    test asserted the refusal.) RAM: TORCHIC (slot 2) down to 10/33, under half."""
+    test asserted the refusal.) RAM: TORCHIC (slot 2) down to 10/33, under half. Since
+    train heals from the bag first (2026-11-04), the bag's medicine is emptied here: this
+    is the trip it makes when nothing in the bag helps."""
     s = server()
     # ROUTE 117 (0,8), next to VERDANTURF TOWN: test_verdanturf_east.state then east. (From
     # test_marill_in_party.state's (18,14) the heal walk can cross the sight of an unbeaten
     # trainer at (8,12), depending on where he faces.) RAM: COMBUSKEN (slot 2) at 10 HP.
     s.load(HERE / "test_verdanturf_east.state")
     assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
+    _no_medicine(s)
     _write(s, 16, PARTY + 100 + 0x56, 10)
     r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
     print("   ", r.get("summary") or r)
@@ -167,6 +214,7 @@ def test_train_heals_a_weak_team_itself_and_comes_back():
     # When the heal trip itself is stopped (from PETALBURG WOODS a ROUTE 104 trainer spots
     # the player on the way), train hands back and says why.
     s.load(WOODS)
+    _no_medicine(s)
     _write(s, 16, PARTY + 100 + 0x56, 10)
     r = s.call("mcp_train", {"trainee": "SHROOMISH", "reasoning": "test"})
     print("   ", r.get("error"))
@@ -427,12 +475,20 @@ def test_trainee_with_the_advantage_is_told_to_fight():
     _write(s, 8, BATTLE_MONS + 0x58 + 0x24, 20)
     line = s.srv._switch_train_line(guidance)
     assert line.startswith('SWITCH-TRAINING: SHROOMISH') and 'switch_pokemon("TORCHIC")' in line, line
-    # Two hits to win, but the foe's ROCK THROW knocks a 6-HP SHROOMISH out in two as well.
+    # Two hits to win, but the foe's ROCK THROW knocks a 6-HP SHROOMISH out in two as well:
+    # the faster side lands its second hit first. (Until 2026-11-04 a tie always switched;
+    # seen live, AZUMARILL then left NUMEL, 4x weak to it, to BRELOOM.) RAM: struct
+    # BattlePokemon speed (+6).
     _shroomish_out_against(s, (TYPE_ROCK, TYPE_GROUND))
     _write(s, 16, BATTLE_MONS + 0x58 + 0x0C, Move["ROCK_THROW"].value)
     _write(s, 8, BATTLE_MONS + 0x58 + 0x24, 15)
     _write(s, 16, BATTLE_MONS + 0x28, 6)
+    _write(s, 16, BATTLE_MONS + 6, 10)
+    _write(s, 16, BATTLE_MONS + 0x58 + 6, 50)
     assert s.srv._switch_train_line(guidance).startswith("SWITCH-TRAINING: SHROOMISH")
+    _write(s, 16, BATTLE_MONS + 0x58 + 6, 5)
+    line = s.srv._switch_train_line(guidance)
+    assert line.startswith("SHROOMISH can beat SILCOON on its own"), line
 
 
 def test_train_lets_the_trainee_win_with_the_advantage():
@@ -446,6 +502,36 @@ def test_train_lets_the_trainee_win_with_the_advantage():
     assert first["trainee_fought"] is True and first["switched"] is False, first
     assert first["outcome"] == "won" and first["exp_gained"] > 0, first
     assert _by_name(s, "SHROOMISH").experience > exp_before
+
+
+def test_train_makes_the_trainee_lead_before_its_battles():
+    """Seen live (2026-11-04, train("AZUMARILL") on Jagged Pass with NUMEL leading by the
+    party rule): every battle switched AZUMARILL in, the foe hit it on the switch (82→65
+    →50→32 HP, then "the team is weak"), and NUMEL took a share of the EXP. train now
+    makes the trainee the lead first. test_train_woods.state: SHROOMISH leads, TORCHIC 2nd."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(WOODS)
+    assert _party(s)[0].species_name.upper() == "SHROOMISH"
+    r = s.call("mcp_train", {"trainee": "TORCHIC", "max_minutes": 0.2, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"], r
+    assert "made TORCHIC the lead" in r["summary"], r["summary"]
+    assert _party(s)[0].species_name.upper() == "TORCHIC"
+    for battle in r["battles"]:
+        assert not battle.get("trainee_sent_in"), battle  # it started out, nobody switched it in
+    # Holding the Exp. Share it earns from the bench: the lead is left alone. RAM: the
+    # trainee's held item (struct Pokemon, encrypted substruct0) is written through the
+    # give_item macro instead, from the bag (test_party_rule._put_in_bag).
+    from test_party_rule import _put_in_bag
+
+    s.load(WOODS)
+    _put_in_bag(s, ms.ITEM_EXP_SHARE)
+    assert s.call("mcp_give_item", {"item": "EXP SHARE", "pokemon": "TORCHIC", "reasoning": "test"})["success"]
+    r = s.call("mcp_train", {"trainee": "TORCHIC", "max_minutes": 0.1, "reasoning": "test"})
+    assert "made TORCHIC the lead" not in (r.get("summary") or ""), r
+    assert _party(s)[0].species_name.upper() == "SHROOMISH"
 
 
 def test_trainee_not_leading_still_gets_the_exp():

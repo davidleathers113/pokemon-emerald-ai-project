@@ -785,6 +785,26 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "required": ["item", "pokemon", "reasoning"],
         },
     },
+    # David (2026-11-04), "Potions + Jagged Pass": heal from the bag where a Pokémon
+    # Center is a long walk away.
+    {
+        "name": "use_item",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Outside battle: use a medicine from the bag (Potion, Super Potion, Antidote, "
+            "Revive...) on a party Pokemon, in one call. Leave item empty to use the "
+            "cheapest one that heals it."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "item": {"type_": "STRING", "description": "Optional: the item's name, e.g. 'SUPER POTION'."},
+                "pokemon": {"type_": "STRING", "description": "Party Pokemon name or slot 1-6, e.g. 'AZUMARILL'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why heal it."},
+            },
+            "required": ["pokemon", "reasoning"],
+        },
+    },
     # Seen live: switch-training cost ~3 model decisions per wild battle (walk into the
     # grass, switch_pokemon, use_move); train runs the whole loop server-side.
     {

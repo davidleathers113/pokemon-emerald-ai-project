@@ -1286,6 +1286,51 @@ def _walk_exits(map_dir: str) -> tuple:
     return tuple(sorted(out))
 
 
+# Rides a go_to walk can take besides exits: the station's attendant takes the player to
+# the other station (pret data/maps/Route112_CableCarStation/scripts.inc: the attendant's
+# MSGBOX_YESNO, YES → special CableCarWarp). Each is {map: (the attendant's tile in the
+# map's object_events, the other station)}. The attendant faces down from that tile.
+RIDE_EXIT = "CABLE CAR"
+CABLE_CAR_STATIONS = {
+    "Route112_CableCarStation": ((6, 6), "MtChimney_CableCarStation"),
+    "MtChimney_CableCarStation": ((6, 6), "Route112_CableCarStation"),
+}
+
+
+@lru_cache(maxsize=None)
+def _ride_exits(map_dir: str) -> tuple:
+    """_walk_exits' shape for a ride (RIDE_EXIT) from this map, or () if it has none.
+
+    emerald-new (2026-11-04): from the Lavaridge Pokémon Center, go_to("Jagged Pass")
+    walked into Jagged Pass's bottom (14,40), below one-way ledges, where the tall grass
+    can't be reached; the way to it is the Cable Car up to Mt. Chimney.
+    """
+    from utils.mapping.porymap_state import _readable_map_name, _map_dirs_by_const
+
+    ride = CABLE_CAR_STATIONS.get(map_dir)
+    if ride is None:
+        return ()
+    (x, y), dest = ride
+    const = next((c for c, d in _map_dirs_by_const().items() if d == dest), dest)
+    mine = _areas_at(map_dir, x, y + 1, _route_areas(map_dir))
+    theirs = _areas_at(dest, x, y + 1, _route_areas(dest))
+    return tuple((m, RIDE_EXIT, dest, t, _readable_map_name(const)) for m in mine for t in theirs)
+
+
+def _downhill(map_dir: str, area: int) -> set:
+    """The areas of a map reachable on foot from `area`: itself and every area below a
+    ledge from it (one-way jumps; _ledge_jumps)."""
+    jumps = _ledge_jumps(map_dir)
+    out, stack = {area}, [area]
+    while stack:
+        here = stack.pop()
+        for low, high in jumps:
+            if low == here and high not in out:
+                out.add(high)
+                stack.append(high)
+    return out
+
+
 def _squash_name(text: str) -> str:
     """'Birch's Lab' -> 'BIRCHSLAB': letters and digits only, upper case, accents dropped.
 
@@ -1432,7 +1477,8 @@ def _far_map_hint(map_dir: str, matches, position: Optional[Tuple[int, int]] = N
 
 
 def _walk_paths(
-    map_dir: str, matches, position: Optional[Tuple[int, int]] = None, other_parts_of_here: bool = False
+    map_dir: str, matches, position: Optional[Tuple[int, int]] = None, other_parts_of_here: bool = False,
+    rides: bool = False,
 ) -> List[List[Tuple[str, str]]]:
     """Ways on foot to every map `matches(readable map name)` accepts, nearest first.
 
@@ -1443,6 +1489,12 @@ def _walk_paths(
     other_parts_of_here: the player's own map counts too, entered again into another
     area (from ROUTE 117's walled-in notch at (0,6), Route 117's grass is west to
     VERDANTURF TOWN and back east).
+
+    rides: the Cable Car counts as a step too (RIDE_EXIT, which only go_to can take, so
+    hints for the model leave it out), and every way into a matching map is weighed: one
+    whose part of the map another way in reaches as well, and more, is dropped. Seen
+    live: go_to("Jagged Pass") from Lavaridge entered at the bottom, below one-way ledges;
+    from the top (Mt. Chimney, by Cable Car) the ledges lead everywhere, the bottom too.
     """
     if not map_dir:
         return []
@@ -1473,13 +1525,13 @@ def _walk_paths(
     for _ in range(_FAR_MAP_MAX_STEPS):
         nxt = []
         for node in frontier:
-            for from_area, exit_arg, dest, dest_area, name in _walk_exits(node[0]):
+            for from_area, exit_arg, dest, dest_area, name in _walk_exits(node[0]) + (_ride_exits(node[0]) if rides else ()):
                 target = (dest, dest_area)
                 if from_area != node[1] or target in parent:
                     continue
                 parent[target] = (node, exit_arg, name)
                 nxt.append(target)
-                if dest in seen_maps:
+                if dest in seen_maps and not (rides and dest != map_dir):
                     continue
                 seen_maps.add(dest)
                 if matches(name):
@@ -1487,6 +1539,12 @@ def _walk_paths(
         frontier = with_jumps(nxt)
         if not frontier:
             break
+    if rides:
+        reach = {hit: _downhill(*hit) for hit in hits}
+        hits = [
+            hit for hit in hits
+            if not any(o[0] == hit[0] and reach[o] > reach[hit] for o in hits)
+        ]
     paths = []
     for hit in hits:
         path, node = [], hit
@@ -1870,7 +1928,8 @@ def place_route(location_name: str, position: Optional[Tuple[int, int]], target:
 
     map_dir = ROM_TO_PORYMAP_MAP.get(location_name, "")
     for matcher in (lambda name: _place_words(name) == words, matches):
-        paths = _walk_paths(map_dir, matcher, position)
+        # go_to walks this, so the Cable Car is a step it can take (RIDE_EXIT).
+        paths = _walk_paths(map_dir, matcher, position, rides=True)
         if paths:
             return paths[0]
     return None

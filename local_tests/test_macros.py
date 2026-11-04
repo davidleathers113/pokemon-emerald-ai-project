@@ -265,6 +265,39 @@ def test_go_to_from_south_route111_goes_round_the_desert():
     assert "ROUTE 112 → ROUTE 111 → ROUTE 112" not in walked and "ROUTE 111 → ROUTE 112 → ROUTE 111" not in walked, r
 
 
+def test_go_to_jagged_pass_rides_the_cable_car_to_its_top():
+    """emerald-new (2026-11-04): at 18:03 from the Lavaridge Pokémon Center, go_to("Jagged
+    Pass") walked into its bottom (14,40), below one-way ledges, where the tall grass
+    can't be reached. From the top (Mt. Chimney, by Cable Car) the ledges lead everywhere.
+    A way into a map is dropped when another way in reaches all of its part and more;
+    Route 104's halves, joined only through Petalburg Woods, are not like that. Hints for
+    the model (way_to_place) never name the ride: only go_to can take it.
+    test_mt_chimney_busy_grunt.state: MT CHIMNEY before Maxie (grunts stand on row 39, so
+    only the ride down is tried there). test_lavaridge_after_chimney.state: the live save
+    from 18:03, LAVARIDGE TOWN (6,7) outside the Pokémon Center, after Maxie."""
+    from server import game_tools
+
+    route = game_tools.place_route("LAVARIDGE TOWN", (12, 15), "Jagged Pass")
+    print("    from Lavaridge:", route)
+    assert route and route[-1] == ("JAGGED PASS", "JAGGED PASS"), route
+    assert (game_tools.RIDE_EXIT, "MT CHIMNEY CABLE CAR STATION") in route, route
+    assert game_tools.place_route("PETALBURG CITY", (2, 15), "Route 104")[0][1] == "ROUTE 104"
+    assert "CABLE CAR\"" not in game_tools.way_to_place("LAVARIDGE TOWN", (12, 15), "Jagged Pass")
+
+    s = server()
+    s.load(HERE / "test_mt_chimney_busy_grunt.state", wild_encounters=False)
+    r = s.call("mcp_go_to", {"place": "Route 112 Cable Car Station", "reasoning": "test"})
+    print("   ", r.get("error") or r.get("summary"))
+    assert r["success"] and s.srv._location_name() == "ROUTE 112 CABLE CAR STATION", r
+    assert "MT CHIMNEY CABLE CAR STATION → ROUTE 112 CABLE CAR STATION" in r["summary"], r
+    s.load(HERE / "test_lavaridge_after_chimney.state", wild_encounters=False)
+    r = s.call("mcp_go_to", {"place": "Jagged Pass", "reasoning": "test"})
+    print("   ", r.get("error") or r.get("summary"))
+    snap = s.snapshot()
+    assert r["success"] and s.srv._location_name() == "JAGGED PASS", r
+    assert snap.y < 23, f"arrived below the grass at ({snap.x},{snap.y})"
+
+
 def test_route_plans_know_which_part_of_route111_they_start_in():
     """From ROUTE 111's north part (0,31) Route 113 is the west edge's top span, named by
     its map because ROUTE 112 is on the west side too (seen live: "west" walked into 112

@@ -543,6 +543,25 @@ def find_objects_by_graphics(reader, graphics_id: int) -> List[Tuple[int, int, s
     return found
 
 
+OBJ_EVENT_ID_PLAYER = 0xFF  # struct ObjectEvent localId (+8) of the player's own object
+
+
+def people_near(reader, x: int, y: int, radius: int) -> List[Tuple[int, int]]:
+    """(x, y) of visible object events other than the player within `radius` steps of
+    (x, y), nearest first. For someone a script can move (the Cable Car attendant)."""
+    found = []
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        flags = reader._read_u32(base)
+        if not flags & 0x1 or flags & (1 << 13) or reader._read_u8(base + 8) == OBJ_EVENT_ID_PLAYER:
+            continue
+        ox = reader._read_s16(base + 0x10) - MAP_OFFSET
+        oy = reader._read_s16(base + 0x12) - MAP_OFFSET
+        if abs(ox - x) + abs(oy - y) <= radius:
+            found.append((ox, oy))
+    return sorted(found, key=lambda p: abs(p[0] - x) + abs(p[1] - y))
+
+
 def talk_spot(x: int, y: int, facing: str, counter_between: bool) -> CounterPerson:
     """Where to stand to talk to a person who faces customers, maybe across a counter.
 
