@@ -1276,6 +1276,24 @@ prompt. That came to 1.1 tiles walked per minute.
   6/6 → balls at once). Objective-memory 25/25, train-macro 18/18 (its catch stop now
   reads "…use_move("SCRATCH") once…" against SILCOON), battle-view 17/17.
 
+## Walks go round floor switches and scene triggers (2026-11-04, WEAKNESSES R23)
+- Seen live in MAUVILLE CITY GYM: talk_to's walk to Wattson from the right switch
+  (0,15) crossed the switches at (4,12) and (3,9) and shut the barriers again.
+- `game_tools.active_triggers(env, map_dir)`: the map's coord_events of type "trigger"
+  whose var equals var_value now (`read_game_var`; var names from
+  `pokemon_env/porymap/include/constants/vars.h`, copied from pret, parsed by
+  `_var_ids` including "(TEMP_VARS_START + 0x0)" forms). Unreadable vars count as
+  firing; spent ones (Birch's ROUTE 110 scene once its var moved on) stay walkable.
+  `load_pathfinding_state` puts them in the porymap state as `triggers`;
+  `_extract_map_data` passes them on.
+- `Pathfinder.find_path`: A* first with the triggers (other than start and goal)
+  blocked; if that finds no full path, again without them. Variance candidates avoid
+  them too when the first search succeeded.
+- `navigate_to` accepts `avoid: [[x, y], ...]` (operator use; not in the model's tools).
+- *Verified:* `test_walks_go_round_floor_switches` on test_mauville_gym_switch1.state:
+  new route (0,15)→(2,10)→(4,10)→(5,3) touches no switch; with the trigger list emptied
+  the same search crosses (3,9); navigate_to reaches (5,3), also with avoid [[4,10]].
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

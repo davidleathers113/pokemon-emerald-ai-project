@@ -165,6 +165,51 @@ def test_an_edge_exit_never_lands_in_a_dead_end_pocket():
     assert r.get("status") == "DONE" and s.snapshot().x == snap.x + 1, r
 
 
+def test_walks_go_round_floor_switches():
+    """Seen live in MAUVILLE CITY GYM: on the south-west switch (0,15) the barriers were
+    open, then talk_to's walk to Wattson crossed the switches at (4,12) and (3,9) and
+    flipped them shut. test_mauville_gym_switch1.state is the player on (0,15) just after
+    pressing it; Wattson stands at (5,2)."""
+    from server import game_tools
+    from server.field_control import DIRECTION_DELTAS
+
+    switches = {(4, 12), (3, 9), (8, 9)}
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_mauville_gym_switch1.state")
+    with s.srv.memory_lock:
+        state, offset, source = game_tools.load_pathfinding_state(s.srv.env)
+        assert source["porymap_map_name"] == "MauvilleCity_Gym"
+        assert switches <= set(state["map"]["porymap"]["triggers"]), state["map"]["porymap"]["triggers"]
+        buttons = game_tools.pathfinder.find_path((0, 15), (5, 3), state, consider_npcs=True, allow_partial=False)
+        # The same walk with no trigger list, as before: it crosses a switch.
+        state["map"]["porymap"]["triggers"] = []
+        old = game_tools.pathfinder.find_path((0, 15), (5, 3), state, consider_npcs=True, allow_partial=False)
+
+    def tiles(presses):
+        x, y, out = 0, 15, []
+        for b in presses or []:
+            dx, dy = DIRECTION_DELTAS[b]
+            x, y = x + dx, y + dy
+            out.append((x, y))
+        return out
+
+    print("    new:", tiles(buttons), "\n    old:", tiles(old))
+    assert buttons and tiles(buttons)[-1] == (5, 3) and not switches & set(tiles(buttons)), tiles(buttons)
+    assert switches & set(tiles(old)), tiles(old)
+    r = s.call("mcp_navigate_to", {"x": 5, "y": 3, "variance": "none", "reason": "to Wattson"})
+    print("   ", r.get("summary"))
+    snap = s.snapshot()
+    assert (snap.x, snap.y) == (5, 3), (snap, r)
+    # navigate_to's operator-only avoid list reaches the planner. (Not (4,10): that is the
+    # only switch-free corridor, so avoiding it rightly falls back to crossing a switch.)
+    s.load(Path(__file__).resolve().parent / "test_mauville_gym_switch1.state")
+    r = s.call("mcp_navigate_to", {"x": 5, "y": 3, "variance": "none", "reason": "test", "avoid": [[7, 14]]})
+    snap = s.snapshot()
+    assert (snap.x, snap.y) == (5, 3), (snap, r)
+    bad = s.call("mcp_navigate_to", {"x": 5, "y": 3, "reason": "test", "avoid": [["a"]]})
+    assert bad["success"] is False and "avoid must be a list" in bad["error"], bad
+
+
 def test_walks_never_step_on_a_door_they_are_not_going_to():
     """Seen live: from ROUTE 110 (16,89), right below the Cycling Road gate's door at
     (16,88), every navigate_to north ended inside ROUTE 110 SEASIDE CYCLING ROAD SOUTH

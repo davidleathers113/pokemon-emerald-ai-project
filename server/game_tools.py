@@ -327,6 +327,9 @@ def load_pathfinding_state(env) -> tuple:
                             (int(w.get("x", -1)), int(w.get("y", -1)))
                             for w in _raw_map_json(porymap_map_name).get("warp_events") or []
                         ]
+                        # Floor switches and scene triggers that would fire if stepped on:
+                        # walks go round them unless that is the only way (find_path).
+                        state["map"]["porymap"]["triggers"] = active_triggers(env, porymap_map_name)
                         state["map"]["porymap"]["raw_tiles"] = raw_tiles
 
                         # For selected dynamic maps (e.g. Mauville Gym), replace static
@@ -763,6 +766,73 @@ def _flag_ids() -> dict:
 
 
 SYSTEM_FLAGS = 0x860  # include/constants/flags.h: (TRAINER_FLAGS_END + 1)
+
+
+@lru_cache(maxsize=1)
+def _var_ids() -> dict:
+    """VAR_TEMP_0 -> 0x4000, from include/constants/vars.h (copied from pret). Values are
+    a number or "(NAME + 0xN)" with NAME defined earlier in the file."""
+    from pokemon_env.porymap_paths import get_porymap_root
+
+    root = get_porymap_root()
+    path = Path(root) / "include" / "constants" / "vars.h" if root else None
+    ids: dict = {}
+    if path is None or not path.exists():
+        return ids
+
+    def number(text: str) -> Optional[int]:
+        text = text.strip().strip("()")
+        try:
+            return int(text, 16) if text.lower().startswith("0x") else int(text)
+        except ValueError:
+            return ids.get(text)
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] != "#define":
+            continue
+        value = parts[2].split("//")[0].strip()
+        if value.startswith("(") and "+" in value:
+            base, _, offset = value.strip("()").partition("+")
+            left, right = number(base), number(offset)
+            if left is not None and right is not None:
+                ids[parts[1]] = left + right
+        else:
+            found = number(value)
+            if found is not None:
+                ids[parts[1]] = found
+    return ids
+
+
+def active_triggers(env, map_dir: str) -> List[Tuple[int, int]]:
+    """Tiles of map.json coord_events "trigger"s that fire when stepped on now: the
+    event's var equals its var_value (pret: a coord event runs its script when
+    VarGet(var) == value). A var that can't be read or resolved counts as firing.
+
+    Seen live in MAUVILLE CITY GYM: after the AI stood on the south-west switch (0,15),
+    talk_to's walk to Wattson crossed the switches at (4,12) and (3,9), each of which
+    flipped the barriers back. Already spent triggers (Birch's ROUTE 110 scene once
+    VAR_REGISTER_BIRCH_STATE has moved on) stay walkable.
+    """
+    out = []
+    for event in _raw_map_json(map_dir).get("coord_events") or []:
+        if event.get("type") != "trigger":
+            continue
+        var_id = _var_ids().get(str(event.get("var", "")))
+        try:
+            wanted = int(str(event.get("var_value", "0")), 0)
+        except ValueError:
+            wanted = None
+        fires = True
+        if var_id is not None and wanted is not None and env is not None:
+            try:
+                value = env.memory_reader.read_game_var(var_id)
+                fires = value is None or value == wanted
+            except Exception as e:  # unreadable var: treat as live, the safer guess
+                logger.debug(f"trigger var {event.get('var')} unreadable: {e}")
+        if fires:
+            out.append((int(event.get("x", -1)), int(event.get("y", -1))))
+    return out
 
 
 @lru_cache(maxsize=1)

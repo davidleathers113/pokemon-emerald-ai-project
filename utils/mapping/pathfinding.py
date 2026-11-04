@@ -320,8 +320,17 @@ class Pathfinder:
 
         logger.debug(f"Total blocked positions: {len(blocked)}, warps: {len(warps)}")
 
-        # Run A* algorithm (returns both path and best_node if path fails)
-        result = self._astar(start, goal, blocked, map_data, max_distance)
+        # Run A* algorithm (returns both path and best_node if path fails). Trigger tiles
+        # (floor switches, scene triggers) are walked round when there is another way:
+        # seen live in MAUVILLE CITY GYM, the walk to Wattson crossed two floor switches
+        # that flipped the barriers back. When the only way is over one (a story scene to
+        # walk into), it is walked over.
+        triggers = {tuple(t) for t in map_data.get("triggers") or []} - {start, goal}
+        result = self._astar(start, goal, blocked | triggers, map_data, max_distance) if triggers else None
+        if result is None or isinstance(result, tuple):
+            result = self._astar(start, goal, blocked, map_data, max_distance)
+        else:
+            blocked = blocked | triggers  # the variance candidates below avoid them too
 
         if isinstance(result, tuple):
             # A* returned (None, best_node) - no complete path but found closest point
@@ -395,6 +404,8 @@ class Pathfinder:
                     "warps": porymap.get("warps", []),  # Include warps for pathfinding
                     # The tiles that really warp (map.json warp_events), see find_path.
                     "raw_warps": porymap.get("raw_warps", []),
+                    # Coord-event triggers that would fire now (game_tools.active_triggers).
+                    "triggers": porymap.get("triggers", []),
                 }
 
                 # Include raw tiles with elevation if available

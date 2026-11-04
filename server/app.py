@@ -7335,7 +7335,15 @@ async def mcp_navigate_to(request: dict):
             return {"success": False, "error": f"Invalid coordinates: x={x}, y={y}"}
 
         # Calculate path and get buttons
-        result = game_tools.navigate_to_direct(env, x, y, reason=reason, variance=variance)
+        # Operator use (not in the model's tool list): tiles to walk round, [[x, y], ...].
+        # Asked for after the MAUVILLE CITY GYM switches had to be avoided by hand.
+        try:
+            avoid = [(int(p[0]), int(p[1])) for p in request.get("avoid") or []]
+        except (TypeError, ValueError, IndexError):
+            return {"success": False, "error": "avoid must be a list of [x, y] pairs."}
+        result = game_tools.navigate_to_direct(
+            env, x, y, reason=reason, variance=variance, blocked_coords=avoid or None
+        )
 
         def exit_hint() -> str:
             try:
