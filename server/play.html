@@ -8,11 +8,13 @@
   :root {
     --bg: #111418; --panel: #1b2027; --text: #e8edf2; --muted: #9aa6b2;
     --accent: #3ddc84; --warn: #ffb020; --key: #2a313b; --key-active: #3ddc84;
+    --bad: #ff6b5e; --mid: #f2c94c; --line: #2a313b; --inset: #151a20;
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
       --bg: #f3f5f7; --panel: #ffffff; --text: #14181d; --muted: #5b6672;
       --accent: #12924f; --warn: #b26a00; --key: #e3e8ee; --key-active: #12924f;
+      --bad: #c62828; --mid: #c79100; --line: #e3e8ee; --inset: #f6f8fa;
     }
   }
   * { box-sizing: border-box; }
@@ -55,6 +57,87 @@
   }
   #offline.show { display: block; }
   .screen.stale img { opacity: .35; filter: grayscale(1); }
+
+  /* Live panels: three columns on wide windows, stacked below ~900px. */
+  .panels {
+    width: 100%; max-width: 1400px; margin-top: 16px; display: grid; gap: 16px;
+    grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start;
+  }
+  @media (max-width: 900px) { .panels { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: var(--panel); border-radius: 10px; padding: 14px; min-width: 0; overflow-wrap: anywhere; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  .panel-body { max-height: 70vh; overflow-y: auto; position: relative; font-size: 13px; }
+  .empty { color: var(--muted); }
+  .t, .n, .dur, .when, .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .feed-paused { background: var(--warn); color: #1d1200; border-radius: 6px; padding: 4px 8px; margin-bottom: 8px; font-weight: 600; }
+  .step, .event { border-bottom: 1px solid var(--line); padding: 7px 0; }
+  .step { cursor: pointer; }
+  .step-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+  .step-head .dur { margin-left: auto; }
+  .call { font: 12px ui-monospace, monospace; color: var(--accent); }
+  .reasoning, .result { margin-top: 3px; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; }
+  .reasoning { -webkit-line-clamp: 3; line-clamp: 3; }
+  .result { -webkit-line-clamp: 2; line-clamp: 2; color: var(--muted); }
+  .step.open .reasoning, .step.open .result { display: block; }
+  .result.fail { color: var(--bad); }
+  .step.fail { border-left: 3px solid var(--bad); padding-left: 6px; }
+  .inflight { cursor: default; }
+  .thinking { color: var(--warn); font-weight: 600; }
+  .event { display: flex; gap: 8px; }
+  .ev-pause span:last-child { color: var(--warn); }
+  .ev-resume span:last-child { color: var(--accent); }
+
+  .party-sum { display: grid; gap: 2px; margin-bottom: 8px; }
+  .balls { color: var(--muted); }
+  .warn-strip { background: var(--warn); color: #1d1200; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
+  .mons { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+  .mon { background: var(--inset); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+  .mon.fainted { opacity: .6; }
+  .mon-head { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+  .species { font-weight: 700; }
+  .nick { color: var(--muted); }
+  .lv { margin-left: auto; color: var(--muted); }
+  .tag.lead { background: var(--accent); color: #04140a; border-radius: 4px; padding: 0 5px; font-size: 11px; font-weight: 700; }
+  .hpbar { height: 6px; background: var(--key); border-radius: 3px; margin: 6px 0 2px; overflow: hidden; }
+  .hp-fill { height: 100%; }
+  .hp-high { background: var(--accent); }
+  .hp-mid { background: var(--mid); }
+  .hp-low { background: var(--bad); }
+  .hp-zero { background: var(--muted); }
+  .hp-text, .ability { color: var(--muted); font-size: 12px; }
+  .status { color: var(--bad); font-weight: 600; }
+  .moves { list-style: none; margin: 6px 0 0; padding: 0; font-size: 12px; }
+  .move { display: flex; gap: 6px; }
+  .move .type { color: var(--muted); font-size: 10px; align-self: center; }
+  .move .pp { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .move.no-pp .pp { color: var(--bad); }
+
+  .prog-top { position: sticky; top: 0; background: var(--panel); padding-bottom: 6px; z-index: 1; }
+  .prog-head { font-weight: 600; margin-bottom: 6px; }
+  .pips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pip { border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; font-size: 11px; color: var(--muted); }
+  .pip.earned { background: var(--accent); border-color: var(--accent); color: #04140a; font-weight: 600; }
+  .chap-head {
+    width: 100%; display: flex; gap: 6px; align-items: baseline; background: none; border: 0; padding: 6px 0;
+    color: var(--text); font: inherit; font-weight: 600; cursor: pointer; text-align: left;
+    border-bottom: 1px solid var(--line);
+  }
+  .chap-head .count { margin-left: auto; font-weight: 400; }
+  .chapter.finished .chap-name { color: var(--muted); }
+  .objs { list-style: none; margin: 0; padding: 0; }
+  .obj { display: flex; gap: 6px; padding: 3px 0; }
+  .obj .mark { width: 1em; flex: none; text-align: center; }
+  .obj .desc { flex: 1; min-width: 0; }
+  .obj.done .mark { color: var(--accent); }
+  .obj.done .desc { color: var(--muted); }
+  .obj.upcoming .mark { color: var(--muted); }
+  .obj.current { background: var(--inset); border-left: 3px solid var(--warn); padding: 6px; border-radius: 4px; }
+  .obj.current .mark { color: var(--warn); }
+  .obj.current .desc > div:first-child { font-weight: 600; }
+  .hint, .target { color: var(--muted); margin-top: 2px; }
+  .battle-head { font-size: 13px; margin: 14px 0 4px; display: flex; gap: 6px; }
+  .battle-head .count { margin-left: auto; font-weight: 400; }
 </style>
 </head>
 <body>
@@ -86,6 +169,12 @@
     <div class="note">Take control first so the AI doesn't press buttons at the same time. The AI resumes when you hand control back. While you play, progress is checkpointed every minute.</div>
   </aside>
 </main>
+<div class="panels">
+  <section class="panel"><h2>What the AI is doing</h2><div class="panel-body" id="feed"></div></section>
+  <section class="panel"><h2>Party</h2><div class="panel-body" id="party"></div></section>
+  <section class="panel"><h2>Progress</h2><div class="panel-body" id="progress"></div></section>
+</div>
+<script src="/play_panels.js"></script>
 <script>
 const base = window.location.origin;
 const frame = document.getElementById("frame");
@@ -153,7 +242,7 @@ modeBtn.addEventListener("click", async () => {
   try {
     const want = !(await api("/agent_pause")).paused;  // decide from the server's state, not a stale copy
     await checkpoint(want ? "taking control" : "handing back");
-    paused = (await api("/agent_pause", { paused: want })).paused;
+    paused = (await api("/agent_pause", { paused: want, source: "human" })).paused;
     renderMode();
     statusEl.textContent = paused
       ? "AI paused (it finishes the move it was already thinking about)."
@@ -216,9 +305,96 @@ async function pollFrame() {
   setTimeout(pollFrame, 100);
 }
 
+// Live panels. Rendering lives in play_panels.js; this part fetches, writes the
+// DOM only when the HTML changed (keeps text selection and scroll), and handles clicks.
+const feedEl = document.getElementById("feed");
+const partyEl = document.getElementById("party");
+const progressEl = document.getElementById("progress");
+const PANELS_EVERY_MS = 2000;
+const expandedSteps = {};  // step number -> reasoning expanded
+const openChapters = {};   // chapter key -> open, only for chapters the user toggled
+let panelsInFlight = false;
+let lastFeed = null, lastDash = null, lastObjectives = null;
+let serverSkewMs = 0;      // browser clock minus server clock, from feed.now
+let scrolledToId = null;
+
+function setHtml(el, html) {
+  if (el.dataset.html === html) return;
+  el.dataset.html = html;
+  el.innerHTML = html;
+}
+
+function serverNow() { return Date.now() - serverSkewMs; }
+
+function drawProgress() {
+  setHtml(progressEl, renderProgress(lastObjectives, lastDash && lastDash.badges, openChapters));
+}
+
+async function pollPanels() {
+  if (panelsInFlight) return;  // a slow server must not stack up requests
+  if (typeof renderFeed === "undefined") return;  // play_panels.js didn't load; the controls still work
+  panelsInFlight = true;
+  try {
+    // Settled, not all: one failing endpoint shouldn't blank the other two.
+    // On failure the last render stays; the offline banner reports the outage.
+    const [feed, dash, objs] = await Promise.allSettled([api("/ai_feed"), api("/dashboard"), api("/objectives")]);
+    if (feed.status === "fulfilled") {
+      lastFeed = feed.value;
+      const now = parseUtc(lastFeed.now);
+      if (Number.isFinite(now)) serverSkewMs = Date.now() - now;
+      setHtml(feedEl, renderFeed(lastFeed, serverNow(), expandedSteps));
+    }
+    if (dash.status === "fulfilled") {
+      lastDash = dash.value;
+      setHtml(partyEl, renderParty(lastDash));
+    }
+    if (objs.status === "fulfilled") lastObjectives = objs.value;
+    if (objs.status === "fulfilled" || dash.status === "fulfilled") drawProgress();
+    scrollToCurrentObjective();
+  } finally {
+    panelsInFlight = false;
+  }
+}
+
+// Only when the current objective changes, so reading further down isn't undone every poll.
+function scrollToCurrentObjective() {
+  const id = lastObjectives && lastObjectives.story ? lastObjectives.story.current_id : null;
+  if (!id || id === scrolledToId) return;
+  const target = progressEl.querySelector(".scroll-target");
+  if (!target) return;
+  scrolledToId = id;
+  const sticky = progressEl.querySelector(".prog-top");
+  progressEl.scrollTop = target.offsetTop - (sticky ? sticky.offsetHeight : 0) - 8;
+}
+
+feedEl.addEventListener("click", (e) => {
+  if (window.getSelection().toString()) return;  // selecting text to copy, not toggling
+  const row = e.target.closest(".step[data-step]");
+  if (!row) return;
+  const step = row.dataset.step;
+  expandedSteps[step] = !expandedSteps[step];
+  if (lastFeed) setHtml(feedEl, renderFeed(lastFeed, serverNow(), expandedSteps));
+});
+
+progressEl.addEventListener("click", (e) => {
+  const head = e.target.closest("[data-chapter]");
+  if (!head) return;
+  openChapters[head.dataset.chapter] = head.getAttribute("aria-expanded") !== "true";
+  drawProgress();
+});
+
+// The thinking counter ticks locally between polls; only its text changes.
+setInterval(() => {
+  const el = feedEl.querySelector(".thinking[data-since-ms]");
+  if (!el || el.dataset.sinceMs === "") return;
+  el.textContent = `thinking… ${fmtElapsed(Number(el.dataset.sinceMs), serverNow())}`;
+}, 1000);
+
 refreshState();
 setInterval(refreshState, 3000);
 pollFrame();
+pollPanels();
+setInterval(pollPanels, PANELS_EVERY_MS);
 </script>
 </body>
 </html>

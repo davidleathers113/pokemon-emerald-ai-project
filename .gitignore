@@ -1,6 +1,9 @@
 *.mkv
 *.out
 *.js
+# The controller page's panel renderer and its node smoke test are source, not build output.
+!server/play_panels.js
+!local_tests/test_play_panels.js
 *.log
 *.gba
 *.gbc

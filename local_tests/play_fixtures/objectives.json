@@ -1,0 +1,31 @@
+{
+  "mode": "categorized",
+  "story": {
+    "done": 5,
+    "total": 11,
+    "current_id": "chimney_003",
+    "objectives": [
+      {"id": "early_001", "description": "Leave the moving truck in LITTLEROOT TOWN", "status": "done", "completed_at": "2026-11-03T05:29:33", "navigation_hint": null, "target_location": null},
+      {"id": "early_002", "description": "Set the clock in your bedroom", "status": "done", "completed_at": "2026-11-03T05:41:02", "navigation_hint": null, "target_location": null},
+      {"id": "early_003", "description": "Rescue Prof. Birch on ROUTE 101", "status": "done", "completed_at": "2026-11-03T06:12:10.5", "navigation_hint": null, "target_location": null},
+      {"id": "chimney_001", "description": "Reach the summit of MT. CHIMNEY via the cable car", "status": "done", "completed_at": "2026-11-04T14:02:00", "navigation_hint": null, "target_location": null},
+      {"id": "chimney_002", "description": "Beat Team Magma <Grunt> & \"Tabitha\" at the summit", "status": "done", "completed_at": "2026-11-04T15:30:45", "navigation_hint": null, "target_location": null},
+      {"id": "chimney_003", "description": "Defeat Maxie and stop the meteorite machine", "status": "current", "completed_at": null, "navigation_hint": "Walk north past the grunts; Maxie stands by the machine at the crater's edge.", "target_location": "MT CHIMNEY"},
+      {"id": "chimney_004", "description": "Descend JAGGED PASS", "status": "upcoming", "completed_at": null, "navigation_hint": null, "target_location": null},
+      {"id": "chimney_005", "description": "Arrive in LAVARIDGE TOWN", "status": "upcoming", "completed_at": null, "navigation_hint": null, "target_location": null},
+      {"id": "lavaridge_001", "description": "Get the Go-Goggles from Brendan", "status": "upcoming", "completed_at": null, "navigation_hint": null, "target_location": null},
+      {"id": "lavaridge_002", "description": "Enter the LAVARIDGE GYM", "status": "upcoming", "completed_at": null, "navigation_hint": null, "target_location": null},
+      {"id": "lavaridge_003", "description": "Defeat Flannery for the Heat Badge", "status": "upcoming", "completed_at": null, "navigation_hint": null, "target_location": null}
+    ]
+  },
+  "battling": {
+    "done": 1,
+    "total": 3,
+    "current_id": "battle_002",
+    "objectives": [
+      {"id": "battle_001", "description": "Win the Roxanne rematch", "status": "done", "completed_at": "2026-11-03T09:10:00", "navigation_hint": null, "target_location": null},
+      {"id": "battle_002", "description": "Get a team member to Lv25", "status": "current", "completed_at": null, "navigation_hint": "Train in the grass on ROUTE 112.", "target_location": "ROUTE 112"},
+      {"id": "battle_003", "description": "Teach a Fire-type move", "status": "upcoming", "completed_at": null, "navigation_hint": null, "target_location": null}
+    ]
+  }
+}

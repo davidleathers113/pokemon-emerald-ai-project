@@ -1370,8 +1370,22 @@ AGENT_PAUSE_FLAG = os.path.join(".pokeagent_cache", "AGENT_PAUSED")
 @app.get("/play")
 async def get_play():
     """Serve the human controller page (server/play.html)."""
-    with open("server/play.html", "r") as f:
+    with open(Path(__file__).resolve().parent / "play.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+
+@app.get("/play_panels.js")
+async def get_play_panels():
+    """The controller page's panel renderers (server/play_panels.js)."""
+    from fastapi.responses import Response
+
+    with open(Path(__file__).resolve().parent / "play_panels.js", "r", encoding="utf-8") as f:
+        return Response(content=f.read(), media_type="application/javascript")
+
+
+# Pause/resume of the agent, newest last, for the controller page's feed (/ai_feed).
+_pause_events: List[Dict[str, Any]] = []
+PAUSE_EVENTS_KEPT = 20
 
 
 @app.get("/agent_pause")
@@ -1381,13 +1395,216 @@ async def get_agent_pause():
 
 @app.post("/agent_pause")
 async def set_agent_pause(request: dict):
+    was = os.path.exists(AGENT_PAUSE_FLAG)
     if request.get("paused"):
         os.makedirs(os.path.dirname(AGENT_PAUSE_FLAG), exist_ok=True)
         with open(AGENT_PAUSE_FLAG, "w") as f:
             f.write(str(time.time()))
     elif os.path.exists(AGENT_PAUSE_FLAG):
         os.remove(AGENT_PAUSE_FLAG)
-    return {"paused": os.path.exists(AGENT_PAUSE_FLAG)}
+    now = os.path.exists(AGENT_PAUSE_FLAG)
+    if now != was:
+        _pause_events.append({
+            "time": datetime.datetime.utcnow().isoformat(),
+            "kind": "pause" if now else "resume",
+            "source": str(request.get("source") or "unknown"),
+            "text": str(request.get("reason") or ""),
+        })
+        del _pause_events[:-PAUSE_EVENTS_KEPT]
+    return {"paused": now}
+
+
+# /ai_feed: steps shown, and how much of the trajectory file's end is read for them
+# (rows carry the whole prompt, ~12K characters each).
+AI_FEED_STEPS = 10
+AI_FEED_TAIL_BYTES = 600_000
+
+
+def _quoted_field(text: str, field: str) -> Optional[str]:
+    """The JSON string value of "field" in a result block, decoded; None if absent."""
+    key = f'"{field}": '
+    at = text.find(key)
+    if at == -1 or text[at + len(key): at + len(key) + 1] != '"':
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text, at + len(key))
+    except ValueError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _step_result(prompt: str) -> Tuple[Optional[str], Optional[bool]]:
+    """(summary, success) of the call a step made, from the next step's prompt."""
+    text = str(prompt or "")
+    start = text.find("RESULTS FROM PREVIOUS STEP")
+    if start == -1:
+        return None, None
+    end = text.find("### ", start)
+    block = text[start:end if end != -1 else len(text)]
+    success = False if '"success": false' in block else (True if '"success": true' in block else None)
+    return _quoted_field(block, "summary") or _quoted_field(block, "error"), success
+
+
+@app.get("/ai_feed")
+async def get_ai_feed():
+    """Read-only: the agent's last steps for the controller page (reasoning, the call,
+    its result, how long the step took), the step being thought about now, and
+    pause/resume events.
+
+    David (2026-11-04): "it would be cool to be able to see what the LLM is doing".
+    Read from the trajectory file's end; nothing here touches the emulator.
+    """
+    from utils.data_persistence.run_data_manager import get_cache_path
+
+    rows: List[Dict[str, Any]] = []
+    path = get_cache_path("trajectory_history.jsonl")
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - AI_FEED_TAIL_BYTES))
+            for line in fh.read().decode("utf-8", errors="replace").splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue  # the first line is usually cut by the seek
+    except OSError:
+        rows = []
+    rows = sorted((r for r in rows if r.get("timestamp")), key=lambda r: r["timestamp"])[-(AI_FEED_STEPS + 1):]
+    steps = []
+    for i, row in enumerate(rows):
+        action = row.get("action") if isinstance(row.get("action"), dict) else {}
+        call = (action.get("tool_calls") or [{}])[0]
+        args = {k: v for k, v in (call.get("args") or {}).items() if k not in ("reasoning", "reason")}
+        result, success, duration = None, None, None
+        if i + 1 < len(rows):
+            result, success = _step_result(rows[i + 1].get("llm_prompt"))
+            try:
+                duration = round(
+                    (datetime.datetime.fromisoformat(rows[i + 1]["timestamp"])
+                     - datetime.datetime.fromisoformat(row["timestamp"])).total_seconds(), 1
+                )
+            except ValueError:
+                duration = None
+        steps.append({
+            "step": row.get("step"),
+            "time": row["timestamp"],
+            "tool": call.get("name"),
+            "args": args,
+            "reasoning": str(row.get("reasoning") or ""),
+            "result": result,
+            "success": success,
+            "duration_s": duration,
+        })
+    paused = os.path.exists(AGENT_PAUSE_FLAG)
+    in_flight = None
+    if steps and not paused:
+        in_flight = {"since": steps[-1]["time"], "step": (steps[-1]["step"] or 0) + 1}
+    return {
+        "now": datetime.datetime.utcnow().isoformat(),
+        "paused": paused,
+        "in_flight": in_flight,
+        "steps": list(reversed(steps[-AI_FEED_STEPS:])),
+        "events": list(reversed(_pause_events)),
+    }
+
+
+BADGE_COUNT = 8
+
+
+@app.get("/dashboard")
+async def get_dashboard():
+    """Read-only: party, place, money, badges and balls for the controller page.
+
+    David (2026-11-04): "a module with the pokemon party". One read of the party under
+    the memory lock; move types and PP come from the ROM table the battle view uses.
+    """
+    if env is None or getattr(env, "memory_reader", None) is None:
+        return {"error": "Emulator not initialized"}
+    from server import game_tools
+    from pokemon_env.enums import Move, PokemonType
+    from utils.state_formatter import _exp_concentration_line
+
+    with memory_lock:
+        reader = env.memory_reader
+        party = reader.read_party_pokemon() or []
+        money = reader.read_money()
+        badges = [bool(reader._is_event_flag_set(game_tools.FLAG_BADGE01_GET + i)) for i in range(BADGE_COUNT)]
+        balls = [
+            {"name": item["name"], "count": item["quantity"]}
+            for item in reader.read_full_inventory().get("poke_balls", [])
+        ]
+        cards = []
+        for i, mon in enumerate(party):
+            moves = []
+            for name, pp in zip(mon.moves or [], mon.move_pp or []):
+                if not name or name == "NONE":
+                    continue
+                try:
+                    data = reader._rom_battle_move(Move[str(name).upper().replace(" ", "_")].value)
+                    move_type, base_pp = PokemonType(data["type"]).name, data["pp"]
+                except (KeyError, ValueError):
+                    move_type, base_pp = None, pp
+                moves.append({"name": str(name).replace("_", " "), "type": move_type, "pp": pp, "max_pp": max(pp, base_pp)})
+            cards.append({
+                "slot": i + 1,
+                "species": str(mon.species_name).upper(),
+                "nickname": str(mon.nickname or mon.species_name).upper(),
+                "level": mon.level,
+                "hp": mon.current_hp,
+                "max_hp": mon.max_hp,
+                "status": str(getattr(mon.status, "name", mon.status) or "OK"),
+                "ability": mon.ability,
+                "lead": i == 0,
+                "egg": bool(mon.is_egg),
+                "moves": moves,
+            })
+    snap = _field_snapshot()
+    exp_note = _exp_concentration_line([
+        {"species_name": c["species"], "level": c["level"], "current_hp": c["hp"], "is_egg": c["egg"]} for c in cards
+    ])
+    return {
+        "location": _location_name(),
+        "position": [snap.x, snap.y] if snap is not None else None,
+        "money": money,
+        "badges": badges,
+        "balls": balls,
+        "party": cards,
+        "exp_note": exp_note,
+    }
+
+
+def _objective_rows(sequence, index: int) -> Dict[str, Any]:
+    rows = []
+    for i, obj in enumerate(sequence):
+        status = "done" if obj.completed else ("current" if i == index else "upcoming")
+        rows.append({
+            "id": obj.id,
+            "description": obj.description,
+            "status": status,
+            "completed_at": obj.completed_at.isoformat() if obj.completed_at else None,
+            "navigation_hint": obj.navigation_hint,
+            "target_location": obj.target_location,
+        })
+    current = sequence[index].id if 0 <= index < len(sequence) else None
+    return {"done": sum(1 for r in rows if r["status"] == "done"), "total": len(rows), "current_id": current, "objectives": rows}
+
+
+@app.get("/objectives")
+async def get_objectives():
+    """Read-only: the live objective sequences (story and battling) for the controller
+    page's checklist, from the objectives manager in memory (not objectives.json).
+
+    David (2026-11-04): "a checklist of where we are at in the game and what objectives
+    we've accomplished and what has yet to be done".
+    """
+    manager = direct_objectives_manager
+    if manager is None:
+        return {"mode": None, "story": _objective_rows([], 0), "battling": _objective_rows([], 0)}
+    return {
+        "mode": manager.mode,
+        "story": _objective_rows(manager.story_sequence, manager.story_index),
+        "battling": _objective_rows(manager.battling_sequence, manager.battling_index),
+    }
 
 
 @app.get("/status")

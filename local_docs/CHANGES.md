@@ -1462,6 +1462,23 @@ prompt. That came to 1.1 tiles walked per minute.
 - *Verified:* on the live save test_jagged_pass_top.state go_to("Route 112") walks down
   to the hiker at (16,25); the old code has no route and draws (18,8) as a ledge.
 
+## Controller page: what the AI is doing, the party, the checklist (2026-11-04)
+- David: "it would be cool to be able to see what the LLM is doing and maybe a module
+  with the pokemon party and a checklist of where we are at in the game and what
+  objectives we've accomplished and what has yet to be done."
+- /play gains three panels (server/play_panels.js renders them; play.html polls every
+  2 s): the last 10 steps (reasoning, call, result, duration; the step being thought
+  about; pauses and resumes with who did them), the party (HP bars, moves with type and
+  PP, the lead, the EXP line, place, money, badges, balls), and the story checklist by
+  chapter plus the battling goals.
+- Read-only endpoints: GET /ai_feed (the trajectory file's end), GET /dashboard (one
+  party read under the memory lock, ~0.1 s), GET /objectives (the objectives manager in
+  memory). POST /agent_pause records who paused (play.html: human; stall_watch: its
+  reason).
+- *Verified:* local_tests/test_play_endpoints.py (4) on the live MT CHIMNEY save;
+  `node local_tests/test_play_panels.js` (16) renders fixtures; the real endpoint output
+  renders too.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

@@ -297,7 +297,8 @@ def main() -> int:
                 last_seen = newest
                 if not args.no_pause:
                     try:
-                        _post("/agent_pause", {"paused": True})
+                        # The controller page's feed shows who paused it and why.
+                        _post("/agent_pause", {"paused": True, "source": "stall_watch", "reason": why})
                         why += " — agent PAUSED"
                     except Exception as e:
                         why += f" — could not pause ({e})"

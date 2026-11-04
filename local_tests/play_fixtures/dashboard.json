@@ -1,0 +1,31 @@
+{
+  "location": "ROUTE 112",
+  "position": [7, 47],
+  "money": 18921,
+  "badges": [true, true, true, false, false, false, false, false],
+  "balls": [{"name": "Poke Ball", "count": 22}, {"name": "Great Ball", "count": 5}],
+  "party": [
+    {"slot": 1, "species": "BRELOOM", "nickname": "BRELOOM", "level": 38, "hp": 70, "max_hp": 106, "status": "OK",
+     "ability": "EFFECT SPORE", "lead": true, "egg": false,
+     "moves": [{"name": "MACH PUNCH", "type": "FIGHTING", "pp": 25, "max_pp": 30},
+               {"name": "MEGA DRAIN", "type": "GRASS", "pp": 10, "max_pp": 15},
+               {"name": "HEADBUTT", "type": "NORMAL", "pp": 15, "max_pp": 15},
+               {"name": "STUN SPORE", "type": "GRASS", "pp": 0, "max_pp": 30}]},
+    {"slot": 2, "species": "AZUMARILL", "nickname": "Bubbles & <Co>", "level": 20, "hp": 12, "max_hp": 78, "status": "PSN",
+     "ability": "HUGE POWER", "lead": false, "egg": false,
+     "moves": [{"name": "WATER GUN", "type": "WATER", "pp": 22, "max_pp": 25},
+               {"name": "ROLLOUT", "type": "ROCK", "pp": 20, "max_pp": 20}]},
+    {"slot": 3, "species": "GROVYLE", "nickname": "GROVYLE", "level": 24, "hp": 0, "max_hp": 70, "status": "OK",
+     "ability": "OVERGROW", "lead": false, "egg": false,
+     "moves": [{"name": "QUICK ATTACK", "type": "NORMAL", "pp": 30, "max_pp": 30}]},
+    {"slot": 4, "species": "TAILLOW", "nickname": "TAILLOW", "level": 19, "hp": 20, "max_hp": 52, "status": "OK",
+     "ability": "GUTS", "lead": false, "egg": false,
+     "moves": [{"name": "WING ATTACK", "type": "FLYING", "pp": 35, "max_pp": 35}]},
+    {"slot": 5, "species": "NUMEL", "nickname": "NUMEL", "level": 17, "hp": 47, "max_hp": 50, "status": "PAR",
+     "ability": "OBLIVIOUS", "lead": false, "egg": false,
+     "moves": [{"name": "EMBER", "type": "FIRE", "pp": 25, "max_pp": 25}]},
+    {"slot": 6, "species": "WYNAUT", "nickname": "", "level": 5, "hp": 0, "max_hp": 0, "status": "OK",
+     "ability": "", "lead": false, "egg": true, "moves": []}
+  ],
+  "exp_note": "EXP: BRELOOM is Lv38, 18 levels above the rest of the team; consider set_lead(\"AZUMARILL\")."
+}

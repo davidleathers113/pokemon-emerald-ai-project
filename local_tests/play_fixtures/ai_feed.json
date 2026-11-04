@@ -1,0 +1,23 @@
+{
+  "now": "2026-11-04T16:10:05.123",
+  "paused": false,
+  "in_flight": {"since": "2026-11-04T16:09:53.000", "step": 61},
+  "steps": [
+    {"step": 60, "time": "2026-11-04T16:09:20.5", "tool": "go_to_exit", "args": {"exit": "ROUTE 112"},
+     "reasoning": "We're in LAVARIDGE TOWN and the objective says to head north to ROUTE 112 for the cable car. The exit list shows ROUTE 112 to the north-east, so walk there directly instead of stepping tile by tile.",
+     "result": "Arrived: now at (7,0) on ROUTE 112 after 41 steps.", "success": true, "duration_s": 33.2},
+    {"step": 59, "time": "2026-11-04T16:08:02.250", "tool": "press_buttons", "args": {"buttons": ["A", "A"], "speed": "fast"},
+     "reasoning": "Breloom's HP < 50% & the trainer said \"Let's battle!\" so I'll keep tapping A through the dialogue to reach the fight menu.",
+     "result": "Dialogue advanced; the battle menu is open.", "success": true, "duration_s": 12.8},
+    {"step": 58, "time": "2026-11-04T16:06:40", "tool": "use_item", "args": {"item": "<SUPER POTION>", "target": "AZUMARILL"},
+     "reasoning": "Azumarill is low, heal before the next trainer.",
+     "result": "Failed: you don't have that item <SUPER POTION> in the bag.", "success": false, "duration_s": 6.0},
+    {"step": 57, "time": "2026-11-04T16:04:10.123456", "tool": "talk_to_npc", "args": {},
+     "reasoning": "", "result": null, "success": null, "duration_s": null}
+  ],
+  "events": [
+    {"time": "2026-11-04T16:07:30", "kind": "resume", "source": "human", "text": ""},
+    {"time": "2026-11-04T16:05:01", "kind": "pause", "source": "stall_watch", "text": "SAME_TILE: 6 steps on (12,9) in LAVARIDGE TOWN"},
+    {"time": "2026-11-04T09:00:00", "kind": "pause", "source": "human", "text": "too old to show"}
+  ]
+}
