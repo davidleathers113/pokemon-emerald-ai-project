@@ -137,6 +137,44 @@ def test_go_to_exit_is_routed_to_the_server():
     assert post.call_args.kwargs["timeout"] >= 120
 
 
+def test_prompt_sections_measure_each_section():
+    """Speed plan, Phase 0: each trajectory row says how big each "### " section of its
+    prompt was, so the uncached part's make-up can be measured step by step."""
+    prompt = "# Step: 3\nhead\n### OBJECTIVES\nstory\n### STATE\nmap\nmore\n"
+    sizes = pa._prompt_sections(prompt)
+    assert sizes == {
+        "(head)": len("# Step: 3\nhead\n"),
+        "OBJECTIVES": len("### OBJECTIVES\nstory\n"),
+        "STATE": len("### STATE\nmap\nmore\n"),
+    }, sizes
+    assert sum(sizes.values()) == len(prompt)
+
+
+def test_trajectory_rows_carry_the_step_timing():
+    """The parts of a step (auto-advance, state fetch, prompt build, model call, tools…)
+    reach the trajectory row, which local_tools/speed_report.py reads."""
+    import tempfile
+
+    from utils.data_persistence import run_data_manager as rdm
+
+    agent = _bare_agent()
+    agent._step_timing = {"state_s": 0.9, "vlm_s": 31.2, "tools_s": 4.0}
+    manager = mock.MagicMock()
+    agent._log_trajectory_for_step(manager, 7, {"location": "ROUTE 101"}, "### STATE\nx\n", "why", [], "")
+    kwargs = manager.log_trajectory.call_args.kwargs
+    assert kwargs["timing"] == {"state_s": 0.9, "vlm_s": 31.2, "tools_s": 4.0}, kwargs
+    assert kwargs["prompt_sections"] == {"STATE": len("### STATE\nx\n")}, kwargs
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "trajectory_history.jsonl"
+        with mock.patch.object(rdm, "get_cache_path", lambda name: path):
+            rdm.RunDataManager.log_trajectory(
+                mock.MagicMock(), step=7, reasoning="why", action={}, pre_state={"location": "ROUTE 101"},
+                timing=kwargs["timing"], prompt_sections=kwargs["prompt_sections"],
+            )
+        row = json.loads(path.read_text().splitlines()[-1])
+    assert row["timing"]["vlm_s"] == 31.2 and row["prompt_sections"] == {"STATE": 12}, row
+
+
 def _run_all():
     failures = 0
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

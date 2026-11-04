@@ -1479,6 +1479,22 @@ prompt. That came to 1.1 tiles walked per minute.
   `node local_tests/test_play_panels.js` (16) renders fixtures; the real endpoint output
   renders too.
 
+## Speed plan, Phase 0: measure each step (2026-11-04)
+- David approved a plan to make each decision faster without playing worse
+  (~/.claude/plans/create-a-plan-to-snug-flask.md). Every later phase is judged against
+  these numbers.
+- The agent writes `timing` (seconds: prev_post_s, auto_advance_s, state_s, prompt_s,
+  vlm_s, reprompt_s, tools_s, settle_s, nav_state_s, end_state_s) and `prompt_sections`
+  (characters per "### " section) into each trajectory row.
+- `local_tools/speed_report.py [--steps 60]`: step time, the timing breakdown, model
+  time and tokens (prompt, cached, uncached, output; overworld and battle) from the
+  run's llm_logs file, and quality: stalls per hour (stall_watch replayed), failed calls
+  per 100 steps by cause, objectives per hour.
+- Baseline before any change (60 steps, 15:13-16:00 UTC): step 39.2 s median; model
+  34.4 s overworld / 27.7 s battle; uncached 5.7K / 4.4K tokens; output ~110 tokens.
+- Found while instrumenting (Phase 5): a fixed 1 s sleep after every step, and a full
+  get_game_state after every step just to read the end position.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

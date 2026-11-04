@@ -35,6 +35,9 @@ def _bare_agent():
     agent.text_only_reply_count = 0
     agent.text_only_noop_count = 0
     agent._last_prompt_usage = None
+    # Per-step timing (speed plan, Phase 0): __init__ sets these, and run_step writes them.
+    agent._step_timing = {}
+    agent._post_step_s = None
     agent.scaffold = "simple"
     agent.backend = "openai"
     agent.model = "qwen3-vl:8b-instruct"

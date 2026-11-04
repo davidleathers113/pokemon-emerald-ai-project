@@ -215,6 +215,22 @@ def auto_dialogue_enabled() -> bool:
     return os.environ.get("POKEAGENT_AUTO_DIALOGUE", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _prompt_sections(prompt: str) -> Dict[str, int]:
+    """Characters per "### " section of a prompt ("(head)" for what comes before the
+    first): which parts are big, for local_tools/speed_report.py.
+
+    David (2026-11-04) approved a plan to make each decision faster; the uncached part of
+    the prompt (~5.6K tokens) is the main cost, so its make-up is measured per step.
+    """
+    sizes: Dict[str, int] = {}
+    name = "(head)"
+    for line in str(prompt or "").splitlines(keepends=True):
+        if line.startswith("### "):
+            name = line[4:].strip()
+        sizes[name] = sizes.get(name, 0) + len(line)
+    return sizes
+
+
 def _clip(text: Any, max_chars: int) -> str:
     """One line, at most max_chars, marked when cut."""
     flat = " ".join(str(text).split())
@@ -393,6 +409,9 @@ class PokeAgent:
         # Text-only (no tool call) replies: how many happened, and how many were
         # still text-only after the one re-prompt (wasted no-op steps).
         self.text_only_reply_count = 0
+        # Seconds each part of the current step took (written with its trajectory row).
+        self._step_timing: Dict[str, float] = {}
+        self._post_step_s: Optional[float] = None
         self.text_only_noop_count = 0
         # Last real prompt size reported by the backend, used to calibrate the
         # token estimate for the next prompt: (prompt_tokens, prompt_chars).
@@ -2090,6 +2109,7 @@ class PokeAgent:
                     response = self._call_vlm_with_guard(lambda: call_vlm(prompt))
 
                 self._record_prompt_usage(response, prompt)
+                self._step_timing["vlm_s"] = round(time.time() - vlm_call_start, 2)
 
                 is_function_calling = hasattr(response, 'candidates')
                 
@@ -2164,9 +2184,11 @@ class PokeAgent:
             tool_call_count = 0
 
             # Use unified VLM function calling for ALL backends
+            tools_start = time.time()
             function_calls_executed = self._handle_vlm_function_calls(
                 response, tool_calls_made, tool_call_count, max_tool_calls
             )
+            self._step_timing["tools_s"] = round(time.time() - tools_start, 2)
 
             if not function_calls_executed and not tool_calls_made and self.tools:
                 # Text-only reply: nothing happened in the game. Re-prompt once
@@ -2178,8 +2200,10 @@ class PokeAgent:
                     f"⚠️ Text-only reply without a tool call (#{self.text_only_reply_count} this run); "
                     f"re-prompting once. Reply was: {first_text[:300]!r}"
                 )
+                retry_start = time.time()
                 try:
                     retry_response = self._call_vlm_with_guard(lambda: call_vlm(prompt + TEXT_ONLY_REPROMPT))
+                    self._step_timing["reprompt_s"] = round(time.time() - retry_start, 2)
                     self._record_prompt_usage(retry_response, prompt + TEXT_ONLY_REPROMPT)
                     if self._handle_vlm_function_calls(
                         retry_response, tool_calls_made, tool_call_count, max_tool_calls
@@ -2251,7 +2275,9 @@ class PokeAgent:
                     target_y = last_tool_call["args"]["y"]
                     self._wait_for_actions_complete()
                     final_pos = None
+                    nav_state_start = time.time()
                     final_state_result = self._execute_function_call_by_name("get_game_state", {})
+                    self._step_timing["nav_state_s"] = round(time.time() - nav_state_start, 2)
                     final_state_data = json_module.loads(final_state_result)
                     if final_state_data.get("success"):
                         player_pos = final_state_data.get("player_position", {})
@@ -2295,10 +2321,14 @@ class PokeAgent:
                 start_coords = pre_state.get("player_coords") if pre_state else None
                 end_coords = None
                 last_tool_name = last_tool_call.get("name")
+                settle_start = time.time()
                 if last_tool_name in PRESSING_TOOLS:
                     self._wait_for_actions_complete()
+                self._step_timing["settle_s"] = round(time.time() - settle_start, 2)
+                end_state_start = time.time()
                 try:
                     final_state_result = self._execute_function_call_by_name("get_game_state", {})
+                    self._step_timing["end_state_s"] = round(time.time() - end_state_start, 2)
                     final_state_data = json_module.loads(final_state_result)
                     if final_state_data.get("success"):
                         player_pos = final_state_data.get("player_position", {})
@@ -3300,6 +3330,8 @@ Step {step_count}"""
                 pre_state=pre_state,
                 outcome=outcome,
                 llm_prompt=prompt,
+                timing=dict(self._step_timing),
+                prompt_sections=_prompt_sections(prompt),
             )
             logger.debug(f"Logged trajectory for step {step_num}")
         except Exception as e:
@@ -3423,12 +3455,23 @@ Step {step_count}"""
                 logger.info(f"📚 History: {len(self.conversation_history)} turns ({context_size:,} chars)")
                 logger.info(f"{'='*70}")
 
+                # Seconds per part of this step (local_tools/speed_report.py). The last
+                # step's checkpoint, history save and pause end after its row is written,
+                # so they are recorded on this one.
+                self._step_timing = {}
+                if self._post_step_s is not None:
+                    self._step_timing["prev_post_s"] = self._post_step_s
+                part_start = time.time()
+
                 # Plain text boxes only need A: let the server read through them
                 # before spending a model call on the screen.
                 self._auto_advance_dialogue()
+                self._step_timing["auto_advance_s"] = round(time.time() - part_start, 2)
 
                 # Fetch game state
+                part_start = time.time()
                 game_state_result = self._execute_function_call_by_name("get_game_state", {})
+                self._step_timing["state_s"] = round(time.time() - part_start, 2)
 
                 # Parse for screenshot
                 try:
@@ -3445,14 +3488,18 @@ Step {step_count}"""
                     build_prompt = lambda: self._build_optimized_prompt(game_state_result, next_step)
                 else:
                     build_prompt = lambda: self._build_structured_prompt(game_state_result, next_step)
+                part_start = time.time()
                 prompt = self._fit_prompt_to_budget(build_prompt, has_image=bool(screenshot_b64))
+                self._step_timing["prompt_s"] = round(time.time() - part_start, 2)
 
                 # Run step
                 success, output = self.run_step(prompt, screenshot_b64=screenshot_b64, step_number=next_step)
+                post_start = time.time()
 
                 if not success:
                     logger.warning("⚠️ Step failed, waiting 5 seconds before retry...")
                     time.sleep(5)
+                    self._post_step_s = None
                     continue
 
                 logger.info(f"✅ Global step counter now {self.step_count}")
@@ -3487,6 +3534,7 @@ Step {step_count}"""
                 # Brief pause
                 logger.info("⏸️  Waiting 1 second before next step...")
                 time.sleep(1)
+                self._post_step_s = round(time.time() - post_start, 2)
 
         except KeyboardInterrupt:
             logger.info("\n\n🛑 Agent stopped by user")

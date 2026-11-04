@@ -198,6 +198,8 @@ class RunDataManager:
                       llm_prompt: Optional[str] = None,
                       llm_trace_ref: Optional[str] = None,
                       objective_context: Optional[str] = None,
+                      timing: Optional[Dict[str, float]] = None,
+                      prompt_sections: Optional[Dict[str, int]] = None,
                       **kwargs):
         """Log a system-level trajectory entry.
 
@@ -222,6 +224,10 @@ class RunDataManager:
                 - objective_context
                 - llm_prompt
                 - llm_trace_ref
+                - timing: seconds per part of the step (auto_advance_s, state_s,
+                  prompt_s, vlm_s, tools_s, settle_s, end_state_s, prev_post_s...),
+                  read by local_tools/speed_report.py
+                - prompt_sections: characters per "### " section of the prompt
             Legacy:
                 - post_state may exist in older run files but is not written
         """
@@ -244,7 +250,13 @@ class RunDataManager:
 
         if llm_trace_ref:
             trajectory_entry["llm_trace_ref"] = llm_trace_ref
-        
+
+        if timing:
+            trajectory_entry["timing"] = timing
+
+        if prompt_sections:
+            trajectory_entry["prompt_sections"] = prompt_sections
+
         # Write to cache as the primary location
         trajectories_file = get_cache_path("trajectory_history.jsonl")
 
