@@ -40,6 +40,20 @@ def test_two_calls_in_turn_with_nothing_changing_are_a_stall():
     assert stall_reason(rows) == ""
 
 
+def test_throwing_balls_that_get_used_up_is_not_a_repeat():
+    """Seen live 08:42: four throw_ball("Great Ball") at a full-HP ELECTRIKE (Great Balls 8
+    -> 4) paused the agent as a REPEAT. The ball count changed each time: a catch attempt."""
+    rows = []
+    for i in range(4):
+        row = _row("throw_ball", {"ball": "Great Ball"}, xy=(20, 9), ts=f"2026-11-04T08:4{i}:00")
+        row["llm_prompt"] = _prompt(foe_hp=40) + f"=== BAG STATUS ===\n  Poke Balls:\n    - Great Ball x{8 - i}\n"
+        rows.append(row)
+    assert stall_reason(rows) == "", stall_reason(rows)
+    for row in rows:  # the same throws with nothing used up would be stuck
+        row["llm_prompt"] = _prompt(foe_hp=40) + "=== BAG STATUS ===\n  Poke Balls:\n    - Great Ball x8\n"
+    assert stall_reason(rows).startswith('REPEAT: throw_ball({"ball": "Great Ball"})'), stall_reason(rows)
+
+
 def test_eight_decisions_with_nothing_changing_are_a_stall():
     calls = [("press_buttons", {"buttons": ["A"]}), ("press_buttons", {"buttons": ["B"]}), ("use_move", {"move": "1"}),
              ("switch_pokemon", {"pokemon": "2"}), ("press_buttons", {"buttons": ["RIGHT"]}), ("use_move", {"move": "2"}),

@@ -114,7 +114,12 @@ def stall_reason(rows: list) -> str:
         names = ", ".join(_call(r)[0] for r in tail)
         return f"SAME_TILE: {SAME_TILE_RUN} walk/train calls left the player at {xy} on {loc} ({names})"
     calls = [_call(r) for r in rows[-REPEAT_RUN:]]
-    if len(calls) == REPEAT_RUN and calls[0][0] and all(c == calls[0] for c in calls):
+    # Seen live 08:42: four throw_ball("Great Ball") at a full-HP ELECTRIKE (8 balls -> 4)
+    # were a catch attempt, not a stall: the ball count changed every time.
+    if (
+        len(calls) == REPEAT_RUN and calls[0][0] and all(c == calls[0] for c in calls)
+        and not _changed(rows[-REPEAT_RUN:])
+    ):
         return f"REPEAT: {calls[0][0]}({json.dumps(calls[0][1])}) {REPEAT_RUN} times in a row"
     # Seen live 07:06-07:36: press_buttons(A) and switch_pokemon(...) in turn for 30
     # minutes in the game's replacement menu; neither SAME_TILE (no walking) nor REPEAT
@@ -136,7 +141,8 @@ def stall_reason(rows: list) -> str:
 def _fingerprint(row: dict):
     """What a decision saw that progress would change: the tile, in battle or not, and
     the prompt's party lines ("1. Breloom (Lv.27) HP: 72/75") and battle lines ("…battle
-    vs WINGULL Lv12 (WATER/FLYING), HP 30/30", "You: BRELOOM …"). None without a prompt."""
+    vs WINGULL Lv12 (WATER/FLYING), HP 30/30", "You: BRELOOM …"), and the bag's ball
+    lines ("- Great Ball x8": a throw uses one). None without a prompt."""
     prompt = row.get("llm_prompt")
     if not prompt:
         return None
@@ -144,7 +150,8 @@ def _fingerprint(row: dict):
     for line in str(prompt).splitlines():
         s = line.strip()
         party = s[:1].isdigit() and ". " in s[:4] and "(Lv." in s and "HP" in s
-        if party or "battle vs " in s or s.startswith("You: "):
+        balls = s.startswith("- ") and " Ball x" in s
+        if party or balls or "battle vs " in s or s.startswith("You: "):
             lines.append(s)
     pre = row.get("pre_state") or {}
     return _spot(row), bool(pre.get("is_in_battle")), tuple(dict.fromkeys(lines))
@@ -153,6 +160,12 @@ def _fingerprint(row: dict):
 def _unchanged(rows: list) -> bool:
     prints = [_fingerprint(r) for r in rows]
     return prints[0] is not None and all(p == prints[0] for p in prints)
+
+
+def _changed(rows: list) -> bool:
+    """Something visibly changed between these rows (rows without a prompt show nothing)."""
+    prints = [p for p in (_fingerprint(r) for r in rows) if p is not None]
+    return any(p != prints[0] for p in prints)
 
 
 def rows_after(rows: list, watch_from: str) -> list:
