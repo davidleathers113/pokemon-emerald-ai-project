@@ -1426,6 +1426,15 @@ prompt. That came to 1.1 tiles walked per minute.
   note, then the "only repeats" form, naming SHIRLEY, SHELBY and GRUNT (9,16); the old
   code says only "The text box closed."
 
+## navigate_to a person's tile walks next to them (2026-11-04, WEAKNESSES M59)
+- Seen live on MT CHIMNEY: navigate_to(13,16), a beaten grunt's tile, four times, each
+  "BLOCKED … occupied by someone".
+- `_navigate_beside_someone`: an occupied target means the nearest free tile beside it
+  (no walk when already beside it); the result names the talk_to call.
+- *Verified:* test_mt_chimney_busy_grunt.state: navigate_to(23,17) from beside him says
+  so without moving; navigate_to(21,19) ends at (21,18). The old code: "BLOCKED moving
+  DOWN at (23,16)".
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

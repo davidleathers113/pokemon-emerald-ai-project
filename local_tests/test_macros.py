@@ -181,6 +181,28 @@ def test_talking_to_someone_who_is_not_a_trainer_names_the_trainers_left():
     assert "talking to them again only repeats the same words" in said[1], said[1]
 
 
+def test_navigate_to_a_persons_tile_walks_next_to_them():
+    """Seen live on MT CHIMNEY (12,16), 15:14-15:16 UTC: navigate_to(13,16) four times "to
+    get closer"; a beaten grunt stands there, and each walk ended "BLOCKED … (13,16) is
+    occupied by someone". A person's tile as the target now means the free tile next to
+    them, with the talk_to call to use."""
+    from server.field_control import npc_at
+
+    s = server()
+    s.load(HERE / "test_mt_chimney_busy_grunt.state", wild_encounters=False)
+    r = s.call("mcp_navigate_to", {"x": 23, "y": 17, "variance": "none", "reason": "test"})
+    print("   ", r.get("summary"))
+    assert r["success"] is True and "already next to them at (23,16)" in r["summary"], r
+    assert "talk_to(23, 17)" in r["summary"], r
+    with s.srv.memory_lock:
+        assert npc_at(_reader(s), 21, 19)
+    r = s.call("mcp_navigate_to", {"x": 21, "y": 19, "variance": "none", "reason": "test"})
+    print("   ", r.get("summary"))
+    here = s.snapshot()
+    assert abs(here.x - 21) + abs(here.y - 19) == 1, (here, r)
+    assert "(21,19) is where someone stands" in r["summary"] and "talk_to(21, 19)" in r["summary"], r
+
+
 def test_a_trainer_who_spots_the_player_on_the_way_is_reported_as_a_battle():
     """Seen live: walking to Verdanturf's Pokémon Center to restore BRELOOM's PP, a trainer
     spotted the player; the walk reported "something has the player's attention on the

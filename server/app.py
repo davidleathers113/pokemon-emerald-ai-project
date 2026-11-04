@@ -7774,6 +7774,55 @@ async def mcp_complete_direct_objective(request: dict):
         return {"success": False, "error": str(e)}
 
 
+async def _navigate_beside_someone(request: dict, x: int, y: int) -> Optional[Dict[str, Any]]:
+    """navigate_to whose target tile someone stands on: walk to the nearest free tile
+    beside them instead, and say how to talk to them. None when the tile is free.
+
+    Seen live on MT CHIMNEY (12,16), 15:14-15:16 UTC: the model called navigate_to(13,16)
+    four times "to get closer" to TABITHA; (13,16) is a beaten grunt who still stands
+    there, and each walk ended "BLOCKED … (13,16) is occupied by someone".
+    """
+    from server.field_control import DIRECTION_DELTAS, npc_at
+
+    if request.get("_beside") or not _mem(npc_at, x, y):
+        return None
+    snap = _field_snapshot()
+    if snap is None:
+        return None
+    talk = f"to talk to them, talk_to({x}, {y}) (it faces them and presses A)"
+    if abs(snap.x - x) + abs(snap.y - y) == 1:
+        summary = f"({x},{y}) is where someone stands, and you are already next to them at ({snap.x},{snap.y}): {talk}."
+        return {"success": True, "status": "BESIDE", "target": f"({x}, {y})", "summary": summary}
+    sides = sorted(
+        ((x - dx, y - dy) for dx, dy in DIRECTION_DELTAS.values()),
+        key=lambda t: abs(t[0] - snap.x) + abs(t[1] - snap.y),
+    )
+    walk: Dict[str, Any] = {}
+    for sx, sy in sides:
+        if _mem(npc_at, sx, sy):
+            continue
+        walk = await mcp_navigate_to({**request, "x": sx, "y": sy, "_beside": True})
+        here = _field_snapshot()
+        if here is not None and (here.x, here.y) == (sx, sy):
+            walk["summary"] = (
+                f"({x},{y}) is where someone stands, so the walk went next to them instead. "
+                f"{walk.get('summary', '')} {talk[0].upper()}{talk[1:]}."
+            )
+            return walk
+        if _mem(lambda r: r.is_in_battle()) or (here is not None and here.map_id != snap.map_id):
+            break  # a trainer or a door ended the walk: report that walk as it is
+    if walk:
+        walk["summary"] = (
+            f"({x},{y}) is where someone stands; no free tile next to them was reached. "
+            f"{walk.get('summary') or walk.get('error', '')} {talk[0].upper()}{talk[1:]}."
+        )
+        return walk
+    return {
+        "success": False,
+        "error": f"({x},{y}) is where someone stands and every tile next to them is taken; {talk}.",
+    }
+
+
 @app.post("/mcp/navigate_to")
 async def mcp_navigate_to(request: dict):
     """MCP Tool: Navigate to coordinates using pathfinding"""
@@ -7800,6 +7849,10 @@ async def mcp_navigate_to(request: dict):
             y = int(y)
         except (ValueError, TypeError):
             return {"success": False, "error": f"Invalid coordinates: x={x}, y={y}"}
+
+        beside = await _navigate_beside_someone(request, x, y)
+        if beside is not None:
+            return beside
 
         # Calculate path and get buttons
         # Operator use (not in the model's tool list): tiles to walk round, [[x, y], ...].
