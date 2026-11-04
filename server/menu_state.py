@@ -376,6 +376,62 @@ def list_presses(current: int, goal: int) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# START menu, TMs & HMs, the move-replace screen (teach_move). pret symbols (US) and
+# struct layouts; each was watched in memory on test_marill_in_party.state.
+# ---------------------------------------------------------------------------
+
+S_START_MENU_CURSOR_POS = 0x0203760E      # sStartMenuCursorPos: index into the actions
+S_NUM_START_MENU_ACTIONS = 0x0203760F
+S_CURRENT_START_MENU_ACTIONS = 0x02037610  # u8[9], start_menu.c MENU_ACTION_*
+TASK_SHOW_START_MENU = 0x0809FA34
+MENU_ACTION_BAG = 2
+TMHM_POCKET = 2                            # POKé BALLS is 1 (BALLS_POCKET)
+ITEM_TM01 = 289                            # TM01..TM50 = 289..338, HM01..HM08 = 339..346
+G_TMHM_LEARNSETS = 0x0831E898             # u32[2] per species: bit n = TM/HM n
+S_TMHM_MOVES = 0x08616040                  # u16 per TM/HM: the move it teaches
+CB2_SUMMARY_SCREEN = 0x081BFAB4            # seen as gMain.callback2 on the forget screen
+TASK_REPLACE_MOVE_INPUT = 0x081C174C       # Task_HandleReplaceMoveInput
+S_MON_SUMMARY_SCREEN = 0x0203CF1C          # pointer to struct PokemonSummaryScreenData
+SUMMARY_NEW_MOVE = 0x40C4                  # u16 newMove (0x70 + 0x4C summary + 4 pages x 0x1000)
+SUMMARY_FIRST_MOVE_INDEX = 0x40C6          # u8 firstMoveIndex: the forget cursor (4 = the new move)
+
+
+def start_menu_open(reader) -> bool:
+    return task_running(reader, TASK_SHOW_START_MENU)
+
+
+def start_menu_actions(reader) -> List[int]:
+    count = min(reader._read_u8(S_NUM_START_MENU_ACTIONS), 9)
+    return list(bytes(reader._read_bytes(S_CURRENT_START_MENU_ACTIONS, count)))
+
+
+def start_menu_cursor(reader) -> int:
+    return reader._read_u8(S_START_MENU_CURSOR_POS)
+
+
+def tmhm_move(reader, item_id: int) -> int:
+    """The move id a TM/HM item teaches (ROM sTMHMMoves)."""
+    return reader._read_u16(S_TMHM_MOVES + 2 * (item_id - ITEM_TM01))
+
+
+def can_learn_tmhm(reader, species_id: int, item_id: int) -> bool:
+    """pret CanMonLearnTMHM: gTMHMLearnsets[species] has the TM/HM's bit."""
+    index = item_id - ITEM_TM01
+    word = reader._read_u32(G_TMHM_LEARNSETS + 8 * species_id + 4 * (index // 32))
+    return bool(word >> (index % 32) & 1)
+
+
+def replace_move_cursor(reader) -> Optional[Tuple[int, int]]:
+    """(firstMoveIndex, newMove) on the forget-a-move screen, or None when it isn't up."""
+    if not (callback2_is(reader, CB2_SUMMARY_SCREEN) and task_running(reader, TASK_REPLACE_MOVE_INPUT)):
+        return None
+    data = reader._read_u32(S_MON_SUMMARY_SCREEN)
+    if not data:
+        return None
+    return reader._read_u8(data + SUMMARY_FIRST_MOVE_INDEX), reader._read_u16(data + SUMMARY_NEW_MOVE)
+
+
+# ---------------------------------------------------------------------------
 # Mart
 # ---------------------------------------------------------------------------
 

@@ -725,6 +725,28 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "required": ["item", "count", "reasoning"],
         },
     },
+    # Seen live: told to teach Rock Smash, the model pressed B over and over in the HM
+    # man's house; the menus (START, BAG, TMs & HMs, party, forget-a-move) are one call.
+    {
+        "name": "teach_move",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Outside battle: teach a TM or HM from your bag to a party Pokemon in one call "
+            "(it opens the bag, uses the TM/HM, picks the Pokemon and, if it already knows "
+            "four moves, forgets `forget`, or the weakest non-HM move if you leave it out). "
+            "Refuses a Pokemon that can't learn it."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "item": {"type_": "STRING", "description": "The TM/HM or its move, e.g. 'HM06' or 'ROCK SMASH'."},
+                "pokemon": {"type_": "STRING", "description": "Party Pokemon name or slot 1-6, e.g. 'BRELOOM'."},
+                "forget": {"type_": "STRING", "description": "Optional: the move to forget if it knows four."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why teach it."},
+            },
+            "required": ["item", "pokemon", "reasoning"],
+        },
+    },
     # Seen live: switch-training cost ~3 model decisions per wild battle (walk into the
     # grass, switch_pokemon, use_move); train runs the whole loop server-side.
     {

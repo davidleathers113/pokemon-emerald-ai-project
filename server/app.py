@@ -6821,6 +6821,203 @@ async def _leave_shop(source: str) -> bool:
     return _shop_stage() == DIALOGUE_NONE
 
 
+# teach_move: presses allowed through the texts between two screens.
+TEACH_TEXT_PRESSES = 14
+
+
+def _hm_moves() -> set:
+    """Move ids the HMs teach (HM01-HM08): the game refuses to forget them in the field."""
+    from server import menu_state as ms
+
+    with memory_lock:
+        return {ms.tmhm_move(env.memory_reader, item) for item in range(ms.ITEM_TM01 + 50, ms.ITEM_TM01 + 58)}
+
+
+@app.post("/mcp/teach_move")
+async def mcp_teach_move(request: dict = None):
+    """MCP Tool: teach a TM or HM from the bag to a party Pokémon, forgetting a move if needed.
+
+    Seen live: told to "Teach Rock Smash to a Pokémon", the model pressed B over and over in
+    the HM man's house. By hand it is START → BAG → TMs & HMs → the HM → USE → "Teach ROCK
+    SMASH to a POKéMON?" YES → the party (its cursor is not always on slot 1) → "Should a
+    move be deleted…?" YES → the forget screen → the move → A. Each step here waits for its
+    screen; the cursors are read from memory (sStartMenuCursorPos, the bag's, gPartyMenu
+    slotId, the summary screen's firstMoveIndex). Seen while building it: DOWN presses sent
+    before the forget screen had opened left its cursor on move 1, and MACH PUNCH was lost,
+    so the forget cursor is checked before A. The result is checked in the party data.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from pokemon_env.enums import Move
+    from server import menu_state as ms
+
+    source = "teach_move"
+    request = request or {}
+    wanted_item = str(request.get("item") or "").strip()
+    wanted_mon = request.get("pokemon")
+    forget = str(request.get("forget") or "").strip()
+    if not wanted_item or wanted_mon is None or str(wanted_mon).strip() == "":
+        return _refusal('item and pokemon are required, e.g. teach_move("HM06", "BRELOOM").')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+
+    with memory_lock:
+        reader = env.memory_reader
+        tms = reader.read_full_inventory().get("tms_hms", [])
+        party = reader.read_party_pokemon() or []
+        taught = {t["item_id"]: ms.tmhm_move(reader, t["item_id"]) for t in tms}
+    move_name = {item: Move(mid).name if mid in Move._value2member_map_ else f"MOVE {mid}" for item, mid in taught.items()}
+    key = ms.name_key(wanted_item)
+    item = next(
+        (t for t in tms if ms.name_key(t["name"]) == key or ms.name_key(move_name[t["item_id"]]) == key), None
+    )
+    listing = ", ".join(f"{t['name']} ({move_name[t['item_id']].replace('_', ' ')})" for t in tms) or "none"
+    if item is None:
+        return _refusal(f"{wanted_item} is not in your TMs & HMs pocket. You have: {listing}.")
+    new_move = taught[item["item_id"]]
+    new_name = move_name[item["item_id"]].replace("_", " ")
+
+    index = _train_member([(0, p) for p in party], wanted_mon)
+    if index is None:
+        names = ", ".join(f"{i + 1}. {p.species_name.upper()}" for i, p in enumerate(party))
+        return _refusal(f"{wanted_mon} is not in your party ({names}).")
+    mon = party[index]
+    name = mon.species_name.upper()
+    with memory_lock:
+        able = ms.can_learn_tmhm(env.memory_reader, mon.species_id, item["item_id"])
+        personalities = ms.party_personalities(env.memory_reader)
+    if not able:
+        return _refusal(f"{name} is NOT ABLE to learn {new_name} from {item['name']}.")
+    known = [m for m in mon.moves if m and m != "NONE"]
+    if move_name[item["item_id"]] in known:
+        return _refusal(f"{name} already knows {new_name}.")
+    forget_index = None
+    if len(known) >= 4:
+        hm_moves = {Move(m).name for m in _hm_moves() if m in Move._value2member_map_}
+        if forget:
+            fkey = ms.name_key(forget)
+            forget_index = next((i for i, m in enumerate(known) if ms.name_key(m) == fkey), None)
+            if forget_index is None:
+                return _refusal(f"{name} doesn't know {forget}. Its moves: {', '.join(m.replace('_', ' ') for m in known)}.")
+            if known[forget_index] in hm_moves:
+                return _refusal(f"{known[forget_index].replace('_', ' ')} is an HM move: it can't be forgotten here.")
+        else:
+            # No move named: the weakest that isn't an HM move (the learn-move advice's measure).
+            with memory_lock:
+                own = env.memory_reader.party_mon_types(mon)
+                worth = [(env.memory_reader.move_worth(m, own), i) for i, m in enumerate(known) if m not in hm_moves]
+            if not worth:
+                return _refusal(f"All of {name}'s moves are HM moves: none can be forgotten here.")
+            forget_index = min(worth)[1]
+
+    def screen(check):
+        return _mem(lambda r: bool(check(r)))
+
+    async def leave(message: str) -> Dict[str, Any]:
+        for _ in range(6):  # B backs out of every screen here
+            if _player_can_walk():
+                break
+            await _macro_press(["B"], source)
+            await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+        return _refusal(message + ("" if _player_can_walk() else " Could not close every menu: look at the screen."))
+
+    with _turbo():
+        await _macro_press(["START"], source)
+        if not await _await_game(lambda: screen(ms.start_menu_open), MACRO_MENU_FRAMES):
+            return await leave("The START menu did not open.")
+        actions = _mem(ms.start_menu_actions)
+        if ms.MENU_ACTION_BAG not in actions:
+            return await leave("The START menu has no BAG.")
+        await _macro_press(ms.list_presses(_mem(ms.start_menu_cursor), actions.index(ms.MENU_ACTION_BAG)), source)
+        if _mem(ms.start_menu_cursor) != actions.index(ms.MENU_ACTION_BAG):
+            return await leave("Could not put the START menu cursor on BAG.")
+        await _macro_press(["A"], source)
+
+        def bag_ready(r):
+            return ms.callback2_is(r, ms.CB2_BAG_MENU_RUN) and ms.task_running(r, ms.TASK_BAG_INPUT) and not ms.fade_active(r)
+
+        if not await _await_game(lambda: screen(bag_ready), MACRO_MENU_FRAMES * 2):
+            return await leave("Chose BAG but the bag did not open.")
+        for press in ms.pocket_presses(_mem(ms.bag_pocket), ms.TMHM_POCKET):
+            await _macro_press([press], source)
+            await _await_game(lambda: screen(bag_ready), MACRO_MENU_FRAMES)
+        listed = _mem(lambda r: ms.bag_pocket_item_ids(r, ms.TMHM_POCKET))
+        if _mem(ms.bag_pocket) != ms.TMHM_POCKET or item["item_id"] not in listed:
+            return await leave(f"Could not find {item['name']} in the TMs & HMs pocket.")
+        goal = listed.index(item["item_id"])
+        await _macro_press(ms.list_presses(_mem(lambda r: ms.bag_cursor_index(r, ms.TMHM_POCKET)), goal), source)
+        if _mem(lambda r: ms.bag_cursor_index(r, ms.TMHM_POCKET)) != goal:
+            return await leave(f"Could not put the bag cursor on {item['name']}.")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: screen(lambda r: ms.task_running(r, *ms.TASK_BAG_CONTEXT)), MACRO_MENU_FRAMES):
+            return await leave(f"Pressed A on {item['name']} but its USE menu did not open.")
+        if _mem(lambda r: r._read_u16(ms.G_SPECIAL_VAR_ITEM_ID)) != item["item_id"] or _mem(ms.read_menu_cursor).cursor != 0:
+            return await leave(f"The bag's menu is not USE on {item['name']}.")
+        await _macro_press(["A"], source)  # USE
+
+        # "Booted up an HM." "It contained X. Teach X to a POKéMON?" YES (the cursor starts there).
+        def party_ready(r):
+            return ms.callback2_is(r, ms.CB2_UPDATE_PARTY_MENU) and ms.task_running(r, ms.TASK_PARTY_CHOOSE) and not ms.fade_active(r)
+
+        for _ in range(TEACH_TEXT_PRESSES):
+            if await _await_game(lambda: screen(party_ready), MACRO_MENU_FRAMES):
+                break
+            await _macro_press(["A"], source)
+        if not screen(party_ready):
+            return await leave(f"Used {item['name']} but the party screen never opened ({_mem(read_field_text)}).")
+        # The menu lists gPlayerParty in order; the Pokémon is checked by personality too.
+        slot = index
+        if _mem(ms.party_personalities)[slot] != personalities[index]:
+            return await leave(f"The party changed while teaching; {name} is not in slot {slot + 1}.")
+        # Seen live: this screen's cursor started on slot 2, and A at once taught COMBUSKEN.
+        await _macro_press(ms.list_presses(_mem(ms.party_menu_slot), slot), source)
+        if _mem(ms.party_menu_slot) != slot:
+            return await leave(f"Could not put the party cursor on {name} (it is on slot {_mem(ms.party_menu_slot) + 1}).")
+        await _macro_press(["A"], source)
+
+        forgotten = None
+        if forget_index is not None:
+            # "...already knows four moves. Should a move be deleted...?" YES → the forget screen.
+            for _ in range(TEACH_TEXT_PRESSES):
+                if await _await_game(lambda: _mem(ms.replace_move_cursor) is not None, MACRO_MENU_FRAMES):
+                    break
+                await _macro_press(["A"], source)
+            cursor = _mem(ms.replace_move_cursor)
+            if cursor is None or cursor[1] != new_move:
+                return await leave(f"The forget-a-move screen did not open for {new_name}.")
+            await _macro_press(ms.list_presses(cursor[0], forget_index), source)
+            cursor = _mem(ms.replace_move_cursor)
+            if cursor is None or cursor[0] != forget_index:
+                return await leave(f"Could not put the forget cursor on {known[forget_index].replace('_', ' ')}; nothing was forgotten.")
+            await _macro_press(["A"], source)
+            forgotten = known[forget_index].replace("_", " ")
+
+        # "1, 2, and... Poof! ... learned X!" back to the bag, then out of the menus.
+        for _ in range(TEACH_TEXT_PRESSES):
+            if await _await_game(lambda: screen(bag_ready), MACRO_MENU_FRAMES):
+                break
+            await _macro_press(["A"], source)
+        for _ in range(4):
+            if _player_can_walk():
+                break
+            await _macro_press(["B"], source)
+            await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+
+    with memory_lock:
+        after = (env.memory_reader.read_party_pokemon() or [None] * (index + 1))[index]
+    moves_after = [m.replace("_", " ") for m in (after.moves if after else []) if m and m != "NONE"]
+    if new_name.replace(" ", "_") not in (after.moves if after else []):
+        return _refusal(f"{name} did not learn {new_name}. Its moves: {', '.join(moves_after)}.{_screen_note()}")
+    lost = f" (forgot {forgotten})" if forgotten else ""
+    walk = "" if _player_can_walk() else " A menu is still open: look at the screen."
+    return {
+        "success": True,
+        "status": "LEARNED",
+        "summary": f"{name} learned {new_name}{lost}. Its moves: {', '.join(moves_after)}.{walk}",
+    }
+
+
 @app.post("/mcp/buy_item")
 async def mcp_buy_item(request: dict = None):
     """MCP Tool: in a Poké Mart, buy `count` of an item from the clerk; confirmed from

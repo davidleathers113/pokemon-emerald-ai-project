@@ -434,6 +434,52 @@ def test_buy_refuses_outside_a_mart():
     assert r["success"] is False and "no shop clerk here" in r["error"], r
 
 
+def _give_hm06(s):
+    """RAM: HM06 (item 344) into the first empty TMs & HMs slot of SaveBlock1; bag
+    quantities are XORed with the save's key (pret: gSaveBlock2Ptr->encryptionKey)."""
+    from pokemon_env.emerald_utils import SAVE_BLOCK_1_OFFSETS
+
+    reader = _reader(s)
+    with s.srv.memory_lock:
+        pocket = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR) + SAVE_BLOCK_1_OFFSETS["bagPocket_TMHM"]
+        slot = next(i for i in range(64) if reader._read_u16(pocket + 4 * i) == 0)
+        key = reader._get_security_key() & 0xFFFF
+    _write(s, 16, pocket + 4 * slot, 344)
+    _write(s, 16, pocket + 4 * slot + 2, 1 ^ key)
+
+
+def test_teach_move_teaches_an_hm_and_forgets_the_named_move():
+    """Seen live: told to teach Rock Smash, the model pressed B over and over. By hand the
+    party screen's cursor started on slot 2, and A at once picked COMBUSKEN. RAM: HM06 in
+    the bag (test_marill_in_party.state has none) and gPartyMenu.slotId (+9) left on 1."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(HERE / "test_marill_in_party.state", wild_encounters=False)
+    _give_hm06(s)
+    _write(s, 8, ms.G_PARTY_MENU + 9, 1)
+    r = s.call("mcp_teach_move", {"item": "HM06", "pokemon": "BRELOOM", "forget": "LEECH SEED", "reasoning": "test"})
+    print("   ", r)
+    assert r["success"] is True and r["summary"].startswith("BRELOOM learned ROCK SMASH (forgot LEECH SEED)"), r
+    moves = _read(s, lambda rd: [p.moves for p in rd.read_party_pokemon()])
+    assert moves[0] == ["MACH_PUNCH", "HEADBUTT", "MEGA_DRAIN", "ROCK_SMASH"], moves[0]
+    assert "ROCK_SMASH" not in moves[1], moves[1]  # COMBUSKEN untouched
+    assert s.srv._player_can_walk()
+    # Refusals: knows it already; a Pokémon the HM's ROM bit says is NOT ABLE; not in the bag.
+    r = s.call("mcp_teach_move", {"item": "ROCK SMASH", "pokemon": "BRELOOM", "reasoning": "test"})
+    assert r["success"] is False and "already knows ROCK SMASH" in r["error"], r
+    party = _read(s, lambda rd: rd.read_party_pokemon())
+    # HM05 (FLASH, item 343) is in this bag already.
+    unable = [p for p in party if not _read(s, lambda rd: ms.can_learn_tmhm(rd, p.species_id, 343))]
+    print("    NOT ABLE for HM05:", [p.species_name for p in unable])
+    assert unable, "expected a party Pokémon that can't learn FLASH"
+    for p in unable:
+        r = s.call("mcp_teach_move", {"item": "HM05", "pokemon": p.species_name, "reasoning": "test"})
+        assert r["success"] is False and "NOT ABLE" in r["error"], r
+    r = s.call("mcp_teach_move", {"item": "TM26", "pokemon": "BRELOOM", "reasoning": "test"})
+    assert r["success"] is False and "not in your TMs & HMs pocket" in r["error"], r
+
+
 def _run_all():
     import test_movement_feedback as harness
 

@@ -167,7 +167,10 @@ def truncate_middle(text: Any, max_chars: int) -> Any:
 
 # Server-side macros (server/app.py): each runs a whole menu chore and answers only
 # when its presses are done, like use_move.
-MACRO_TOOLS = ("heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to")
+MACRO_TOOLS = (
+    "heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to",
+    "teach_move",
+)
 # Tools that press buttons and answer after the presses ran.
 PRESSING_TOOLS = ("press_buttons", "navigate_to", "go_to_exit", "use_move") + MACRO_TOOLS
 # HTTP timeout for a pressing tool: a long walk plus a door warp, or a macro reading a
@@ -253,6 +256,9 @@ def format_tool_call_brief(name: str, args: Any) -> str:
         return f"use_move \"{args.get('move', '')}\""
     if name == "buy_item":
         return f"buy_item \"{args.get('item', '')}\" x{args.get('count', 1)}"
+    if name == "teach_move":
+        forget = f" forget {args['forget']}" if args.get("forget") else ""
+        return f"teach_move \"{args.get('item', '')}\" to {args.get('pokemon', '')}{forget}"
     rest = {k: v for k, v in args.items() if k not in _REASONING_ARG_KEYS}
     if not rest:
         return name

@@ -1312,6 +1312,30 @@ prompt. That came to 1.1 tiles walked per minute.
   Steel with 100 HP in RAM → "Better matchup: call switch_pokemon("COMBUSKEN") instead
   (EMBER 2x, ~125 HP a hit vs ~24 for NIGHT SHADE …)".
 
+## teach_move: TMs and HMs in one call (2026-11-04, WEAKNESSES M56)
+- Seen live: the model stalled on "Teach Rock Smash to a Pokémon", pressing B in the HM
+  man's house.
+- `mcp_teach_move(item, pokemon, forget=None)`: START (cursor from sStartMenuCursorPos
+  onto BAG in sCurrentStartMenuActions) → the bag (CB2_BagMenuRun, Task_BagMenu_
+  HandleInput) → TMs & HMs pocket → the item (bag cursor) → USE (gSpecialVar_ItemId
+  checked) → A through "Booted up an HM. … Teach X to a POKéMON?" (YES) → the teach
+  party screen (cursor moved from gPartyMenu.slotId, the Pokémon checked by
+  personality) → A; with four moves, A through "…Should a move be deleted?" (YES) to the
+  forget screen (CB2 0x081BFAB4, Task_HandleReplaceMoveInput; sMonSummaryScreen +0x40C6
+  firstMoveIndex, +0x40C4 newMove), cursor onto `forget`, checked, A → texts until the
+  bag → B out of the menus. Success is read from the party's moves.
+- Refusals before any press: not in the TMs & HMs pocket (lists what is), not in the
+  party, NOT ABLE (`menu_state.can_learn_tmhm`: ROM gTMHMLearnsets), already known, the
+  named move unknown, an HM move as `forget`. Without `forget`: the weakest non-HM move
+  by `move_worth`.
+- Registered: agents/tools/registry.py, PokeAgent MACRO_TOOLS (endpoint and timeout) and
+  its short-memory line, SIMPLE.md.
+- *Verified:* the flow was watched in memory first (scratch probe). Test
+  `test_teach_move_teaches_an_hm_and_forgets_the_named_move`: HM06 written into the bag,
+  gPartyMenu.slotId left on 1 → BRELOOM learns ROCK SMASH in place of LEECH SEED,
+  COMBUSKEN untouched, the player can walk; refusals for "already knows", HM05 for the
+  two Pokémon the ROM says are NOT ABLE (COMBUSKEN, MARILL), and a TM not in the bag.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
