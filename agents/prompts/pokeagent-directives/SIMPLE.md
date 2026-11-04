@@ -32,6 +32,7 @@ Moving and acting:
 - `go_to(place, reasoning)` — Walk to a named place in one call (a town, route, building or cave floor, as the objectives name it). Use it instead of many go_to_exit calls whenever the objective names somewhere to go.
 - `talk_to(x, y, reasoning)` — Talk to the person at (x, y): it walks next to them, faces them and presses A. Use it whenever an objective says to talk to someone; never navigate_to the tile a person stands on. `buy_item(item, count, reasoning)` — Inside a Poké Mart: buys from the clerk.
 - `teach_move(item, pokemon, forget, reasoning)` — Teach a TM or HM from your bag (e.g. teach_move("HM06", "BRELOOM")) in one call; `forget` is optional. Use it whenever an objective says to teach a move; don't open the bag by hand.
+- `set_lead(pokemon, reasoning)` — Outside battle: put a party Pokémon first, so it starts every battle. Only Pokémon that fight earn EXP: lead with the one that needs levels, not your strongest.
 - `train(trainee, until_level, reasoning)` — Level up a Pokémon in one call: it walks into tall grass and wins wild battles with your strongest teammate while the trainee shares the EXP, and answers when it is done or something needs you. Add `catch="SABLEYE", catch_min_level=10` to stop when that wild Pokémon appears, then catch it.
 - `press_buttons(buttons, reasoning)` — Short moves, menus, dialogue, and anything the tools above don't cover (see Plan the Whole Sequence).
 

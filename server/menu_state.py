@@ -144,6 +144,7 @@ G_SPECIAL_VAR_ITEM_ID = 0x0203CE7C       # set to the chosen item when its conte
 # Party menu: gPartyMenu +9 slotId; sPartyMenuInternal (pointer) +0xF actions[8], +0x17 numActions.
 G_PARTY_MENU = 0x0203CEC8
 S_PARTY_MENU_INTERNAL = 0x0203CEC4
+MENU_SWITCH = 1  # party_menu.c MENU_SWITCH, the field selection menu's "SWITCH"
 MENU_SHIFT = 10  # party_menu.c MENU_SHIFT, the battle selection menu's first entry
 # party_menu.c MENU_SEND_OUT: the same menu when a fainted Pokémon must be replaced.
 MENU_SEND_OUT = 11
@@ -326,6 +327,14 @@ def party_menu_slot(reader) -> int:
     return slot - 256 if slot >= 128 else slot
 
 
+def party_menu_switch_slot(reader) -> int:
+    """gPartyMenu.slotId2 (+0xA): the cursor while SWITCH asks "Move to where?" (pret
+    GetCurrentPartySlotPtr returns it for PARTY_ACTION_SWITCH; slotId stays on the
+    Pokémon being moved)."""
+    slot = reader._read_u8(G_PARTY_MENU + 0xA)
+    return slot - 256 if slot >= 128 else slot
+
+
 def party_menu_actions(reader) -> List[int]:
     internal = reader._read_u32(S_PARTY_MENU_INTERNAL)
     if not internal:
@@ -384,6 +393,7 @@ S_START_MENU_CURSOR_POS = 0x0203760E      # sStartMenuCursorPos: index into the 
 S_NUM_START_MENU_ACTIONS = 0x0203760F
 S_CURRENT_START_MENU_ACTIONS = 0x02037610  # u8[9], start_menu.c MENU_ACTION_*
 TASK_SHOW_START_MENU = 0x0809FA34
+MENU_ACTION_POKEMON = 1                    # start_menu.c MENU_ACTION_POKEMON
 MENU_ACTION_BAG = 2
 TMHM_POCKET = 2                            # POKé BALLS is 1 (BALLS_POCKET)
 ITEM_TM01 = 289                            # TM01..TM50 = 289..338, HM01..HM08 = 339..346

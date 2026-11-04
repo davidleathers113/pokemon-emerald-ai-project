@@ -747,6 +747,24 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "required": ["item", "pokemon", "reasoning"],
         },
     },
+    # David (2026-11-04): BRELOOM, always first in the party, took every battle's EXP.
+    {
+        "name": "set_lead",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Outside battle: make a party Pokemon the lead (slot 1), in one call. The lead "
+            "starts every battle, and only Pokemon that fight get EXP: lead with the one "
+            "that needs levels."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "pokemon": {"type_": "STRING", "description": "Party Pokemon name or slot 1-6, e.g. 'NUMEL'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why it should lead."},
+            },
+            "required": ["pokemon", "reasoning"],
+        },
+    },
     # Seen live: switch-training cost ~3 model decisions per wild battle (walk into the
     # grass, switch_pokemon, use_move); train runs the whole loop server-side.
     {

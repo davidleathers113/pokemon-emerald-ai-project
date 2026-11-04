@@ -333,6 +333,32 @@ def test_party_abilities_are_shown():
     assert f"Marill (Lv.13, {marill.ability})" in text, text
 
 
+def test_party_says_when_one_pokemon_has_taken_the_exp():
+    """David (2026-11-04): "It has overtrained breloom because it was first in the party."
+    test_mt_chimney_busy_grunt.state (saved live) has BRELOOM Lv38 leading the rest at
+    Lv18-29. The party section says so and names set_lead; once another Pokémon leads,
+    the line says to let the others fight."""
+    import asyncio
+
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_mt_chimney_busy_grunt.state", wild_encounters=False)
+    with s.srv.memory_lock:
+        party = s.srv.env.memory_reader.read_party_pokemon()
+    print("   ", [(p.species_name, p.level) for p in party])
+    text = asyncio.run(s.srv.mcp_get_game_state())["state_text"]
+    line = next((l for l in text.splitlines() if l.startswith("EXP: ")), "")
+    print("   ", line)
+    assert line.startswith(f"EXP: BRELOOM is Lv{party[0].level}"), line
+    lowest = min((p for p in party[1:] if p.current_hp > 0), key=lambda p: p.level).species_name.upper()
+    assert f'and BRELOOM leads' in line and f'set_lead("{lowest}")' in line, line
+    r = s.call("mcp_set_lead", {"pokemon": lowest, "reasoning": "test"})
+    assert r["success"] is True, r
+    text = asyncio.run(s.srv.mcp_get_game_state())["state_text"]
+    line = next((l for l in text.splitlines() if l.startswith("EXP: ")), "")
+    print("   ", line)
+    assert "let the others fight" in line and "set_lead" not in line, line
+
+
 def test_learn_move_advice():
     """Seen live: at Lv28 BRELOOM learned COUNTER and the model forgot MACH PUNCH (its STAB
     Fighting move); the learn-move prompt came with no advice. test_marill_in_party.state:

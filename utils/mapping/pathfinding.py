@@ -45,6 +45,9 @@ CLEARABLE_TILE_COST = 10.0
 # live: METEOR FALLS 1F 1R's bridge (19-21,18) between elevation-4 floor counted as a
 # wall; the player could neither reach the scene at (14,18) nor walk back to the door.
 BRIDGE_ELEVATION = 15
+# Grid symbols whose tiles are crossed though their collision bit is set: ledges, doors,
+# warps and the cycling road (_get_blocked_positions).
+PASSABLE_WITH_COLLISION = frozenset({"D", "S", "&", "←", "→", "↑", "↓", "↗", "↖", "↘", "↙"})
 
 
 @dataclass
@@ -758,6 +761,20 @@ class Pathfinder:
                                 else:
                                     blocked.add(pos)
 
+        # pret GetCollisionAtCoords: a tile whose collision bits are set stops the walker
+        # whatever it is drawn as. Ledges (the jump goes over them), doors and warps (they
+        # fire) and cycling-road tiles (handled above) are the exceptions. Seen building
+        # R30: once elevation 0 stopped counting as a mismatch, the walk up BRENDAN'S
+        # HOUSE 1F pressed into the TV at (4,4) (drawn 'T', elevation 0, collision 1).
+        if raw_tiles and game_type.upper() != "RED":
+            for y, row in enumerate(grid):
+                for x, cell in enumerate(row):
+                    if cell in PASSABLE_WITH_COLLISION or (start_pos and (x, y) == start_pos):
+                        continue
+                    tile = raw_tiles[y][x] if y < len(raw_tiles) and x < len(raw_tiles[y]) else None
+                    if tile and len(tile) > 2 and tile[2]:
+                        blocked.add((x, y))
+
         # Add NPC/object positions as blocked.
         # Prefer runtime object_events (live positions); fall back to static porymap objects.
         if consider_npcs:
@@ -964,6 +981,13 @@ class Pathfinder:
                             # Stepping off: the walker's own elevation decides.
                             known = carried_elevation not in (None, BRIDGE_ELEVATION)
                             from_elevation = carried_elevation if known else to_elevation
+                        # pret IsElevationMismatchAt: a walker at elevation 0, or a tile
+                        # at 0, never mismatches. Seen live on JAGGED PASS: the south
+                        # ledges are elevation 0 between elevation-3 floor, and the step
+                        # off a ledge (the jump's landing) counted as a wall, so no route
+                        # led down the pass ("no walkable path" from the top).
+                        if from_elevation == 0 or to_elevation == 0:
+                            to_elevation = from_elevation
 
                     # Calculate elevation difference
                     elev_diff = abs(from_elevation - to_elevation)

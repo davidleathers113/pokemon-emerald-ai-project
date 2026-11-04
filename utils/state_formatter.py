@@ -410,6 +410,28 @@ def format_battle_view(view):
                 f"({better['move']} {better['effectiveness']:g}x, ~{round(better['damage'])} HP a hit vs "
                 f"~{round(best.get('damage') or 0)} for {best['name']}; it takes one hit coming in)."
             )
+        danger = view.get('danger')
+        if danger:
+            # Seen live (Maxie's ZUBAT): BRELOOM was told only "HEADBUTT ~131 HP"; WING
+            # ATTACK was 4x on it, and it fainted with ELECTRIKE in the party.
+            me, foe = view['player'], view['target']
+            our = "can't hurt it" if danger['our_hits'] == float('inf') else f"needs {danger['our_hits']}"
+            line = (
+                f"DANGER: {foe['name'].upper()}'s {danger['foe_move']} ({danger['effectiveness']:g}x) takes "
+                f"~{round(danger['foe_damage'])} of {me['name'].upper()}'s {me['hp']} HP a hit: it knocks "
+                f"{me['name'].upper()} out in {danger['foe_hits']} hit{'s' if danger['foe_hits'] != 1 else ''} "
+                f"first; {me['name'].upper()} {our}."
+            )
+            safe = danger.get('switch')
+            if safe:
+                line += (
+                    f" Switch: call switch_pokemon(\"{safe['name']}\") ({safe['move']} {safe['effectiveness']:g}x, "
+                    f"~{round(safe['damage'])} HP a hit; it takes ~{round(safe['taken'])} of its {safe['hp']} HP "
+                    "coming in and still wins)."
+                )
+            else:
+                line += " No teammate wins this exchange either: attack, heal, or switch to the one that lasts longest."
+            lines.append(line)
     elif moves and view.get('switch_hint'):
         # Seen live: with only "switch Pokémon" here, the model used LEECH SEED 5 times.
         hint = view['switch_hint']
@@ -751,12 +773,57 @@ def _format_party_info(player_data, game_data):
                     # David wants a HUGE POWER Marill (not Thick Fat): the ability is shown.
                     ability = f", {pokemon['ability']}" if pokemon.get('ability') and not is_egg else ""
                     context_parts.append(f"  {i+1}. {species} (Lv.{level}{ability}) HP: {hp}/{max_hp} Status: {status}")
+            line = _exp_concentration_line(pokemon_list[:6])
+            if line:
+                context_parts.append(line)
         else:
             context_parts.append("No Pokemon in party")
     else:
         context_parts.append("No Pokemon in party")
-    
+
     return context_parts
+
+
+# Levels a Pokémon can be above the median of the rest before the party line says so.
+EXP_GAP_LEVELS = 8
+
+
+def _exp_concentration_line(pokemon_list):
+    """'EXP: BRELOOM is Lv38, 18 levels above …' when one Pokémon has taken the EXP.
+
+    David (2026-11-04): "It has overtrained breloom because it was first in the party.
+    It should have known to switch the first pokemon in the party so it could focus on
+    training that." Gen 3 gives EXP only to Pokémon that were on the field against the
+    foe, and the lead always is: BRELOOM, leading, was Lv38 with the rest Lv18-29.
+    """
+    mons = [
+        (i, p) for i, p in enumerate(pokemon_list)
+        if p and not p.get('is_egg') and isinstance(p.get('level'), int)
+    ]
+    if len(mons) < 2:
+        return ""
+    top_index, top = max(mons, key=lambda m: m[1]['level'])
+    others = sorted(p['level'] for i, p in mons if i != top_index)
+    median = others[len(others) // 2] if len(others) % 2 else (others[len(others) // 2 - 1] + others[len(others) // 2]) // 2
+    gap = top['level'] - median
+    if gap < EXP_GAP_LEVELS:
+        return ""
+    name = str(top.get('species_name') or top.get('species') or 'Your strongest').upper()
+    head = (
+        f"EXP: {name} is Lv{top['level']}, {gap} levels above the rest of the party (median Lv{median}). "
+        "Only Pokémon that fight earn EXP"
+    )
+    if top_index != 0:
+        return head + f": let the others fight; {name} is for battles they can't win."
+    able = [(p['level'], i, p) for i, p in mons if i != top_index and (p.get('current_hp') or 0) > 0]
+    if not able:
+        return head + "."
+    _, _, low = min(able, key=lambda m: (m[0], m[1]))
+    low_name = str(low.get('species_name') or low.get('species') or '').upper()
+    return (
+        head + f", and {name} leads, so it starts every battle and takes the EXP. "
+        f'Put one that needs levels first: set_lead("{low_name}").'
+    )
 
 
 def _format_inventory_info(player_data, game_data, include_only_pockets=None, header=None):

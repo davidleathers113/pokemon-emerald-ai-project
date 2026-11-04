@@ -169,8 +169,12 @@ def truncate_middle(text: Any, max_chars: int) -> Any:
 # when its presses are done, like use_move.
 MACRO_TOOLS = (
     "heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to",
-    "teach_move",
+    "teach_move", "set_lead",
 )
+# Battle calls decided for one match-up (who is out on each side): they carry the
+# get_game_state battle_key the model saw. Seen live: switch_pokemon("BRELOOM"), chosen
+# vs MIGHTYENA, ran vs ZUBAT after presses from the /play page played two turns.
+BATTLE_DECISION_TOOLS = ("use_move", "switch_pokemon", "throw_ball")
 # Tools that press buttons and answer after the presses ran.
 PRESSING_TOOLS = ("press_buttons", "navigate_to", "go_to_exit", "use_move") + MACRO_TOOLS
 # HTTP timeout for a pressing tool: a long walk plus a door warp, or a macro reading a
@@ -1665,6 +1669,11 @@ class PokeAgent:
             result_json = self._execute_evolve_harness(arguments)
             self._store_function_result_for_context("evolve_harness", result_json)
             return result_json
+
+        # A battle call carries the match-up the model saw (server _battle_moved_on): the
+        # server refuses it if the battle changed while the model was thinking.
+        if function_name in BATTLE_DECISION_TOOLS and getattr(self, "_seen_battle", None):
+            arguments = {**arguments, "seen_battle": self._seen_battle}
 
         # Call the tool via MCP adapter
         result = self.mcp_adapter.call_tool(function_name, arguments)
@@ -3426,7 +3435,9 @@ Step {step_count}"""
                     game_state_data = json_module.loads(game_state_result)
                     screenshot_b64 = game_state_data.get("screenshot_base64")
                 except:
-                    screenshot_b64 = None
+                    game_state_data, screenshot_b64 = {}, None
+                # The match-up this decision is made for (BATTLE_DECISION_TOOLS).
+                self._seen_battle = game_state_data.get("battle_key") if isinstance(game_state_data, dict) else None
 
                 # Build prompt (conditional based on optimization mode), trimming
                 # the oldest history if it would not fit the context budget.

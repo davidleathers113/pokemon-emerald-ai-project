@@ -555,6 +555,31 @@ def _give_hm06(s):
     _write(s, 16, pocket + 4 * slot + 2, 1 ^ key)
 
 
+def test_set_lead_puts_a_party_pokemon_first():
+    """David (2026-11-04): BRELOOM, always first, took every battle's EXP; the trainees
+    should lead. set_lead goes START → POKéMON → the Pokémon → SWITCH → slot 1; the order
+    is read back from gPlayerParty. RAM: gPartyMenu.slotId (+9) left on slot 3, so the
+    party cursor doesn't start on the lead."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(HERE / "test_marill_in_party.state", wild_encounters=False)
+    before = _read(s, lambda rd: [p.species_name.upper() for p in rd.read_party_pokemon()])
+    print("    before:", before)
+    assert before[0] == "BRELOOM" and "MARILL" in before[1:], before
+    _write(s, 8, ms.G_PARTY_MENU + 9, 2)
+    r = s.call("mcp_set_lead", {"pokemon": "MARILL", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    after = _read(s, lambda rd: [p.species_name.upper() for p in rd.read_party_pokemon()])
+    assert r["success"] is True and after[0] == "MARILL", (after, r)
+    assert sorted(after) == sorted(before), after  # a swap, nobody lost
+    assert s.srv._player_can_walk()
+    r = s.call("mcp_set_lead", {"pokemon": "MARILL", "reasoning": "test"})
+    assert r["success"] is True and "already leads" in r["summary"], r
+    r = s.call("mcp_set_lead", {"pokemon": "PIKACHU", "reasoning": "test"})
+    assert r["success"] is False and "not in your party" in r["error"], r
+
+
 def test_teach_move_teaches_an_hm_and_forgets_the_named_move():
     """Seen live: told to teach Rock Smash, the model pressed B over and over. By hand the
     party screen's cursor started on slot 2, and A at once picked COMBUSKEN. RAM: HM06 in

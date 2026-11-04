@@ -260,6 +260,42 @@ def test_walks_smash_a_rock_the_party_can_clear():
     assert (snap.x, snap.y) != (19, 99), (snap, r)
 
 
+def test_walks_go_down_jagged_pass_ledges_and_not_bumpy_slopes():
+    """Seen live (15:47-15:49 UTC, REPEAT stall): from JAGGED PASS (14,5) every
+    heal_at_pokecenter said "Cannot reach 'ROUTE 112' … no walkable path"; by hand the
+    pass goes down ledge after ledge. Two causes: the south ledges are elevation 0 between
+    elevation-3 floor, and the step off a ledge counted as an elevation change (pret
+    IsElevationMismatchAt: elevation 0 never mismatches); and the bumpy slopes ((18,8)...)
+    were drawn as one-way slides, though on foot they collide (pret CheckAcroBikeCollision).
+    test_jagged_pass_top.state is the live save."""
+    from server import game_tools
+
+    s = server()
+    s.load(HERE / "test_jagged_pass_top.state", wild_encounters=False)
+    assert _location(s) == "JAGGED PASS", _location(s)
+    with s.srv.memory_lock:
+        state, _, _ = game_tools.load_pathfinding_state(s.srv.env)
+    grid = state["map"]["porymap"]["grid"]
+    assert grid[8][18] == "#" and grid[9][14] == "↓", (grid[8][18], grid[9][14])
+    path = game_tools.pathfinder.find_path((14, 5), (14, 40), state, consider_npcs=False, allow_partial=False)
+    assert path, "no route down the pass"
+    r = s.call("mcp_go_to", {"place": "Route 112", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    here = s.snapshot()
+    # A hiker at (16,25) spots the player on the way down; his battle is a fair stop, once
+    # past the ledges (the walk reads his speech through, as the heal walk does).
+    assert _location(s) == "ROUTE 112" or ("a trainer battle started" in r.get("error", "") and here.y > 12), (here, r)
+    # Seen live 16:05-16:07 UTC, the same cause: from ROUTE 112 (7,47) the CABLE CAR
+    # STATION had "no walkable path"; by hand RIGHT jumped the east ledges on row 52
+    # (elevation 0 between elevation-3 floor). test_route111_south_to_113.state is on
+    # ROUTE 112.
+    s.load(HERE / "test_route111_south_to_113.state", wild_encounters=False)
+    with s.srv.memory_lock:
+        state, _, _ = game_tools.load_pathfinding_state(s.srv.env)
+    for start in ((7, 47), (7, 52)):
+        assert game_tools.pathfinder.find_path(start, (28, 27), state, consider_npcs=False, allow_partial=False), start
+
+
 def test_walks_go_round_floor_switches():
     """Seen live in MAUVILLE CITY GYM: on the south-west switch (0,15) the barriers were
     open, then talk_to's walk to Wattson crossed the switches at (4,12) and (3,9) and

@@ -1435,6 +1435,33 @@ prompt. That came to 1.1 tiles walked per minute.
   so without moving; navigate_to(21,19) ends at (21,18). The old code: "BLOCKED moving
   DOWN at (23,16)".
 
+## Battles: the match-up decided on, the danger, the lead (2026-11-04, WEAKNESSES M60-M62)
+- Seen live at Maxie (15:39-15:41 UTC): a switch chosen vs MIGHTYENA ran vs ZUBAT after
+  presses from the /play page played two turns; BRELOOM then took WING ATTACK (4x) with
+  nothing warning of it, and fainted; a use_move for BRELOOM fired ELECTRIKE's slot 2.
+  David, earlier: BRELOOM, always leading, had taken the EXP (Lv38 vs Lv18-29).
+- M61 `_battle_key` / `_battle_moved_on` / `_matchup_changed`: get_game_state hands out
+  who is facing whom; the agent sends it back with use_move, switch_pokemon and
+  throw_ball; a changed match-up is refused before any press, also after a turn's text
+  played out first. use_move re-finds the move by id.
+- M62 `_danger`: the exchange both ways (hits to a knockout, speed); "DANGER: …" and the
+  teammate that wins it, in place of "Better matchup".
+- M60 `set_lead` (model tool) and the party section's "EXP: …" line.
+- *Verified:* on Isaac's battle (RAM: HP, speed) the stale key is refused with nothing
+  pressed, the faint-and-replace turn refuses the move, the danger line names BRELOOM;
+  set_lead reorders test_marill_in_party.state. Each fails on the old code.
+
+## Jagged Pass: ledges at elevation 0, bumpy slopes (2026-11-04, WEAKNESSES R30)
+- `_can_move_to`: elevation 0 on either side never mismatches (pret
+  IsElevationMismatchAt). `ACRO_BIKE_ONLY_BEHAVIORS` are walls on foot.
+- `_get_blocked_positions`: a tile with its collision bit set is blocked whatever its
+  symbol (pret GetCollisionAtCoords), except `PASSABLE_WITH_COLLISION` (ledges, doors,
+  warps, cycling road). The elevation rule had been what kept walks out of furniture
+  at elevation 0 (BRENDAN'S HOUSE 1F's TV at (4,4), test_go_to_exit_up_the_stairs).
+- The same cause stopped ROUTE 112's south band (7,47) → CABLE CAR STATION (16:05 UTC).
+- *Verified:* on the live save test_jagged_pass_top.state go_to("Route 112") walks down
+  to the hiker at (16,25); the old code has no route and draws (18,8) as a ledge.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

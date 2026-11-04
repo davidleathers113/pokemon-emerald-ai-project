@@ -1798,6 +1798,7 @@ class PokemonEmeraldReader:
             "stats": {
                 "attack": self._read_u16(base + 0x5A),
                 "defense": self._read_u16(base + 0x5C),
+                "speed": self._read_u16(base + 0x5E),
                 "sp_attack": self._read_u16(base + 0x60),
                 "sp_defense": self._read_u16(base + 0x62),
             },
@@ -1903,6 +1904,88 @@ class PokemonEmeraldReader:
                 best = {"slot": index + 1, "name": mon.species_name.upper(), "score": score}
         return best
 
+    @staticmethod
+    def _loses_race(our_hits: float, foe_hits: float, our_speed: int, foe_speed: int) -> bool:
+        """True when the foe knocks us out first: fewer hits needed, or as many and it
+        moves first (the faster side hits first each turn; a tie is counted against us)."""
+        return foe_hits < our_hits or (foe_hits == our_hits and foe_speed >= our_speed)
+
+    def _danger(
+        self, player: Dict[str, Any], target: Dict[str, Any], best: Optional[Dict[str, Any]], player_battlers: List[int]
+    ) -> Optional[Dict[str, Any]]:
+        """The foe's hit that wins the exchange against the Pokémon out, and the teammate
+        that would win it instead, or None when the Pokémon out wins.
+
+        Seen live (Maxie's ZUBAT, MT CHIMNEY): BRELOOM (GRASS/FIGHTING) at 70/106 HP was
+        told only "Best move now: HEADBUTT ~131 HP"; ZUBAT's WING ATTACK is 4x on it, and
+        BRELOOM fainted while ELECTRIKE (SPARK 2x, resists Flying) sat in the party. The
+        exchange counts hits each side needs (estimate_damage, the foe's real moves with
+        PP) and who moves first (speed); a teammate qualifies when it wins it after
+        taking the foe's hit coming in.
+        """
+        foe_hit, foe_move = self._best_hit(target, player)
+        if not foe_hit or not player.get("hp"):
+            return None
+        our_hits = math.ceil(target["hp"] / best["damage"]) if best and best.get("damage") else math.inf
+        foe_hits = math.ceil(player["hp"] / foe_hit)
+        foe_speed = target["stats"].get("speed", 0)
+        if not self._loses_race(our_hits, foe_hits, player["stats"].get("speed", 0), foe_speed):
+            return None
+        party = self.read_party_pokemon() or []
+        out = {
+            self._read_u32(self.addresses.BATTLE_MONS + b * self.addresses.BATTLE_MON_SIZE + 0x48)
+            for b in player_battlers
+        }
+        choice = None
+        for index, mon in enumerate(party):
+            personality = self._read_u32(self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE)
+            if mon.is_egg or mon.current_hp == 0 or personality in out:
+                continue
+            cand = self._party_battle_mon(index, mon)
+            hit, move_id = self._best_hit(cand, target)
+            if not hit:
+                continue
+            taken = self._best_hit(target, cand)[0]
+            left = cand["hp"] - taken  # after the hit it takes switching in
+            if left <= 0:
+                continue
+            cand_hits = math.ceil(target["hp"] / hit)
+            alive = math.ceil(left / taken) if taken else math.inf
+            if self._loses_race(cand_hits, alive, cand["stats"].get("speed", 0), foe_speed):
+                continue
+            key = (cand_hits, -left)
+            if choice is None or key < choice["key"]:
+                data = self._rom_battle_move(move_id)
+                try:
+                    move_name = Move(move_id).name.replace("_", " ")
+                except ValueError:
+                    move_name = f"MOVE {move_id}"
+                choice = {
+                    "key": key,
+                    "slot": index + 1,
+                    "name": mon.species_name.upper(),
+                    "move": move_name,
+                    "effectiveness": self.type_effectiveness(data["type"], target["type_ids"]),
+                    "damage": round(hit, 1),
+                    "taken": round(taken, 1),
+                    "hp": cand["hp"],
+                }
+        if choice:
+            choice.pop("key")
+        foe_data = self._rom_battle_move(foe_move)
+        try:
+            foe_move_name = Move(foe_move).name.replace("_", " ")
+        except ValueError:
+            foe_move_name = f"MOVE {foe_move}"
+        return {
+            "foe_move": foe_move_name,
+            "foe_damage": round(foe_hit, 1),
+            "effectiveness": self.type_effectiveness(foe_data["type"], player["type_ids"]),
+            "foe_hits": foe_hits,
+            "our_hits": our_hits,
+            "switch": choice,
+        }
+
     def species_family(self, name: str) -> List[str]:
         """'SHROOMISH' -> ['SHROOMISH', 'BRELOOM']: the species and every form it evolves
         into, upper-case, from the ROM's gSpeciesNames and gEvolutionTable (cached).
@@ -1969,11 +2052,12 @@ class PokemonEmeraldReader:
             "status": status,
             "move_ids": [self._read_u16(base + 0x0C + 2 * i) for i in range(4)],
             "pp": list(bytes(self.read_memory(base + 0x24, 4))),
-            # pret struct BattlePokemon: attack +2, defense +4, spAttack +8, spDefense
-            # +0xA, statStages[8] +0x18 (6 = no change), ability +0x20.
+            # pret struct BattlePokemon: attack +2, defense +4, speed +6, spAttack +8,
+            # spDefense +0xA, statStages[8] +0x18 (6 = no change), ability +0x20.
             "stats": {
                 "attack": self._read_u16(base + 0x02),
                 "defense": self._read_u16(base + 0x04),
+                "speed": self._read_u16(base + 0x06),
                 "sp_attack": self._read_u16(base + 0x08),
                 "sp_defense": self._read_u16(base + 0x0A),
             },
@@ -2053,6 +2137,9 @@ class PokemonEmeraldReader:
         best = max(scored, key=lambda m: (m["expected"], m["damage"], -m["slot"])) if scored else None
         switch_hint = self._switch_hint(target, player_battlers) if moves and best is None else None
         better_switch = self._better_switch(player, target, best, player_battlers) if player and target and best else None
+        danger = self._danger(player, target, best, player_battlers) if player and target and moves else None
+        if danger:
+            better_switch = None  # the danger line names the switch that wins the exchange
 
         action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3
         return {
@@ -2071,6 +2158,7 @@ class PokemonEmeraldReader:
             "best_move": best,
             "switch_hint": switch_hint,
             "better_switch": better_switch,
+            "danger": danger,
         }
 
     def read_team_condition(self, lead_index: Optional[int] = None) -> Dict[str, Any]:

@@ -25,6 +25,15 @@ except ImportError:  # Allow usage in builder scripts without mgba
     MetatileBehavior = type("MetatileBehavior", (), {"NORMAL": _FallbackEnum(0)})
 
 
+# pret CheckAcroBikeCollision (field_player_avatar.c): sAcroBikeTrickMetatiles collide
+# unless the player rides the Acro Bike, whatever their collision bit says. Seen live on
+# JAGGED PASS: the bumpy slope at (18,8) was drawn as a one-way slide; navigate_to planned
+# down it and the game said the tile wasn't walkable.
+ACRO_BIKE_ONLY_BEHAVIORS = frozenset({
+    "BUMPY_SLOPE", "ISOLATED_VERTICAL_RAIL", "ISOLATED_HORIZONTAL_RAIL", "VERTICAL_RAIL", "HORIZONTAL_RAIL",
+})
+
+
 def _get_behavior_enum():
     """Return the appropriate behavior enum for the current game type.
 
@@ -135,15 +144,16 @@ def is_tile_walkable(tile) -> bool:
     # WALL behaviors are blocked
     if "WALL" in behavior_name:
         return False
-    
+
+    if behavior_name in ACRO_BIKE_ONLY_BEHAVIORS:
+        return False
+
     # Walkable terrain types
     walkable_terrain = [
         "TALL_GRASS", "LONG_GRASS", "SHORT_GRASS", "ASHGRASS",
         "SAND", "DEEP_SAND", "ICE", "THIN_ICE", "CRACKED_ICE",
         "PUDDLE", "SHALLOW_WATER", "FOOTPRINTS", "HOT_SPRINGS",
         "CRACKED_FLOOR",
-        "VERTICAL_RAIL", "HORIZONTAL_RAIL",
-        "ISOLATED_VERTICAL_RAIL", "ISOLATED_HORIZONTAL_RAIL",
         "INDOOR_ENCOUNTER", "MOUNTAIN_TOP", "SHOAL_CAVE_ENTRANCE",
         "REFLECTION_UNDER_BRIDGE", "SEAWEED", "SEAWEED_NO_SURFACING"
     ]
@@ -155,8 +165,7 @@ def is_tile_walkable(tile) -> bool:
     if ("JUMP" in behavior_name or
         "WALK" in behavior_name or
         "SLIDE" in behavior_name or
-        "MUDDY_SLOPE" in behavior_name or
-        "BUMPY_SLOPE" in behavior_name):
+        "MUDDY_SLOPE" in behavior_name):
         return True
     
     # Default: use collision data (collision 0 = passable, >0 = blocked)
@@ -308,8 +317,10 @@ def format_tile_to_symbol(tile, x=None, y=None, location_name=None, player_pos=N
             return "↑"  # Slide up (north)
         else:
             return "S"  # Generic slide/stairs symbol
-    elif "MUDDY_SLOPE" in behavior_name or "BUMPY_SLOPE" in behavior_name:
-        # Muddy/bumpy slopes in caves are one-way slides (always downward/south)
+    elif behavior_name in ACRO_BIKE_ONLY_BEHAVIORS:
+        return "#"  # a wall on foot (ACRO_BIKE_ONLY_BEHAVIORS)
+    elif "MUDDY_SLOPE" in behavior_name:
+        # Muddy slopes are one-way slides (always downward/south)
         return "↓"  # One-way slide down
     elif "BRIDGE" in behavior_name:
         return "&"  # Bridge tiles are walkable

@@ -4200,6 +4200,13 @@ async def mcp_get_game_state():
             except Exception as e:
                 logger.warning(f"team condition check failed: {e}")
 
+        if result.get("success", False):
+            try:
+                # The agent sends it back with its battle call (_battle_moved_on).
+                result["battle_key"] = _battle_key()
+            except Exception as e:
+                logger.warning(f"battle key unreadable: {e}")
+
         # Ensure all data is JSON-serializable (objectives data may contain enums/numpy types)
         from utils.json_utils import serialize_for_json
         return serialize_for_json(result)
@@ -5000,6 +5007,63 @@ def _read_battle_view() -> Optional[Dict[str, Any]]:
         return env.memory_reader.read_battle_view()
 
 
+def _battle_key() -> Optional[str]:
+    """Who is facing whom now: the player's and the foe's battler personalities
+    (gBattleMons[0] and [1] +0x48), or None outside a battle.
+
+    get_game_state hands it out with the state the model decides on, and the agent sends
+    it back with its battle call (seen_battle), so a call made for one match-up is not
+    played on another.
+    """
+    from server import menu_state as ms
+
+    with memory_lock:
+        reader = env.memory_reader
+        if not reader.is_in_battle():
+            return None
+        ours = reader._read_u32(ms.G_BATTLE_MONS + ms.BATTLE_MON_PERSONALITY)
+        foe = reader._read_u32(ms.G_BATTLE_MONS + ms.BATTLE_MON_SIZE + ms.BATTLE_MON_PERSONALITY)
+    return f"{ours:08x}:{foe:08x}"
+
+
+def _matchup_changed(before: Optional[str], after: Optional[str]) -> bool:
+    """True when either side's Pokémon differs between two _battle_key values. A side
+    still empty (0, before the first send-out) changes nothing."""
+    if not before or not after:
+        return False
+    for was, now in zip(before.split(":"), after.split(":")):
+        if int(was, 16) and int(now, 16) and was != now:
+            return True
+    return False
+
+
+def _matchup_text(view: Optional[Dict[str, Any]]) -> str:
+    if not view or not view.get("player") or not view.get("target"):
+        return "the battle"
+    player, foe = view["player"], view["target"]
+    return f"{str(player['name']).upper()} (HP {player['hp']}/{player['max_hp']}) vs {str(foe['name']).upper()} (HP {foe['hp']}/{foe['max_hp']})"
+
+
+def _battle_moved_on(request: dict, tool: str) -> Optional[Dict[str, Any]]:
+    """A refusal when the battle is no longer the one the call was decided on.
+
+    Seen live (Maxie, MT CHIMNEY, 15:40 UTC): the model chose switch_pokemon("BRELOOM")
+    for SABLEYE vs MIGHTYENA; while it was thinking, presses from the /play page played
+    two turns, and the switch ran on ELECTRIKE vs ZUBAT. ZUBAT's WING ATTACK (4x) hit
+    BRELOOM on the way in, and BRELOOM fainted.
+    """
+    seen = str(request.get("seen_battle") or "")
+    if not seen:
+        return None
+    if not _matchup_changed(seen, _battle_key()):
+        return None
+    return _refusal(
+        f"The battle changed since you decided: it is now {_matchup_text(_read_battle_view())}. "
+        f"Nothing was done; look at the battle status again and choose for this match-up ({tool} not used).",
+        status="BATTLE_CHANGED",
+    )
+
+
 def _game_frame() -> int:
     with memory_lock:
         reader = env.memory_reader
@@ -5086,6 +5150,9 @@ async def mcp_use_move(request: dict):
         if view is None:
             message = "No battle is going on (game memory says so): use_move only works in a battle."
             return {"success": False, "error": message, "summary": message}
+        moved_on = _battle_moved_on(request, "use_move")
+        if moved_on:
+            return moved_on
 
         moves = view["moves"]
         listing = ", ".join(f"{m['name']} (slot {m['slot']}, PP {m['pp']})" for m in moves)
@@ -5115,6 +5182,7 @@ async def mcp_use_move(request: dict):
 
         menu = view["menu"]
         if menu == "busy":
+            chosen_for = _battle_key()
             played = await _play_out_battle("use_move")
             if played["end"] == "over":
                 return _refusal(f"The battle ended before {move['name']} could be used. {_battle_report(played)}")
@@ -5123,7 +5191,17 @@ async def mcp_use_move(request: dict):
             view = _read_battle_view()
             if view is None:
                 return _refusal(f"The battle ended before {move['name']} could be used.")
-            move = next((m for m in view["moves"] if m["slot"] == move["slot"]), move)
+            # Seen live: use_move("HEADBUTT") for BRELOOM waited out a turn in which
+            # BRELOOM fainted and ELECTRIKE was sent in; the move was then taken by its
+            # slot (2) and ELECTRIKE used THUNDER WAVE. A different match-up is a new
+            # decision.
+            if _matchup_changed(chosen_for, _battle_key()):
+                return _refusal(
+                    f"{move['name']} was not used: the battle changed while the turn before it played out. "
+                    f"{_battle_report(played)} It is now {_matchup_text(view)}: choose again.",
+                    status="BATTLE_CHANGED",
+                )
+            move = next((m for m in view["moves"] if m["id"] == move["id"]), move)
             if move["pp"] == 0:
                 return _refusal(f"{move['name']} has no PP left. {_battle_report(played)}")
             menu = view["menu"]
@@ -5678,6 +5756,9 @@ async def mcp_throw_ball(request: dict = None):
         view = _read_battle_view()
         if view is None:
             return _refusal("No battle is going on (game memory says so): throw_ball only works in a wild battle.")
+        moved_on = _battle_moved_on(request, "throw_ball")
+        if moved_on:
+            return moved_on
         if view["is_trainer"]:
             return _refusal("You can't catch a trainer's Pokémon: throw_ball only works in a wild battle.")
         flags = _battle_type_flags()
@@ -5998,9 +6079,12 @@ async def mcp_switch_pokemon(request: dict = None):
         view = _read_battle_view()
         if view is None:
             return _refusal(
-                "No battle is going on (game memory says so): switch_pokemon only works in a battle "
-                "(reordering the party outside battles is not supported)."
+                "No battle is going on (game memory says so): switch_pokemon only works in a battle. "
+                f'To choose who starts the next battle, call set_lead("{wanted}").'
             )
+        moved_on = _battle_moved_on(request, "switch_pokemon")
+        if moved_on:
+            return moved_on
         if _battle_type_flags() & BATTLE_TYPE_SAFARI:
             return _refusal("You can't switch Pokémon in the Safari Zone.")
         party = _party_lines()
@@ -6035,10 +6119,21 @@ async def mcp_switch_pokemon(request: dict = None):
         # POKEMON step is already done: pick the Pokémon and SEND OUT.
         forced = _forced_party_menu()
         if not forced:
+            chosen_for = _battle_key()
             view, refusal = await _ready_for_battle_action("switch_pokemon", source)
             if refusal and not _forced_party_menu():
                 return refusal
             forced = refusal is not None
+            if not forced and _matchup_changed(chosen_for, _battle_key()):
+                # The text played out first changed who is out: the switch was for the
+                # match-up before (seen live: chosen vs MIGHTYENA, played vs ZUBAT).
+                return _refusal(
+                    f"Nobody was switched: the battle changed while the text before it played out. "
+                    f"It is now {_matchup_text(_read_battle_view())}: choose again.",
+                    status="BATTLE_CHANGED",
+                )
+            if view and view.get("player"):
+                outgoing = view["player"]["name"].upper()
         if not forced:
             error = await _choose_battle_action(ms.ACTION_POKEMON, source)
             if error:
@@ -7274,6 +7369,126 @@ async def mcp_teach_move(request: dict = None):
         "success": True,
         "status": "LEARNED",
         "summary": f"{name} learned {new_name}{lost}. Its moves: {', '.join(moves_after)}.{walk}",
+    }
+
+
+@app.post("/mcp/set_lead")
+async def mcp_set_lead(request: dict = None):
+    """MCP Tool: outside battle, make a party Pokémon the lead (party slot 1), the one
+    every battle starts with.
+
+    David (2026-11-04): "It has overtrained breloom because it was first in the party. It
+    should have known to switch the first pokemon in the party so it could focus on
+    training that." Gen 3 gives EXP only to Pokémon that were on the field against the
+    foe, and the lead is always on the field. By hand: START → POKéMON → the Pokémon →
+    SWITCH → slot 1 → A. Each step waits for its screen (Task_HandleChooseMonInput,
+    Task_HandleSelectionMenuInput); the cursors are read from memory, and the new order
+    is checked by personality.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import menu_state as ms
+
+    source = "set_lead"
+    request = request or {}
+    wanted = request.get("pokemon")
+    if wanted is None or str(wanted).strip() == "":
+        return _refusal('pokemon is required: the party Pokémon to lead, e.g. set_lead("NUMEL").')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+        personalities = ms.party_personalities(env.memory_reader)
+    index = _train_member([(0, p) for p in party], wanted)
+    if index is None:
+        names = ", ".join(f"{i + 1}. {p.species_name.upper()}" for i, p in enumerate(party))
+        return _refusal(f"{wanted} is not in your party ({names}).")
+    name = party[index].species_name.upper()
+    if party[index].is_egg:
+        return _refusal("An egg can't lead: it can't battle.")
+    if index == 0:
+        return {"success": True, "status": "LEAD", "summary": f"{name} already leads the party."}
+    lead = personalities[index]
+
+    def screen(check):
+        return _mem(lambda r: bool(check(r)))
+
+    def party_ready(r):
+        return ms.callback2_is(r, ms.CB2_UPDATE_PARTY_MENU) and ms.task_running(r, ms.TASK_PARTY_CHOOSE) and not ms.fade_active(r)
+
+    async def close_menus() -> bool:
+        for _ in range(6):  # B backs out of the party screen, then the START menu
+            if _player_can_walk():
+                return True
+            await _macro_press(["B"], source)
+            await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+        return _player_can_walk()
+
+    async def leave(message: str) -> Dict[str, Any]:
+        closed = await close_menus()
+        return _refusal(message + ("" if closed else " Could not close every menu: look at the screen."))
+
+    async def party_cursor_to(slot: int, cursor=ms.party_menu_slot) -> bool:
+        # One press at a time, each waited for, so none lands before the screen reads it.
+        for _ in range(8):
+            at = _mem(cursor)
+            if at == slot:
+                return True
+            await _macro_press(ms.list_presses(at, slot)[:1], source)
+            await _await_game(lambda: _mem(cursor) != at, MACRO_MENU_FRAMES)
+        return _mem(cursor) == slot
+
+    with _turbo():
+        await _macro_press(["START"], source)
+        if not await _await_game(lambda: screen(ms.start_menu_open), MACRO_MENU_FRAMES):
+            return await leave("The START menu did not open.")
+        actions = _mem(ms.start_menu_actions)
+        if ms.MENU_ACTION_POKEMON not in actions:
+            return await leave("The START menu has no POKéMON entry.")
+        goal = actions.index(ms.MENU_ACTION_POKEMON)
+        await _macro_press(ms.list_presses(_mem(ms.start_menu_cursor), goal), source)
+        if _mem(ms.start_menu_cursor) != goal:
+            return await leave("Could not put the START menu cursor on POKéMON.")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: screen(party_ready), MACRO_MENU_FRAMES * 2):
+            return await leave("Chose POKéMON but the party screen did not open.")
+        if _mem(ms.party_personalities)[index] != lead:
+            return await leave(f"The party changed; {name} is not in slot {index + 1}.")
+        if not await party_cursor_to(index):
+            return await leave(f"Could not put the party cursor on {name}.")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: screen(lambda r: ms.task_running(r, ms.TASK_PARTY_SELECTION)), MACRO_MENU_FRAMES):
+            return await leave(f"Pressed A on {name} but its menu did not open.")
+        options = _mem(ms.party_menu_actions)
+        if ms.MENU_SWITCH not in options:
+            return await leave(f"{name}'s menu has no SWITCH.")
+        goal = options.index(ms.MENU_SWITCH)
+        await _macro_press(ms.list_presses(_mem(ms.read_menu_cursor).cursor, goal), source)
+        if _mem(ms.read_menu_cursor).cursor != goal:
+            return await leave(f"Could not put {name}'s menu cursor on SWITCH.")
+        await _macro_press(["A"], source)
+        # "Move to where?": the chooser again, now picking the slot to swap with.
+        if not await _await_game(lambda: screen(party_ready), MACRO_MENU_FRAMES):
+            return await leave("Chose SWITCH but the party screen did not ask where to move.")
+        if not await party_cursor_to(0, ms.party_menu_switch_slot):
+            return await leave(f"Could not put the party cursor on slot 1 (it is on slot {_mem(ms.party_menu_switch_slot) + 1}).")
+        await _macro_press(["A"], source)
+        # The two slots slide off, swap and slide back before the chooser runs again.
+        await _await_game(lambda: screen(lambda r: party_ready(r) and ms.party_personalities(r)[0] == lead), MACRO_MENU_FRAMES * 2)
+        closed = await close_menus()
+
+    order = _mem(ms.party_personalities)
+    with memory_lock:
+        after = [p.species_name.upper() for p in env.memory_reader.read_party_pokemon() or []]
+    listing = ", ".join(f"{i + 1}. {n}" for i, n in enumerate(after))
+    if not order or order[0] != lead:
+        return _refusal(f"{name} is not the lead after the switch (party: {listing}).{_screen_note()}")
+    walk = "" if closed else " A menu is still open: look at the screen."
+    return {
+        "success": True,
+        "status": "LEAD",
+        "summary": f"{name} now leads the party, so it starts every battle and earns its EXP. Party: {listing}.{walk}",
     }
 
 

@@ -400,6 +400,86 @@ def test_a_clearly_better_teammate_is_named():
     assert any(f'Better matchup: call switch_pokemon("{better["name"]}") instead' in line for line in lines), lines
 
 
+def test_a_foe_that_wins_the_exchange_is_a_danger():
+    """Seen live (Maxie's ZUBAT, MT CHIMNEY): BRELOOM at 70/106 HP was told only "Best move
+    now: HEADBUTT ~131 HP"; WING ATTACK was 4x on it and it fainted, ELECTRIKE (SPARK 2x)
+    on the bench. RAM: SABLEYE at 1 HP, Isaac's WHISMUR at 200 HP, so WHISMUR's POUND knocks
+    SABLEYE out before SABLEYE's five hits land. As loaded, SABLEYE wins in one hit and
+    nothing is said."""
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(ISAAC)
+    assert _view(s)["danger"] is None, _view(s)["danger"]
+    _poke(s, 16, 0x02024084 + 0x28, 1)
+    _poke(s, 16, FOE + 0x28, 200)
+    _poke(s, 16, FOE + 0x2C, 200)
+    view = _view(s)
+    lines = format_battle_view(view)
+    print("    " + "\n    ".join(lines))
+    danger = view["danger"]
+    assert danger and danger["foe_hits"] == 1 and danger["our_hits"] > 1, danger
+    assert danger["switch"] and danger["switch"]["name"] in ("COMBUSKEN", "BRELOOM"), danger
+    line = next((l for l in lines if l.startswith("DANGER: WHISMUR's")), "")
+    assert f'Switch: call switch_pokemon("{danger["switch"]["name"]}")' in line, lines
+    assert view["better_switch"] is None and not any(l.startswith("Better matchup") for l in lines), lines
+
+
+def test_a_battle_call_for_a_matchup_that_changed_is_refused():
+    """Seen live (Maxie, 15:40 UTC): switch_pokemon("BRELOOM") was chosen for SABLEYE vs
+    MIGHTYENA; presses from the /play page played two turns while the model thought, and
+    the switch ran on ELECTRIKE vs ZUBAT. The agent sends the battle_key it saw
+    (seen_battle); a different match-up is refused before anything is pressed, the same
+    one goes ahead."""
+    import asyncio
+
+    s = server()
+    s.load(ISAAC)
+    seen = asyncio.run(s.srv.mcp_get_game_state())["battle_key"]
+    ours, foe = seen.split(":")
+    stale = f"{ours}:{int(foe, 16) ^ 1:08x}"  # another foe
+    for tool, payload in (("mcp_use_move", {"move": "SCRATCH"}), ("mcp_switch_pokemon", {"pokemon": "COMBUSKEN"})):
+        r = s.call(tool, {**payload, "seen_battle": stale, "reasoning": "test"})
+        print("   ", r.get("summary"))
+        assert r["success"] is False and r["status"] == "BATTLE_CHANGED", r
+        assert "SABLEYE" in r["error"] and "WHISMUR" in r["error"], r
+    assert _view(s)["menu"] == "action" and _view(s)["target"]["hp"] == 35, _view(s)
+    r = s.call("mcp_use_move", {"move": "SCRATCH", "seen_battle": seen, "reasoning": "test"})
+    assert r["success"] is True, r
+
+
+def test_use_move_waits_out_a_turn_then_refuses_if_a_new_pokemon_is_out():
+    """Seen live: use_move("HEADBUTT") for BRELOOM arrived while a turn was still playing;
+    BRELOOM fainted in it, ELECTRIKE was sent in, and the move was taken by its slot (2):
+    ELECTRIKE used THUNDER WAVE. RAM: SABLEYE at 1 HP vs Isaac's WHISMUR at 200 HP. A turn
+    is started by hand (FIGHT, a move), use_move is called while its text plays; WHISMUR
+    knocks SABLEYE out and the replacement comes in. SABLEYE's speed is set to 1 too, so
+    WHISMUR moves first in that turn (otherwise it can end with SABLEYE still in)."""
+    s = server()
+    s.load(ISAAC)
+    _poke(s, 16, 0x02024084 + 0x28, 1)
+    _poke(s, 16, 0x02024084 + 0x06, 1)
+    _poke(s, 16, FOE + 0x28, 200)
+    _poke(s, 16, FOE + 0x2C, 200)
+    s.srv.env.memory_reader._invalidate_mem_cache()
+    with s.srv.memory_lock:
+        before = s.srv.env.memory_reader.read_party_pokemon()
+    s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "test"})  # FIGHT
+    # SCRATCH (slot 2, RIGHT in the 2x2 grid); DOWN would be FAKE OUT, which goes first.
+    s.call("mcp_press_buttons", {"buttons": ["RIGHT", "A"], "reasoning": "test"})
+    assert _view(s)["menu"] == "busy", _view(s)["menu"]
+    r = s.call("mcp_use_move", {"move": "SCRATCH", "reasoning": "test"})
+    print("   ", r.get("summary"))
+    view = _view(s)
+    assert view is not None and str(view["player"]["name"]).upper() != "SABLEYE", view and view["player"]
+    assert r["success"] is False and r["status"] == "BATTLE_CHANGED", r
+    with s.srv.memory_lock:
+        after = s.srv.env.memory_reader.read_party_pokemon()
+    out = next(p for p in after if p.species_name.upper() == str(view["player"]["name"]).upper())
+    was = next(p for p in before if p.species_name == out.species_name)
+    assert out.move_pp == was.move_pp, (was.move_pp, out.move_pp)  # nothing used
+
+
 def _run_all():
     import test_movement_feedback as harness
 
