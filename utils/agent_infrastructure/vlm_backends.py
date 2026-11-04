@@ -2373,7 +2373,10 @@ def classify_gemini_error(exc: BaseException):
             delay = _duration_s(getattr(detail, "retry_delay", None)) if delay is None else delay
     if any("PerDay" in quota_id for quota_id in quota_ids):
         return GEMINI_DAILY, delay
-    if isinstance(exc, (gx.Unauthenticated, gx.PermissionDenied)) or "API_KEY_INVALID" in reasons:
+    if isinstance(exc, (gx.Unauthenticated, gx.PermissionDenied, gx.NotFound)) or "API_KEY_INVALID" in reasons:
+        # NotFound seen live with a new key (2026-11-04): "404 This model models/gemini-2.5-
+        # flash is no longer available to new users", though the model list names it. Like
+        # a bad key it won't fix itself.
         return GEMINI_AUTH, None
     if isinstance(exc, gx.ResourceExhausted) or getattr(exc, "code", None) == 429:
         return GEMINI_MINUTE, delay
@@ -2399,6 +2402,10 @@ class GeminiBackend(VLMBackend):
         # it raises (None = up to 5 tries, ~62 s). FallbackBackend sets it, then lets the
         # local model play that step.
         self.max_retry_wait_s = kwargs.get("max_retry_wait_s")
+        # Raise every error instead of the text-only retry and canned "press 'A'" reply.
+        # FallbackBackend sets it: seen in a live check (2026-11-04), a 404 for the model
+        # came back as that canned reply, which the fallback would have played as Gemini's.
+        self.raise_errors = bool(kwargs.get("raise_errors", False))
         self.api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
         if not self.api_key:
@@ -2713,7 +2720,7 @@ class GeminiBackend(VLMBackend):
 
         except Exception as e:
             logger.error(f"Error in Gemini image query: {e}")
-            if classify_gemini_error(e)[0] is not None:
+            if self.raise_errors or classify_gemini_error(e)[0] is not None:
                 # A quota, key or server problem hits a text-only call the same way, and
                 # get_text_query would hide it behind a canned reply: the caller
                 # (FallbackBackend) needs the error itself.
@@ -2830,7 +2837,7 @@ class GeminiBackend(VLMBackend):
 
         except Exception as e:
             logger.error(f"Error in Gemini text query: {e}")
-            if classify_gemini_error(e)[0] is not None:
+            if self.raise_errors or classify_gemini_error(e)[0] is not None:
                 raise  # a quota, key or server problem: not a reply to act on (see get_query)
             # Return a safe default response
             logger.warning(f"[{module_name}] Returning default response due to error: {e}")
@@ -2891,7 +2898,7 @@ class FallbackBackend(VLMBackend):
         try:
             self.primary = GeminiBackend(
                 self.primary_model, tools=tools, system_instruction=system_instruction,
-                max_retry_wait_s=FALLBACK_MAX_PRIMARY_WAIT_S,
+                max_retry_wait_s=FALLBACK_MAX_PRIMARY_WAIT_S, raise_errors=True,
             )
             self.current_model = self.primary_model
         except Exception as e:  # e.g. the Google client missing: play on locally
@@ -2933,9 +2940,11 @@ class FallbackBackend(VLMBackend):
                     )
                 elif kind == GEMINI_AUTH:
                     self.on_secondary_until = float("inf")
+                    # The error's first sentence says which: the key, or the model (NotFound).
+                    first = str(getattr(e, "message", "") or e).split(". ")[0][:160]
                     self._announce(
-                        f"Switched to {self.secondary_model} for this run: Gemini rejected the API key "
-                        f"({type(e).__name__}); check GEMINI_API_KEY"
+                        f"Switched to {self.secondary_model} for this run: Gemini refused {self.primary_model} "
+                        f"({type(e).__name__}: {first}); check GEMINI_API_KEY and GEMINI_MODEL"
                     )
                 elif kind in (GEMINI_MINUTE, GEMINI_TRANSIENT):
                     logger.warning(

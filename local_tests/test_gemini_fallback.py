@@ -80,10 +80,11 @@ def test_the_reset_is_the_next_midnight_pacific():
 # -- GeminiBackend's own retries ------------------------------------------------------
 
 
-def _gemini(errors, cap=None):
+def _gemini(errors, cap=None, raise_errors=False):
     """A GeminiBackend without the network: its model raises `errors` in turn, then answers."""
     backend = object.__new__(vb.GeminiBackend)
     backend.model_name, backend.tools, backend.max_retry_wait_s = "gemini-2.5-flash", [], cap
+    backend.raise_errors = raise_errors
     queue = list(errors)
     calls = []
 
@@ -224,9 +225,32 @@ def test_a_rejected_key_switches_for_the_whole_run():
     backend, said = _fallback()
     backend.primary.errors.append(_bad_key())
     assert backend.get_query(None, "x").startswith("qwen3-vl")
-    assert said and "rejected the API key" in said[0] and "test-key" not in said[0], said
+    assert said and "Gemini refused gemini-2.5-flash (InvalidArgument: API key not valid)" in said[0], said
+    assert "test-key" not in said[0], said
     with mock.patch.object(vb.time, "time", return_value=4_000_000_000):  # long after any reset
         backend.get_query(None, "y")
+
+
+def test_a_model_this_key_cannot_use_switches_for_the_whole_run():
+    """Seen in the live check (2026-11-04) with David's new key: "404 This model
+    models/gemini-2.5-flash is no longer available to new users", though the model list
+    named it. The old path turned it into the canned "press 'A'" reply; under the
+    fallback Gemini raises every error (raise_errors) and a 404 means the local model."""
+    error = gx.NotFound("This model models/gemini-2.5-flash is no longer available to new users. Please update")
+    assert vb.classify_gemini_error(error)[0] == vb.GEMINI_AUTH
+    backend, said = _fallback()
+    assert backend.primary.kwargs["raise_errors"] is True
+    backend.primary.errors.append(error)
+    assert backend.get_query(None, "x").startswith("qwen3-vl")
+    assert said and "no longer available to new users" in said[0] and backend.on_secondary_until == float("inf"), said
+    # The real GeminiBackend with raise_errors: any error comes out, never the canned reply.
+    gemini, calls = _gemini([gx.InvalidArgument("a schema problem")], raise_errors=True)
+    try:
+        gemini.get_query(Image.new("RGB", (240, 160)), "p", "test")
+        raise AssertionError("expected InvalidArgument")
+    except gx.InvalidArgument:
+        pass
+    assert len(calls) == 1
     assert backend.primary.calls == 1
 
 
