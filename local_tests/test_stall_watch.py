@@ -141,6 +141,50 @@ def test_a_long_train_call_is_progress():
     assert stall_reason(quick).startswith("SAME_TILE"), stall_reason(quick)
 
 
+def _bounce_rows(minutes):
+    """The live rows of 12:40-12:54 UTC: go_to_exit("west") from ROUTE 111 (0,66),
+    go_to_exit("north edge of the map") and go_to("Route 113") from ROUTE 112 (39,46),
+    in turn, about 40 s apart."""
+    from datetime import datetime, timedelta
+
+    calls = [
+        ("go_to_exit", {"exit": "west"}, "ROUTE 111", (0, 66)),
+        ("go_to_exit", {"exit": "north edge of the map"}, "ROUTE 112", (39, 46)),
+        ("go_to", {"place": "Route 113"}, "ROUTE 112", (39, 46)),
+    ]
+    start = datetime(2026, 11, 4, 12, 40, 12)
+    rows = []
+    for i in range(int(minutes * 60 / 40) + 1):
+        tool, args, loc, xy = calls[i % 3]
+        row = _row(tool, args, loc=loc, xy=xy, ts=(start + timedelta(seconds=40 * i)).isoformat())
+        row["llm_prompt"] = "=== PARTY STATUS ===\n  1. Breloom (Lv.27) HP: 72/75 Status: OK\n"
+        row["outcome"] = {"success": True, "objectives_completed": []}
+        rows.append(row)
+    return rows
+
+
+def test_going_back_and_forth_between_two_maps_is_a_stall():
+    """Seen live 12:40-12:54 UTC: three calls in turn bounced the player between ROUTE 111
+    and ROUTE 112 with the story objective unchanged. Each call changed the tile, so no
+    other check fired."""
+    rows = _bounce_rows(6)
+    why = stall_reason(rows)
+    assert why.startswith("WANDER: ") and "ROUTE 111 → ROUTE 112 → ROUTE 111" in why, why
+    assert stall_reason(_bounce_rows(4)) == ""  # not five minutes yet
+    # An objective completed, or a party that changed (a fight, a heal): something happened.
+    done = _bounce_rows(6)
+    done[-3]["outcome"]["objectives_completed"] = ["story_route_112"]
+    assert stall_reason(done) == ""
+    fought = _bounce_rows(6)
+    fought[-2]["llm_prompt"] = "=== PARTY STATUS ===\n  1. Breloom (Lv.27) HP: 40/75 Status: OK\n"
+    assert stall_reason(fought) == ""
+    # Travel through maps without coming back is not wandering.
+    trip = _bounce_rows(6)
+    for i, row in enumerate(trip):
+        row["location"] = ("ROUTE 111", "ROUTE 112", "FIERY PATH")[min(i // 4, 2)]
+    assert stall_reason(trip) == "", stall_reason(trip)
+
+
 def test_the_same_call_four_times_is_a_stall():
     rows = [_row("press_buttons", {"buttons": ["A"]}, xy=(9, 7)) for _ in range(4)]
     assert stall_reason(rows).startswith('REPEAT: press_buttons({"buttons": ["A"]}) 4 times in a row')

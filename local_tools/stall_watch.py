@@ -14,6 +14,8 @@ Stuck means any of:
   - CYCLE: the last 6 calls repeat a 2- or 3-call pattern while nothing changes;
   - NO_PROGRESS: 8 decisions in a row with nothing changing (tile, battle and party
     lines of the prompt);
+  - WANDER: 5 minutes among 2 or 3 maps, going back to one already left, with no
+    objective completed and the party unchanged;
   - DOWN: the game server did not answer 3 polls in a row.
 
   python3 local_tools/stall_watch.py [--interval 15] [--no-pause]
@@ -32,6 +34,9 @@ SAME_TILE_RUN = 3
 REPEAT_RUN = 4
 CYCLE_RUN = 6
 NO_PROGRESS_RUN = 8
+WANDER_S = 300.0
+WANDER_MAPS = 3
+WANDER_RETURNS = 2
 DOWN_RUN = 3
 
 
@@ -46,7 +51,7 @@ def _post(path: str, body: dict):
         return json.loads(r.read().decode())
 
 
-def _latest_decisions(limit: int = 12) -> list:
+def _latest_decisions(limit: int = 30) -> list:
     """The newest run's last decisions, oldest first (one run dir per server start)."""
     runs = sorted(REPO.glob(".pokeagent_cache/*_ai-local-*/trajectory_history.jsonl"), key=lambda p: p.stat().st_mtime)
     if not runs:
@@ -135,7 +140,60 @@ def stall_reason(rows: list) -> str:
     if len(tail) == NO_PROGRESS_RUN and _unchanged(tail):
         loc, xy = _spot(tail[-1])
         return f"NO_PROGRESS: {NO_PROGRESS_RUN} decisions at {xy} on {loc} with no change to the battle or party"
-    return ""
+    return _wander_reason(rows)
+
+
+def _time(row: dict):
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(row["timestamp"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _party(row: dict):
+    """The prompt's party lines ("1. Breloom (Lv.27) HP: 72/75"), or None without a prompt."""
+    prompt = row.get("llm_prompt")
+    if not prompt:
+        return None
+    return tuple(
+        s for s in (line.strip() for line in str(prompt).splitlines())
+        if s[:1].isdigit() and ". " in s[:4] and "(Lv." in s and "HP" in s
+    )
+
+
+def _wander_reason(rows: list) -> str:
+    """WANDER, or ''.
+
+    Seen live 12:48-12:54 UTC: go_to, go_to_exit("west"), go_to_exit("north") in turn,
+    three times, bouncing between ROUTE 111 and ROUTE 112 with the story objective
+    unchanged. Every call changed the tile, so SAME_TILE, CYCLE and NO_PROGRESS stayed
+    quiet. A party that changed (a fight, a heal, a level) is something happening, a
+    trip through a map without coming back to it is travel, and one return is an errand
+    (into the Mart and out): it takes WANDER_RETURNS returns.
+    """
+    newest = _time(rows[-1]) if rows else None
+    if newest is None:
+        return ""
+    old = [i for i, r in enumerate(rows) if _time(r) is not None and (newest - _time(r)).total_seconds() >= WANDER_S]
+    if not old:
+        return ""  # the rows don't reach back far enough to judge
+    window = rows[old[-1]:]
+    if any((r.get("outcome") or {}).get("objectives_completed") for r in window):
+        return ""
+    parties = [_party(r) for r in window]
+    if any(p is None or p != parties[0] for p in parties):
+        return ""
+    visits = []
+    for r in window:
+        if r.get("location") and (not visits or visits[-1] != r.get("location")):
+            visits.append(r.get("location"))
+    maps = list(dict.fromkeys(visits))
+    if not 2 <= len(maps) <= WANDER_MAPS or len(visits) - len(maps) < WANDER_RETURNS:
+        return ""
+    minutes = (newest - _time(window[0])).total_seconds() / 60
+    return f"WANDER: {minutes:.0f} min going {' → '.join(visits)} with no objective completed"
 
 
 def _fingerprint(row: dict):
