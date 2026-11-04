@@ -1415,6 +1415,17 @@ prompt. That came to 1.1 tiles walked per minute.
   0 → 1, ~90 s of text) and go_to_exit("ROUTE 114") walks back over the bridge; with the
   old pathfinder the walk stopped at (22,18). Each new test fails on the old code.
 
+## Talking to someone who is not a trainer says so (2026-11-04, WEAKNESSES M58)
+- Seen live on MT CHIMNEY: A pressed eight times at a Magma grunt who only repeats one
+  line, with the objective "Battle through Team Magma Grunts".
+- `_not_a_trainer_note` (added to auto_advance_dialogue's summary when the box closes
+  with no battle): on a map with unbeaten trainers, if the faced tile isn't one, it says
+  so, says when the same words came last time too, and names the nearest three
+  unbeaten trainers with their talk_to calls.
+- *Verified:* live save test_mt_chimney_busy_grunt.state: A twice at (23,17) gives the
+  note, then the "only repeats" form, naming SHIRLEY, SHELBY and GRUNT (9,16); the old
+  code says only "The text box closed."
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

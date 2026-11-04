@@ -161,6 +161,26 @@ def test_talk_to_walks_up_faces_and_starts_the_battle():
     assert r["success"] is False and "x and y are required" in r["error"], r
 
 
+def test_talking_to_someone_who_is_not_a_trainer_names_the_trainers_left():
+    """Seen live on MT CHIMNEY (23,16), 14:52-14:57 UTC: objective "Battle through Team
+    Magma Grunts"; the grunt at (23,17) only says "METEORITES pack amazing power!", and the
+    model pressed A at him eight times while the real trainers stood at (13,16) and
+    (9,16). The read now says he isn't one and names who is; the second time, that he
+    only repeats himself. test_mt_chimney_busy_grunt.state is a live save facing him."""
+    s = server()
+    s.load(HERE / "test_mt_chimney_busy_grunt.state", wild_encounters=False)
+    said = []
+    for _ in range(2):
+        s.call("mcp_press_buttons", {"buttons": ["A"], "reasoning": "test"})
+        r = s.call("mcp_auto_advance_dialogue", {})
+        print("   ", r.get("summary"))
+        assert not _in_battle(s)
+        said.append(r["summary"])
+    assert "The person at (23,17) is not a trainer to battle." in said[0], said[0]
+    assert "Trainers still to battle on this map:" in said[0] and "talk_to(9, 16)" in said[0], said[0]
+    assert "talking to them again only repeats the same words" in said[1], said[1]
+
+
 def test_a_trainer_who_spots_the_player_on_the_way_is_reported_as_a_battle():
     """Seen live: walking to Verdanturf's Pokémon Center to restore BRELOOM's PP, a trainer
     spotted the player; the walk reported "something has the player's attention on the

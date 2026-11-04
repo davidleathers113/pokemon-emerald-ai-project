@@ -4731,6 +4731,49 @@ async def _auto_advance_battle_text() -> Optional[Dict[str, Any]]:
     }
 
 
+# (map name, tile talked to) -> the lines read there last time (_not_a_trainer_note).
+_last_talk: Dict[Tuple[str, Tuple[int, int]], Tuple[str, ...]] = {}
+NOT_A_TRAINER_NAMES = 3
+
+
+def _not_a_trainer_note(texts: List[str]) -> str:
+    """After talk that ended without a battle, on a map with trainers still to beat:
+    say the person faced is not one of them, and name the nearest who are.
+
+    Seen live on MT CHIMNEY (23,16), 14:52-14:57 UTC: objective "Battle through Team
+    Magma Grunts", a Magma grunt at (23,17) who only says "METEORITES pack amazing
+    power!", and the model pressed A at him eight times ("grunt next to me → A to
+    battle") while the real trainers stood at (13,16) and (9,16). Every result only said
+    the text box had closed.
+    """
+    from server.field_control import DIRECTION_DELTAS
+    from utils.mapping.porymap_state import _map_trainers
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    snap = _field_snapshot()
+    location = _location_name()
+    map_dir = ROM_TO_PORYMAP_MAP.get(location, "")
+    if snap is None or not map_dir or not texts or snap.facing not in DIRECTION_DELTAS:
+        return ""
+    dx, dy = DIRECTION_DELTAS[snap.facing]
+    faced = (snap.x + dx, snap.y + dy)
+    with memory_lock:
+        left = [
+            (x, y, name) for x, y, name, trainer_id in _map_trainers(map_dir)
+            if not env.memory_reader._is_event_flag_set(_TRAINER_FLAGS_START + trainer_id)
+        ]
+    if not left or any((x, y) == faced for x, y, _ in left):
+        return ""
+    said = tuple(texts)
+    again = _last_talk.get((location, faced)) == said
+    _last_talk[(location, faced)] = said
+    left.sort(key=lambda t: abs(t[0] - snap.x) + abs(t[1] - snap.y))
+    names = "; ".join(f"{name} at ({x},{y}): talk_to({x}, {y})" for x, y, name in left[:NOT_A_TRAINER_NAMES])
+    head = f"The person at ({faced[0]},{faced[1]}) is not a trainer to battle"
+    head += ": talking to them again only repeats the same words." if again else "."
+    return f"{head} Trainers still to battle on this map: {names}."
+
+
 @app.post("/mcp/auto_advance_dialogue")
 async def mcp_auto_advance_dialogue(request: dict = None):
     """Harness step (not a model tool): press A through a plain text box.
@@ -4743,6 +4786,7 @@ async def mcp_auto_advance_dialogue(request: dict = None):
     from server.field_control import (
         DIALOGUE_BUSY,
         DIALOGUE_CHOICE,
+        DIALOGUE_NONE,
         DIALOGUE_OTHER,
         DIALOGUE_PLAIN,
         auto_advance_dialogue,
@@ -4819,6 +4863,14 @@ async def mcp_auto_advance_dialogue(request: dict = None):
         response["presses"] += battle["presses"]
         response["texts"] = battle["texts"] + response["texts"]
         response["summary"] = f"{battle['summary']} Then: {response['summary']}"
+    elif result.final_status == DIALOGUE_NONE and not _mem(lambda r: r.is_in_battle()):
+        try:
+            note = _not_a_trainer_note(result.texts)
+        except Exception as e:  # a hint must never break the read
+            logger.warning(f"not-a-trainer note failed: {e}")
+            note = ""
+        if note:
+            response["summary"] += f" {note}"
     return response
 
 
