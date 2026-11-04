@@ -4875,6 +4875,16 @@ async def mcp_use_move(request: dict):
         if move["pp"] == 0:
             message = f"{move['name']} has no PP left. Your moves: {listing}."
             return {"success": False, "error": message, "summary": message}
+        with memory_lock:
+            useless = env.memory_reader.status_move_failure(move["id"], view.get("target"))
+        if useless:
+            hint = view.get("switch_hint")
+            instead = (
+                f'Use a damaging move, or switch_pokemon("{hint["name"]}").' if hint
+                else "Use a damaging move, switch Pokémon, or run."
+            )
+            message = f"Not using {move['name']}: {useless}. {instead} Your moves: {listing}."
+            return {"success": False, "error": message, "summary": message}
 
         from server import menu_state as ms
 
@@ -5548,19 +5558,8 @@ async def _shift_from_party_menu(personality: int, name: str, source: str) -> Op
 
 
 def _counter_score(reader, mon, foe_types: List[int]) -> float:
-    """How well a party Pokémon matches up against a foe of these types: its best damaging
-    move's multiplier (with STAB) divided by the foe's worst threat to it, both from the
-    ROM type chart (the foe's own types stand in for its moves)."""
-    own_types = [t for t in (getattr(mon.type1, "value", mon.type1), getattr(mon.type2, "value", mon.type2)) if t is not None]
-    offence = 0.0
-    for move, pp in zip(mon.moves or [], mon.move_pp or []):
-        info = reader.move_type_and_power(move) if move and pp else None
-        if not info or not info[1]:
-            continue
-        move_type, _ = info
-        offence = max(offence, reader.type_effectiveness(move_type, foe_types) * (1.5 if move_type in own_types else 1.0))
-    threat = max((reader.type_effectiveness(t, own_types) for t in dict.fromkeys(foe_types)), default=1.0)
-    return offence / max(threat, 0.25)
+    """reader.counter_score: the battle view uses the same score for its switch hint."""
+    return reader.counter_score(mon, foe_types)
 
 
 # Only switch when the counter is clearly better than the Pokémon already out.
@@ -6337,6 +6336,9 @@ def _field_refusal(tool: str) -> Optional[Dict[str, Any]]:
 
 
 HEAL_TRIP_MAX_MAPS = 10
+# _walk_along: scripted scenes (a trainer spotting the player) waited out, each up to
+# MACRO_TEXT_FRAMES, before the walk reports that something has the player's attention.
+WALK_SCENE_WAITS = 3
 
 
 async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]]:
@@ -6372,7 +6374,7 @@ async def _walk_along(
     from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
 
     entered: List[str] = []
-    reads = 0
+    reads = waits = 0
     for _ in range(max_maps * 3):
         if _mem(lambda r: r.is_in_battle()):
             view = _read_battle_view()
@@ -6390,6 +6392,21 @@ async def _walk_along(
                 reads += 1
                 await _read_dialogue()
                 continue
+            # A trainer who spots the player: the "!", the walk up and their line play as
+            # a script the field status reads as neither plain nor busy text, and the
+            # battle starts by itself ~2 s later. Seen live (Breeder Isaac, ROUTE 117):
+            # the walk gave up at once with "something has the player's attention", and
+            # the model fought him with a BRELOOM it had been on its way to heal.
+            if waits < WALK_SCENE_WAITS:
+                waits += 1
+                settled = await _await_game(
+                    lambda: _mem(lambda r: r.is_in_battle())
+                    or _player_can_walk()
+                    or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY),
+                    MACRO_TEXT_FRAMES,
+                )
+                if settled:
+                    continue
             return entered, f"something has the player's attention on the way{_screen_note()}"
         snap = _field_snapshot()
         location = _location_name()

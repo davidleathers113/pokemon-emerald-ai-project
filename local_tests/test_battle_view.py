@@ -195,6 +195,68 @@ def test_use_move_refuses_outside_a_battle():
     assert r["success"] is False and "No battle is going on" in r["error"], r
 
 
+ISAAC = HERE / "test_switch_question.state"  # SABLEYE out vs WHISMUR; COMBUSKEN, BRELOOM benched
+FOE = 0x02024084 + 0x58  # gBattleMons[1]
+
+
+def _poke(s, size, address, value):
+    with s.srv.memory_lock:
+        memory = s.srv.env.core.memory
+        {8: memory.u8, 16: memory.u16, 32: memory.u32}[size][address] = value
+        s.srv.env.memory_reader._invalidate_mem_cache()
+
+
+def test_no_damaging_pp_names_the_switch():
+    """Seen live: BRELOOM's three attacks were at 0 PP; the view said "switch Pokémon, use
+    an item, or run", and the model used LEECH SEED five times instead. RAM: SABLEYE's
+    damaging moves at 0 PP."""
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(ISAAC)
+    for m in _view(s)["moves"]:
+        if m["power"]:
+            _poke(s, 8, PLAYER_PP + m["slot"] - 1, 0)
+    view = _view(s)
+    lines = format_battle_view(view)
+    print("    " + "\n    ".join(lines))
+    assert view["best_move"] is None and view["switch_hint"]["name"] in ("COMBUSKEN", "BRELOOM"), view["switch_hint"]
+    name = view["switch_hint"]["name"]
+    assert any(f'No damaging move with PP left: call switch_pokemon("{name}")' in line for line in lines), lines
+    # With damaging PP there is no switch hint.
+    s.load(ISAAC)
+    assert _view(s)["switch_hint"] is None
+
+
+def test_use_move_refuses_a_status_move_that_cannot_work():
+    """Seen live: LEECH SEED on a WINGULL already seeded, five times, each "missed". RAM
+    writes put a status move in SABLEYE's slot 1 and change the foe (pret Cmd_setseeded,
+    Cmd_trysetsleep family)."""
+    from pokemon_env.enums import Move
+
+    s = server()
+    cases = [
+        ("LEECH_SEED", lambda: _poke(s, 32, 0x020242AC + 4, 1 << 2), "already seeded"),  # gStatuses3[1]
+        ("LEECH_SEED", lambda: (_poke(s, 8, FOE + 0x21, 12), _poke(s, 8, FOE + 0x22, 12)), "Grass type"),
+        ("THUNDER_WAVE", lambda: (_poke(s, 8, FOE + 0x21, 4), _poke(s, 8, FOE + 0x22, 4)), "immune to Electric"),
+        ("HYPNOSIS", lambda: _poke(s, 32, FOE + 0x4C, 2), "already has SLEEP"),  # status1: asleep
+        ("TOXIC", lambda: (_poke(s, 8, FOE + 0x21, 8), _poke(s, 8, FOE + 0x22, 8)), "can't be poisoned"),
+    ]
+    for move, change_foe, why in cases:
+        s.load(ISAAC)
+        _poke(s, 16, 0x02024084 + 0x0C, Move[move].value)  # gBattleMons[0].moves[0]
+        _poke(s, 8, PLAYER_PP, 10)
+        name = move.replace("_", " ")
+        with s.srv.memory_lock:
+            assert s.srv.env.memory_reader.status_move_failure(Move[move].value, _view(s)["target"]) is None, move
+        change_foe()
+        menu_before = _view(s)["menu"]
+        r = s.call("mcp_use_move", {"move": name, "reasoning": "test"})
+        print("   ", r.get("error"))
+        assert r["success"] is False and f"Not using {name}" in r["error"] and why in r["error"], r
+        assert _view(s)["menu"] == menu_before  # nothing pressed
+
+
 def _run_all():
     import test_movement_feedback as harness
 

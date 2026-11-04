@@ -62,6 +62,19 @@ TEAM_LOW_HP_SHARE = 0.5
 # At a quarter of base PP the lead has only a few attacks left (EMBER 25 -> 6).
 TEAM_LOW_PP_SHARE = 0.25
 
+# Status moves that can't work (status_move_failure). pret include/constants/
+# battle_move_effects.h, include/constants/battle.h; gStatuses3 from pret's symbols
+# (US Emerald, the same map that gives gBattleMons 0x02024084).
+G_STATUSES3 = 0x020242AC
+STATUS3_LEECHSEED = 1 << 2
+EFFECT_SLEEP = 1
+EFFECT_TOXIC = 33
+EFFECT_POISON = 66
+EFFECT_PARALYZE = 67
+EFFECT_LEECH_SEED = 84
+EFFECT_WILL_O_WISP = 167
+EFFECTS_MAJOR_STATUS = (EFFECT_SLEEP, EFFECT_TOXIC, EFFECT_POISON, EFFECT_PARALYZE, EFFECT_WILL_O_WISP)
+
 
 def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]:
     """Is the team too worn down to fight a trainer? Eggs are ignored.
@@ -1511,6 +1524,88 @@ class PokemonEmeraldReader:
         data = self._rom_battle_move(move_id)
         return data["type"], data["power"]
 
+    def counter_score(self, mon: PokemonData, foe_types: List[int]) -> float:
+        """How well a party Pokémon matches up against a foe of these types: its best
+        damaging move with PP left (multiplier, with STAB) divided by the foe's worst
+        threat to it, both from the ROM type chart (the foe's own types stand in for its
+        moves). 0 when it has no damaging move with PP."""
+        own_types = [
+            t for t in (getattr(mon.type1, "value", mon.type1), getattr(mon.type2, "value", mon.type2)) if t is not None
+        ]
+        offence = 0.0
+        for move, pp in zip(mon.moves or [], mon.move_pp or []):
+            info = self.move_type_and_power(move) if move and pp else None
+            if not info or not info[1]:
+                continue
+            move_type, _ = info
+            offence = max(offence, self.type_effectiveness(move_type, foe_types) * (1.5 if move_type in own_types else 1.0))
+        threat = max((self.type_effectiveness(t, own_types) for t in dict.fromkeys(foe_types)), default=1.0)
+        return offence / max(threat, 0.25)
+
+    def status_move_failure(self, move_id: int, target: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Why a status move would fail on this target (a battle-view target dict), or None.
+
+        Seen live: BRELOOM, out of damaging PP, used LEECH SEED on a WINGULL that was
+        already seeded five times; every one "missed". The rules are pret's:
+        Cmd_setseeded (seeded already, or a Grass type), and the Cmd_trysetsleep /
+        setpoison / setparalyze / setburn family (one major status at a time; Poison and
+        Steel types can't be poisoned, Fire types can't be burned, and Thunder Wave is
+        Electric, so Ground types are immune through the type chart).
+        """
+        if not target:
+            return None
+        data = self._rom_battle_move(move_id)
+        if data["power"]:
+            return None
+        effect, types = data["effect"], set(target.get("type_ids") or [])
+        foe = str(target.get("name", "the foe")).upper()
+        if effect == EFFECT_LEECH_SEED:
+            statuses3 = self._read_u32(G_STATUSES3 + 4 * int(target.get("battler", 1)))
+            if statuses3 & STATUS3_LEECHSEED:
+                return f"{foe} is already seeded: LEECH SEED misses until it switches out"
+            if PokemonType.GRASS.value in types:
+                return f"{foe} is a Grass type: LEECH SEED can't seed it"
+        if effect in EFFECTS_MAJOR_STATUS:
+            status = str(target.get("status", "OK"))
+            if status != "OK":
+                return f"{foe} already has {status}: it can't get another major status"
+            poisons = effect in (EFFECT_POISON, EFFECT_TOXIC)
+            if poisons and types & {PokemonType.POISON.value, PokemonType.STEEL.value}:
+                return f"{foe} is a Poison or Steel type: it can't be poisoned"
+            if effect == EFFECT_WILL_O_WISP and PokemonType.FIRE.value in types:
+                return f"{foe} is a Fire type: it can't be burned"
+            if data["type"] == PokemonType.ELECTRIC.value and self.type_effectiveness(data["type"], list(types)) == 0:
+                return f"{foe} is immune to Electric moves"
+        return None
+
+    def _switch_hint(self, target: Optional[Dict[str, Any]], player_battlers: List[int]) -> Optional[Dict[str, Any]]:
+        """The party Pokémon to send in when the one battling has no damaging move with PP:
+        able to fight (HP > 0, not an Egg), not the one out, with a damaging move with PP,
+        the best counter_score against the target. None if nobody qualifies.
+
+        Seen live: BRELOOM's three attacks were at 0 PP; the view said only "switch
+        Pokémon", and the model used LEECH SEED on an already seeded WINGULL 5 times.
+        """
+        party = self.read_party_pokemon() or []
+        # struct BattlePokemon +0x48 personality: the player's Pokémon out now (2 in doubles).
+        out = {
+            self._read_u32(self.addresses.BATTLE_MONS + b * self.addresses.BATTLE_MON_SIZE + 0x48)
+            for b in player_battlers
+        }
+        foe_types = (target or {}).get("type_ids") or []
+        best = None
+        for index, mon in enumerate(party):
+            personality = self._read_u32(self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE)
+            if mon.is_egg or mon.current_hp == 0 or personality in out:
+                continue
+            score = self.counter_score(mon, foe_types) if foe_types else 0.0
+            has_attack = any(
+                pp and (self.move_type_and_power(move) or (0, 0))[1] for move, pp in zip(mon.moves or [], mon.move_pp or [])
+            )
+            if has_attack and (best is None or score > best["score"]):
+                best = {"slot": index + 1, "name": mon.species_name.upper(), "score": score}
+        return best
+
     def species_family(self, name: str) -> List[str]:
         """'SHROOMISH' -> ['SHROOMISH', 'BRELOOM']: the species and every form it evolves
         into, upper-case, from the ROM's gSpeciesNames and gEvolutionTable (cached).
@@ -1644,6 +1739,7 @@ class PokemonEmeraldReader:
                 })
         scored = [m for m in moves if m["expected"] > 0]
         best = max(scored, key=lambda m: (m["expected"], -m["slot"])) if scored else None
+        switch_hint = self._switch_hint(target, player_battlers) if moves and best is None else None
 
         action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3
         return {
@@ -1660,6 +1756,7 @@ class PokemonEmeraldReader:
             "target": target,
             "moves": moves,
             "best_move": best,
+            "switch_hint": switch_hint,
         }
 
     def read_team_condition(self, lead_index: Optional[int] = None) -> Dict[str, Any]:

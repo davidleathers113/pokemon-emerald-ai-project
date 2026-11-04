@@ -1156,6 +1156,27 @@ prompt. That came to 1.1 tiles walked per minute.
   the ordering off it lands at (0,6). `test_train_only_picks_grass_it_can_walk_to`: with
   the path check off the notch gets the six unreachable pairs from the live log.
 
+## No attacks left: name the switch, refuse useless status moves, heal walks past trainers (2026-11-04, WEAKNESSES M48, R21)
+- Seen live 06:32-06:35: TEAM IS WEAK (MACH PUNCH 0/30, HEADBUTT 0/15, MEGA DRAIN 0/10
+  PP) → heal_at_pokecenter → "Did not heal: something has the player's attention on the
+  way" (a trainer spotted the player) → in that battle BRELOOM used LEECH SEED five times
+  on a WINGULL already seeded.
+- `_walk_along` (go_to, heal_at_pokecenter) waits out a scripted scene up to
+  `WALK_SCENE_WAITS` times (`MACRO_TEXT_FRAMES` each) for a battle, plain text or walking
+  control; a trainer's spotting then reports "a trainer battle started on the way".
+- Battle view: with no damaging move with PP, `switch_hint` (memory_reader
+  `_switch_hint`) names the teammate to send in, by `counter_score` (moved from app.py,
+  same score as the counter-switch), among those able to fight with damaging PP; the line
+  reads `call switch_pokemon("COMBUSKEN")`.
+- use_move refuses a status move that can't work (`status_move_failure`): LEECH SEED on
+  a seeded foe (gStatuses3, STATUS3_LEECHSEED) or a Grass type; a sleep/poison/paralysis/
+  burn move on a foe with a major status; poison on Poison/Steel; burn on Fire; THUNDER
+  WAVE on Ground. Nothing is pressed; the refusal names the switch when there is one.
+- *Verified:* `test_a_trainer_who_spots_the_player_on_the_way_is_reported_as_a_battle`
+  (the old code returned the live message from the same fixture),
+  `test_no_damaging_pp_names_the_switch`, `test_use_move_refuses_a_status_move_that_cannot_work`
+  (five cases, RAM writes on test_switch_question.state).
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

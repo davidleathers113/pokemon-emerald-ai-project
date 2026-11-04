@@ -159,6 +159,22 @@ def test_talk_to_walks_up_faces_and_starts_the_battle():
     assert r["success"] is False and "x and y are required" in r["error"], r
 
 
+def test_a_trainer_who_spots_the_player_on_the_way_is_reported_as_a_battle():
+    """Seen live: walking to Verdanturf's Pokémon Center to restore BRELOOM's PP, a trainer
+    spotted the player; the walk reported "something has the player's attention on the
+    way", and the model fought him with no damaging PP. The spotting scene ("!", the walk
+    up, "Listen, could I get you to battle…") reads as neither plain nor busy text, and
+    the battle starts by itself ~2 s later. From test_route117_blocked.state the way west
+    passes Breeder Isaac."""
+    s = server()
+    s.load(HERE / "test_route117_blocked.state", wild_encounters=False)
+    r = s.call("mcp_go_to", {"place": "Verdanturf Town", "reasoning": "test"})
+    print("   ", r.get("error") or r.get("summary"))
+    assert r["success"] is False, r
+    assert "a trainer battle started on the way: fight it with use_move, then" in r["error"], r
+    assert _in_battle(s)
+
+
 def test_go_to_walks_map_after_map():
     """David (2026-11-04): "One call per objective." ROUTE 101 to OLDALE TOWN's Pokémon
     Center is a map edge and a door (wild grass on the way is run from); from inside

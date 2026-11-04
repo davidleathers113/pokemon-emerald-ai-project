@@ -395,6 +395,13 @@ def format_battle_view(view):
     best = view.get('best_move')
     if best:
         lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\").")
+    elif moves and view.get('switch_hint'):
+        # Seen live: with only "switch Pokémon" here, the model used LEECH SEED 5 times.
+        hint = view['switch_hint']
+        lines.append(
+            f"No damaging move with PP left: call switch_pokemon(\"{hint['name']}\") "
+            f"(slot {hint['slot']}, the best of the rest here). Status moves won't win this battle."
+        )
     elif moves:
         lines.append("No damaging move with PP left: switch Pokémon, use an item, or run.")
     player = view['player']
