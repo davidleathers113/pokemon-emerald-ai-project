@@ -1093,6 +1093,7 @@ def _judge_move(check: Dict[str, Any], after) -> None:
         }
         if report is not None:
             report["blocked"] = message
+            report["blocked_tile"] = (tx, ty)
             report["skipped"] = skipped
             if occupied:
                 report["blocked_by_person"] = (tx, ty)
@@ -4470,6 +4471,45 @@ async def _settle_after_sequence(before, report: Optional[Dict[str, Any]]) -> No
                 report["done"] = True  # the skipped presses were meant for the old map
 
 
+# Presses allowed for one field move: A on the obstacle, its text, YES, the user's line.
+CLEAR_OBSTACLE_PRESSES = 10
+
+
+async def _clear_obstacle(tile, source: str) -> Optional[str]:
+    """If the walk was stopped by a rock or tree the party can clear (game_tools.
+    clearable_obstacles), use the field move on it: the blocked press already turned the
+    player to face it, so A, through "Would you like to use ROCK SMASH?" (YES is the
+    cursor's default), the move's text and animation, until the tile is free and the
+    player can walk. Returns the move used, or None.
+
+    Seen live on ROUTE 111: the rocks at (19,100) and (18,101) were cleared by hand with
+    exactly these presses after every walk had refused to go near them.
+    """
+    from server import game_tools
+    from server.field_control import DIALOGUE_CHOICE, DIALOGUE_PLAIN, npc_at
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    if not tile:
+        return None
+    move = game_tools.clearable_obstacles(ROM_TO_PORYMAP_MAP.get(_location_name(), "")).get(tuple(tile))
+    if move is None:
+        return None
+    await _macro_press(["A"], source)
+    for _ in range(CLEAR_OBSTACLE_PRESSES):
+        await _await_game(
+            lambda: _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE) or _player_can_walk(), MACRO_TEXT_FRAMES
+        )
+        if _player_can_walk():
+            break
+        if _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE):
+            await _macro_press(["A"], source)  # the text, and YES at "Would you like to use …?"
+    # The object vanishes after the animation; give it a moment.
+    await _await_game(lambda: not _mem(lambda r: npc_at(r, tile[0], tile[1])), MACRO_MENU_FRAMES)
+    if _mem(lambda r: npc_at(r, tile[0], tile[1])) or not _player_can_walk():
+        return None
+    return move.replace("_", " ")
+
+
 @app.post("/mcp/go_to_exit")
 async def mcp_go_to_exit(request: dict):
     """MCP Tool: walk to one of the current map's exits (EXITS list) and through it."""
@@ -4494,8 +4534,9 @@ async def mcp_go_to_exit(request: dict):
         # when the map loaded, so a walk stopped by a person is replanned around the
         # tile they are on now (up to two more tries).
         avoid: List[Tuple[int, int]] = []
+        cleared: List[str] = []
         first_from = None
-        for _attempt in range(3):
+        for _attempt in range(5):
             def _plan():
                 with memory_lock:
                     return game_tools.plan_exit_route(env, exit_query, avoid=tuple(avoid))
@@ -4518,6 +4559,11 @@ async def mcp_go_to_exit(request: dict):
                 )
                 report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
             snap = await _await_map_change(before.map_id, 4.0 if plan["kind"] == "warp" else 1.5)
+            # A rock or tree on the way that the party can clear: clear it, plan again.
+            used = await _clear_obstacle((report or {}).get("blocked_tile"), "go_to_exit")
+            if used:
+                cleared.append(f"used {used} at {tuple(report['blocked_tile'])}")
+                continue
             person = (report or {}).get("blocked_by_person")
             if not person or snap is None or snap.map_id != before.map_id or tuple(person) in avoid:
                 break
@@ -4547,9 +4593,10 @@ async def mcp_go_to_exit(request: dict):
         location = _location_name()
         now = _position_text(snap, location)
         response = {"exit": plan["label"], "from": from_text, "now": now, "path_length": len(plan["buttons"])}
+        on_the_way = f" On the way: {'; '.join(cleared)}." if cleared else ""
         if snap is not None and snap.map_id != before.map_id:
             response["success"] = True
-            response["summary"] = f"Arrived: now at {now} (took exit: {plan['label']})."
+            response["summary"] = f"Arrived: now at {now} (took exit: {plan['label']}).{on_the_way}"
             return response
         response["success"] = False
         if report and (report.get("blocked") or report.get("interrupted")):
@@ -5056,10 +5103,25 @@ def _refusal(message: str, **extra) -> Dict[str, Any]:
     return result
 
 
+def _usable_field_moves() -> set:
+    """Field moves the party can use outside battle now (server.game_tools.
+    field_moves_reader): known by a party Pokémon, with the badge that allows it."""
+    from server import game_tools
+
+    with memory_lock:
+        reader = env.memory_reader
+        known = {m for p in reader.read_party_pokemon() or [] if not p.is_egg for m in p.moves}
+        return {
+            move for move, badge in game_tools.FIELD_MOVE_OBSTACLES.values()
+            if move in known and reader._is_event_flag_set(game_tools.FLAG_BADGE01_GET + badge - 1)
+        }
+
+
 def _install_route_flag_reader() -> None:
     from server import game_tools
 
     game_tools.flag_reader = _route_flag_reader
+    game_tools.field_moves_reader = _usable_field_moves
 
 
 _install_route_flag_reader()
@@ -7586,6 +7648,14 @@ async def mcp_navigate_to(request: dict):
             queued = await take_action(action_request)
             report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
             await _settle_after_sequence(before, report)
+            # A rock or tree the party can clear stopped the walk: clear it, walk on.
+            tile = (report or {}).get("blocked_tile")
+            cleared_before = int(request.get("_cleared", 0))
+            used = await _clear_obstacle(tile, "navigate_to") if cleared_before < 3 else None
+            if used:
+                again = await mcp_navigate_to({**request, "_cleared": cleared_before + 1})
+                again["summary"] = f"Used {used} at {tuple(tile)} on the way. {again.get('summary', '')}".strip()
+                return again
 
         response = {
             "success": True,

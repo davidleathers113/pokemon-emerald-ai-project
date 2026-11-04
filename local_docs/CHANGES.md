@@ -1336,6 +1336,31 @@ prompt. That came to 1.1 tiles walked per minute.
   COMBUSKEN untouched, the player can walk; refusals for "already knows", HM05 for the
   two Pokémon the ROM says are NOT ABLE (COMBUSKEN, MARILL), and a TM not in the bag.
 
+## Walks clear rocks and trees the party can (2026-11-04, WEAKNESSES R24)
+- Seen live on ROUTE 111: rocks at (19,100) and (18,101) on the only way north; HM06
+  taught and the Dynamo Badge, but every walk refused ("no walkable path"). The player
+  got through by hand: face the rock, A, YES.
+- `game_tools.FIELD_MOVE_OBSTACLES` (CUTTABLE_TREE: CUT + badge 1; BREAKABLE_ROCK: ROCK
+  SMASH + badge 3), `field_moves_reader` (installed by app.py: moves known by party
+  Pokémon whose badge flag is set; cached 1 s), `clearable_obstacles(map_dir)`.
+  `_obstacle_tiles` leaves them out, so `_route_areas`, `_walk_exits`, `place_route` and
+  the hints route through them; `load_pathfinding_state` passes them as porymap
+  `clearable`; `find_path` unblocks them and `_astar` charges `CLEARABLE_TILE_COST`.
+- The walk's per-press check now records `report["blocked_tile"]`. `_clear_obstacle`
+  (app.py): if that tile is clearable, A, presses through the text and YES, waits for
+  the object to vanish and the player to walk. navigate_to clears and walks on (up to 3
+  times, "Used ROCK SMASH at (x, y) on the way."); go_to_exit clears and replans (up to
+  5 tries in all), so go_to and heal walks get it too.
+- Boulders (STRENGTH) stay walls: pushing needs room behind, which a route can't promise.
+- Fixture `test_route111_rocks.state`: test_mauville_gym_live.state with the Dynamo Badge
+  flag (RAM), HM06 in the bag (RAM) taught by teach_move (it forgot COUNTER, the weakest),
+  go_to Route 111, navigate_to (19,103). The rocks' flags are FLAG_TEMP_*: they come back
+  each time the map loads.
+- *Verified:* `test_walks_smash_a_rock_the_party_can_clear`: navigate_to (19,99) uses
+  ROCK SMASH on (18,101) and arrives; the route areas join (19,103) and (19,99); with the
+  badge flag cleared (RAM) nothing is clearable, the areas are split and the walk stops
+  short.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

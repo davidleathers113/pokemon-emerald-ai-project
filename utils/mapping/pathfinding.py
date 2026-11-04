@@ -36,6 +36,9 @@ VARIANCE_TO_STEPS = {
 # well under a second per plain step, so a grass step is worth a detour of many tiles.
 # 8 detours freely but still walks into grass when it is the only way or the target.
 GRASS_TILE_COST_MULTIPLIER = 8.0
+# A rock or tree the party can clear (ROCK SMASH, CUT): walkable for the planner, but each
+# costs a stop, a question and an animation, so open ground is preferred when there is any.
+CLEARABLE_TILE_COST = 10.0
 
 
 @dataclass
@@ -325,6 +328,9 @@ class Pathfinder:
         # seen live in MAUVILLE CITY GYM, the walk to Wattson crossed two floor switches
         # that flipped the barriers back. When the only way is over one (a story scene to
         # walk into), it is walked over.
+        # Rocks and trees the party can clear are walkable here (they are objects, so they
+        # were blocked above); _astar charges CLEARABLE_TILE_COST for stepping on one.
+        blocked -= {tuple(t) for t in map_data.get("clearable") or []}
         triggers = {tuple(t) for t in map_data.get("triggers") or []} - {start, goal}
         result = self._astar(start, goal, blocked | triggers, map_data, max_distance) if triggers else None
         if result is None or isinstance(result, tuple):
@@ -406,6 +412,8 @@ class Pathfinder:
                     "raw_warps": porymap.get("raw_warps", []),
                     # Coord-event triggers that would fire now (game_tools.active_triggers).
                     "triggers": porymap.get("triggers", []),
+                    # Rocks/trees the party can clear (game_tools.clearable_obstacles).
+                    "clearable": porymap.get("clearable", []),
                 }
 
                 # Include raw tiles with elevation if available
@@ -1225,6 +1233,7 @@ class Pathfinder:
         """
         start_node = Node(start[0], start[1], 0, self._heuristic(start, goal))
         goal_node = Node(goal[0], goal[1])
+        clearable = {tuple(t) for t in map_data.get("clearable") or []}
 
         open_list = []
         heapq.heappush(open_list, start_node)
@@ -1281,6 +1290,8 @@ class Pathfinder:
                             cell = row[nx]
                             if cell == "~":  # Grass tile
                                 move_cost = self.grass_cost
+                if neighbor_pos in clearable:
+                    move_cost = CLEARABLE_TILE_COST
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)

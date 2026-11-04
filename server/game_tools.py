@@ -330,6 +330,9 @@ def load_pathfinding_state(env) -> tuple:
                         # Floor switches and scene triggers that would fire if stepped on:
                         # walks go round them unless that is the only way (find_path).
                         state["map"]["porymap"]["triggers"] = active_triggers(env, porymap_map_name)
+                        # Rocks and trees the party can clear: walkable for the planner
+                        # (at a cost), cleared by the walk when it bumps into one.
+                        state["map"]["porymap"]["clearable"] = list(clearable_obstacles(porymap_map_name))
                         state["map"]["porymap"]["raw_tiles"] = raw_tiles
 
                         # For selected dynamic maps (e.g. Mauville Gym), replace static
@@ -877,11 +880,65 @@ def first_visit_flag(target: str) -> Optional[int]:
     return None
 
 
+# Obstacles the party can clear on the walk: graphics -> (field move, badge number that
+# allows it outside battle). pret: Cut needs the Stone Badge (FLAG_BADGE01_GET), Rock
+# Smash the Dynamo Badge (FLAG_BADGE03_GET). Strength boulders are left out: pushing one
+# needs room behind it, which a route can't promise.
+FLAG_BADGE01_GET = 0x867  # include/constants/flags.h SYSTEM_FLAGS + 0x7
+FIELD_MOVE_OBSTACLES = {
+    "OBJ_EVENT_GFX_CUTTABLE_TREE": ("CUT", 1),
+    "OBJ_EVENT_GFX_BREAKABLE_ROCK": ("ROCK_SMASH", 3),
+}
+# () -> set of field moves usable now (known by a party Pokémon, badge set), installed by
+# the server. None: no obstacle is clearable.
+field_moves_reader = None
+
+
+_field_moves_cache: list = [0.0, set()]
+
+
+def _usable_field_moves() -> set:
+    """field_moves_reader's answer, kept for a second: a route search asks once per map."""
+    import time
+
+    if field_moves_reader is None:
+        return set()
+    if time.monotonic() - _field_moves_cache[0] < 1.0:
+        return _field_moves_cache[1]
+    try:
+        moves = set(field_moves_reader())
+    except Exception as e:  # unreadable party: treat obstacles as walls
+        logger.debug(f"field moves unreadable: {e}")
+        moves = set()
+    _field_moves_cache[:] = [time.monotonic(), moves]
+    return moves
+
+
+def clearable_obstacles(map_dir: str) -> dict:
+    """(x, y) -> field move for the map's rocks and trees the party can clear now.
+
+    Seen live: on ROUTE 111 the breakable rocks at (19,100) and (18,101) block the only way
+    north. With HM06 taught and the Dynamo Badge, go_to_exit("west") still said "no walkable
+    path": every obstacle was a wall until smashed, so no walk ever led to it.
+    """
+    usable = _usable_field_moves()
+    out = {}
+    for obj in _raw_map_json(map_dir).get("object_events") or []:
+        move = FIELD_MOVE_OBSTACLES.get(obj.get("graphics_id"), (None, 0))[0]
+        if move in usable:
+            out[(int(obj.get("x", -1)), int(obj.get("y", -1)))] = move
+    return out
+
+
 def _obstacle_tiles(map_dir: str) -> frozenset:
-    """Tiles holding an obstacle object that is still there (its hide flag not set)."""
+    """Tiles holding an obstacle object that is still there (its hide flag not set), less
+    the ones the party can clear now (clearable_obstacles: routes go through those)."""
     blocked = set()
+    usable = _usable_field_moves()
     for obj in _raw_map_json(map_dir).get("object_events") or []:
         if obj.get("graphics_id") not in _OBSTACLE_GRAPHICS:
+            continue
+        if FIELD_MOVE_OBSTACLES.get(obj.get("graphics_id"), (None, 0))[0] in usable:
             continue
         flag = _flag_ids().get(str(obj.get("flag", "")))
         if flag is not None and flag_reader is not None:

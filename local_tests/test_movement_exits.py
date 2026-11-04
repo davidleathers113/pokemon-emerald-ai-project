@@ -165,6 +165,44 @@ def test_an_edge_exit_never_lands_in_a_dead_end_pocket():
     assert r.get("status") == "DONE" and s.snapshot().x == snap.x + 1, r
 
 
+def test_walks_smash_a_rock_the_party_can_clear():
+    """Seen live on ROUTE 111: the breakable rocks at (19,100) and (18,101) block the only
+    way north; with HM06 taught and the Dynamo Badge, every walk still said "no walkable
+    path". test_route111_rocks.state: (19,103) below them, BRELOOM knows ROCK SMASH, the
+    Dynamo Badge set (made from test_mauville_gym_live.state with RAM and teach_move).
+    The rocks' hide flags are FLAG_TEMP_*: they come back each time the map loads."""
+    from server import game_tools
+
+    here = Path(__file__).resolve().parent
+    s = server()
+    s.load(here / "test_route111_rocks.state", wild_encounters=False)
+    with s.srv.memory_lock:
+        assert game_tools.clearable_obstacles("Route111") == {(18, 101): "ROCK_SMASH", (19, 100): "ROCK_SMASH"}
+        areas = game_tools._route_areas("Route111")  # what go_to_exit and go_to route with
+        assert areas[(19, 103)] == areas[(19, 99)], "the rocks should not split the route"
+    # (19,99): where the player stood live after smashing (19,100) by hand.
+    r = s.call("mcp_navigate_to", {"x": 19, "y": 99, "variance": "none", "reason": "north past the rocks"})
+    print("   ", r.get("summary"))
+    snap = s.snapshot()
+    assert (snap.x, snap.y) == (19, 99), (snap, r)
+    assert "Used ROCK SMASH at" in r["summary"], r
+    # Without the Dynamo Badge (RAM: FLAG_BADGE03_GET 0x869 cleared) the rocks are walls.
+    s.load(here / "test_route111_rocks.state", wild_encounters=False)
+    reader = s.srv.env.memory_reader
+    with s.srv.memory_lock:
+        addr = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR) + reader.addresses.SAVE_BLOCK1_FLAGS_OFFSET + 0x869 // 8
+        s.srv.env.core.memory.u8[addr] = reader._read_u8(addr) & ~(1 << (0x869 % 8))
+        reader._invalidate_mem_cache()
+    game_tools._field_moves_cache[0] = 0.0  # forget the cached answer
+    with s.srv.memory_lock:
+        assert game_tools.clearable_obstacles("Route111") == {}
+        areas = game_tools._route_areas("Route111")
+        assert areas[(19, 103)] != areas[(19, 99)], "without the badge the rocks are walls"
+    r = s.call("mcp_navigate_to", {"x": 19, "y": 99, "variance": "none", "reason": "north"})
+    snap = s.snapshot()
+    assert (snap.x, snap.y) != (19, 99), (snap, r)
+
+
 def test_walks_go_round_floor_switches():
     """Seen live in MAUVILLE CITY GYM: on the south-west switch (0,15) the barriers were
     open, then talk_to's walk to Wattson crossed the switches at (4,12) and (3,9) and
