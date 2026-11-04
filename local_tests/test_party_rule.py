@@ -176,6 +176,21 @@ def test_with_the_exp_share_the_weakest_holds_it_and_it_moves_when_that_changes(
     assert r["summary"] == "Exp. Share given to NUMEL (lowest level, Lv19), from AZUMARILL.", r
     assert held["NUMEL"] == ms.ITEM_EXP_SHARE and held["AZUMARILL"] == 0, held
     assert s.srv._player_can_walk()
+    # David (2026-11-04): "keep it on the current holder for ties". RAM: ELECTRIKE's level
+    # byte to 19, tied with NUMEL, and the share given to ELECTRIKE (give_item). The
+    # tie-break prefers NUMEL (more EXP still needed), yet ELECTRIKE keeps it: no menu trip.
+    electrike = _names(s).index("ELECTRIKE")
+    _write(s, 8, PARTY + electrike * 100 + 0x54, 19)
+    assert s.call("mcp_give_item", {"item": "EXP SHARE", "pokemon": "ELECTRIKE", "reasoning": "test"})["success"]
+    assert s.srv._party_rule_target(_party(s)) == _names(s).index("NUMEL"), "the tie-break names NUMEL"
+    r = _maintain(s)
+    held = {p.species_name.upper(): p.held_item for p in _party(s)}
+    assert r["changed"] is False and r["why"] == "ELECTRIKE keeps the Exp. Share: tied at the lowest level (Lv19)", r
+    assert held["ELECTRIKE"] == ms.ITEM_EXP_SHARE, held
+    # NUMEL strictly lower (RAM level byte 18): now it moves.
+    _write(s, 8, PARTY + _names(s).index("NUMEL") * 100 + 0x54, 18)
+    r = _maintain(s)
+    assert r["changed"] and r["summary"].startswith("Exp. Share given to NUMEL (lowest level, Lv18), from ELECTRIKE"), r
 
 
 def test_give_item_swaps_what_the_pokemon_held_back_into_the_bag():

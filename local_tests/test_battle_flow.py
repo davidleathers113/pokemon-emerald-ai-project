@@ -302,6 +302,20 @@ def test_switch_pokemon_works_in_the_replacement_menu():
     assert _view(s)["player"]["name"] == "Shroomish", _view(s)["player"]
 
 
+def test_the_learn_move_report_says_how_to_decline_without_looping():
+    """Seen live (2026-11-04): MANECTRIC Lv31 and ROAR. The report said "B = NO keeps the
+    old moves"; the model pressed B over and over. B answers NO, the game asks "Stop learning
+    ROAR?", and B there answers NO again, back to "Delete a move…?". Declining is B, then A."""
+    s = server()
+    s.load(WILD_TWO)
+    texts = ["MANECTRIC is trying to learn ROAR.", "But MANECTRIC can't learn more than four moves.",
+             "Delete a move to make room for ROAR?"]
+    report = s.srv._battle_report({"end": "learn_move", "texts": texts, "notes": [], "flow": _flow(s)})
+    print("   ", report)
+    assert "B = NO keeps the old moves" not in report, report
+    assert "To keep the old moves: B (NO), THEN A (YES) when it asks \"Stop learning" in report, report
+
+
 def test_the_play_out_sends_in_a_replacement_itself():
     """Any Pokémon able to fight is a right answer to the replacement menu, so the
     play-out (use_move, train, ...) sends in the best counter and says so."""

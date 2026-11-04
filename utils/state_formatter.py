@@ -416,7 +416,7 @@ def format_battle_view(view):
             # Seen live (Maxie's ZUBAT): BRELOOM was told only "HEADBUTT ~131 HP"; WING
             # ATTACK was 4x on it, and it fainted with ELECTRIKE in the party.
             me, foe = view['player'], view['target']
-            our = "can't hurt it" if danger['our_hits'] == float('inf') else f"needs {danger['our_hits']}"
+            our = "can't hurt it" if danger['our_hits'] is None else f"needs {danger['our_hits']}"
             line = (
                 f"DANGER: {foe['name'].upper()}'s {danger['foe_move']} ({danger['effectiveness']:g}x) takes "
                 f"~{round(danger['foe_damage'])} of {me['name'].upper()}'s {me['hp']} HP a hit: it knocks "

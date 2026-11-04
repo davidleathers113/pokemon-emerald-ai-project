@@ -2024,7 +2024,10 @@ class PokemonEmeraldReader:
             "foe_damage": round(foe_hit, 1),
             "effectiveness": self.type_effectiveness(foe_data["type"], player["type_ids"]),
             "foe_hits": foe_hits,
-            "our_hits": our_hits,
+            # None, not math.inf, when the Pokémon out can't hurt the foe: the view is sent
+            # as JSON, and inf is not JSON. Seen live (2026-11-04, train on ROUTE 120): one
+            # get_game_state answered 500, "Out of range float values are not JSON compliant".
+            "our_hits": None if our_hits == math.inf else our_hits,
             "switch": choice,
         }
 

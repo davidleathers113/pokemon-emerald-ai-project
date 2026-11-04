@@ -425,6 +425,28 @@ def test_a_foe_that_wins_the_exchange_is_a_danger():
     assert view["better_switch"] is None and not any(l.startswith("Better matchup") for l in lines), lines
 
 
+def test_a_danger_the_pokemon_out_cannot_answer_is_valid_json():
+    """Seen live (2026-11-04, train on ROUTE 120): one get_game_state answered HTTP 500,
+    "Out of range float values are not JSON compliant": the DANGER entry said our_hits =
+    math.inf when the Pokémon out could not hurt the foe. RAM: SABLEYE's PP all 0 (struct
+    BattlePokemon +0x24), so no move of its can hurt Isaac's WHISMUR, whose ASTONISH can."""
+    import json
+
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(ISAAC)
+    for slot in range(4):
+        _poke(s, 8, 0x02024084 + 0x24 + slot, 0)
+    view = _view(s)
+    danger = view["danger"]
+    assert danger and danger["our_hits"] is None, danger
+    json.dumps(view, allow_nan=False)  # what the server's JSON response needs
+    # With no move to use, the view names a switch (not a DANGER line, which needs a best move).
+    lines = format_battle_view(view)
+    assert any(l.startswith("No damaging move with PP left: call switch_pokemon(") for l in lines), lines
+
+
 def _machop_like_foe(s):
     """RAM: Isaac's foe (gBattleMons[1]) made a wild-Jagged-Pass MACHOP: Fighting, Lv21,
     pret-formula stats for base 70/80/50/35/35/35 (HP 60, Atk 38, Def 26, Spe 19, SpA 19,

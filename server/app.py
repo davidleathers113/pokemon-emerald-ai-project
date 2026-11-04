@@ -5944,8 +5944,12 @@ def _battle_end_text(played: Dict[str, Any]) -> str:
     if end == "learn_move":
         advice = _learn_move_advice(played["texts"])
         return (
-            f"Your Pokémon wants to learn a new move ({asked}): decide with press_buttons "
-            f"(A = YES picks a move to forget, B = NO keeps the old moves).{f' {advice}' if advice else ''}"
+            # Seen live (MANECTRIC and ROAR, 2026-11-04): with "B = NO keeps the old moves" here
+            # the model pressed B over and over. B answers NO, the game then asks "Stop learning
+            # X?", and a second B answers NO to that, back to "Delete a move…?", forever.
+            f"Your Pokémon wants to learn a new move ({asked}): decide with press_buttons. To learn it: "
+            "A (YES), then pick the move to forget. To keep the old moves: B (NO), THEN A (YES) when it "
+            f"asks \"Stop learning …?\" (B there starts the question over).{f' {advice}' if advice else ''}"
         )
     if end == "menu":
         choice = _replacement() if _forced_party_menu() else None
@@ -8499,6 +8503,15 @@ async def maintain_party(request: dict = None):
     if share_in_bag or holder is not None:
         if holder == target:
             return nothing(f"{who} already holds the Exp. Share")
+        # David (2026-11-04, verbatim): "yes, keep it on the current holder for ties". Seen
+        # live: COMBUSKEN (holder) reached Lv31, tying four at the lowest level; the EXP
+        # tie-break moved the share to SABLEYE, and each level-up would move it again, a
+        # menu trip each time. An eligible holder keeps it unless another is strictly lower.
+        held_by = party[holder] if holder is not None else None
+        if held_by is not None and not held_by.is_egg and held_by.current_hp > 0 and held_by.level <= mon.level:
+            return nothing(
+                f"{held_by.species_name.upper()} keeps the Exp. Share: tied at the lowest level (Lv{held_by.level})"
+            )
         result = await mcp_give_item({"item": _item_name(ms.ITEM_EXP_SHARE), "pokemon": str(target + 1)})
         summary = f"Exp. Share given to {who}" + (f", from {party[holder].species_name.upper()}" if holder is not None else "")
     else:
