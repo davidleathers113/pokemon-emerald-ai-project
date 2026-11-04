@@ -216,8 +216,9 @@ def auto_dialogue_enabled() -> bool:
 
 
 def _prompt_sections(prompt: str) -> Dict[str, int]:
-    """Characters per "### " section of a prompt ("(head)" for what comes before the
-    first): which parts are big, for local_tools/speed_report.py.
+    """Characters per section of a prompt ("(head)" for what comes before the first):
+    which parts are big, for local_tools/speed_report.py. A section starts at a "### "
+    heading or an opening tag line ("<state>").
 
     David (2026-11-04) approved a plan to make each decision faster; the uncached part of
     the prompt (~5.6K tokens) is the main cost, so its make-up is measured per step.
@@ -225,10 +226,62 @@ def _prompt_sections(prompt: str) -> Dict[str, int]:
     sizes: Dict[str, int] = {}
     name = "(head)"
     for line in str(prompt or "").splitlines(keepends=True):
+        bare = line.strip()
         if line.startswith("### "):
             name = line[4:].strip()
+        elif bare.startswith("<") and bare.endswith(">") and not bare.startswith("</") and " " not in bare:
+            name = bare[1:-1]
         sizes[name] = sizes.get(name, 0) + len(line)
     return sizes
+
+
+# Speed plan, Phase 1 (David, 2026-11-04): Ollama reuses the cached prompt up to the
+# first byte that differs from the last step's. The prompt used to open with "# Step: N"
+# and the previous result, so nothing after the system prompt and tools (8.25K tokens)
+# was ever reused and ~5.6K tokens were read again every step. Sections now go from the
+# ones that change least to the ones that change every step, and the step counter last.
+# Lines of the state that belong with the map's lasting facts (<map_info>): from each
+# marker to the next blank line.
+MAP_INFO_MARKERS = ("EXITS (where each way out of this map leads):", "TRAINERS not yet beaten on this map:")
+# The ASCII map's legend never changes: it is in the system instructions (SIMPLE.md).
+MAP_LEGEND_PREFIX = "(Legend: "
+# Calls that can change long-term memory, skills or subagents (the prompt's overviews).
+STORE_WRITING_TOOLS = frozenset({
+    "process_memory", "add_memory", "add_knowledge", "process_skill", "process_subagent",
+    "run_skill", "run_code", "evolve_harness", "execute_custom_subagent", "process_trajectory_history",
+})
+# Steps an unchanged overview is reused before it is fetched again anyway (a store
+# written by something other than this agent's calls still shows up).
+STORE_CONTEXT_REFRESH_STEPS = 10
+
+
+def _split_state_text(state_text: str) -> Tuple[str, str]:
+    """(map_info, the rest of the state): the EXITS and TRAINERS blocks moved out, and the
+    static legend line dropped."""
+    lines = str(state_text or "").splitlines()
+    info: List[str] = []
+    rest: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() in MAP_INFO_MARKERS:
+            block = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                block.append(lines[i])
+                i += 1
+            info.append("\n".join(block))
+            continue
+        if not line.startswith(MAP_LEGEND_PREFIX):
+            rest.append(line)
+        i += 1
+    return "\n\n".join(info), "\n".join(rest)
+
+
+def _tagged(tag: str, body: str) -> str:
+    """<tag>\\nbody\\n</tag>, or "" for an empty body."""
+    body = str(body or "").strip("\n")
+    return f"<{tag}>\n{body}\n</{tag}>\n" if body.strip() else ""
 
 
 def _clip(text: Any, max_chars: int) -> str:
@@ -595,6 +648,7 @@ class PokeAgent:
 
     def _execute_function_call_by_name(self, function_name: str, arguments: dict) -> str:
         """Execute a function by name with given arguments and return result as JSON string."""
+        self._note_store_write(function_name)
         if is_local_subagent_tool(function_name):
             spec = get_local_subagent_spec(function_name)
             return getattr(self, spec.handler_method)(arguments)
@@ -1647,6 +1701,7 @@ class PokeAgent:
         logger.info(f"🔧 Executing function: {function_name}")
         if allowed_tool_names is not None and function_name not in allowed_tool_names:
             raise ValueError(f"Tool {function_name} is not allowed in this context")
+        self._note_store_write(function_name)
 
         # Parse arguments - convert protobuf types to native Python types
         try:
@@ -2755,6 +2810,12 @@ class PokeAgent:
         skipped entirely (those tools are not available) to save latency
         and tokens.
         """
+        # Speed plan, Phase 1: three MCP calls a step for overviews that change only when
+        # a store is written. Kept until a writing call runs (_note_store_write) or for
+        # STORE_CONTEXT_REFRESH_STEPS steps, whichever comes first.
+        cached = getattr(self, "_store_ctx_cache", None)
+        if cached is not None and self.step_count - cached[0] < STORE_CONTEXT_REFRESH_STEPS:
+            return dict(cached[1])
         ctx = {"memory": self._get_memory_context()}
         if self.scaffold == _SIMPLEST_SCAFFOLD:
             ctx["skills"] = ""
@@ -2762,7 +2823,13 @@ class PokeAgent:
         else:
             ctx["skills"] = self._get_skill_context()
             ctx["subagents"] = self._get_subagent_context()
+        self._store_ctx_cache = (self.step_count, dict(ctx))
         return ctx
+
+    def _note_store_write(self, function_name: str) -> None:
+        """Drop the cached overviews after a call that may have written a store."""
+        if function_name in STORE_WRITING_TOOLS:
+            self._store_ctx_cache = None
 
     def _build_optimized_prompt(self, game_state_result: str, step_count: int) -> str:
         """Build optimized prompt by combining base_prompt.md with current game context.
@@ -3179,37 +3246,20 @@ Step {step_count}"""
             parts.append(self._load_bootstrap_addendum())
             bootstrap_block = "\n".join(parts) + "\n"
 
-        # --- Assemble prompt (simplest gets a minimal layout) ---
-        if is_simplest:
-            prompt = f"""{bootstrap_block}# Step: {step_count}
-### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps)
-{action_history}
-{function_results_context}
-### STATE
-{state_text}
-### LONG-TERM MEMORY OVERVIEW
-{memory_context}
-"""
-        else:
-            prompt = f"""{bootstrap_block}# Step: {step_count}
-### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps)
-{action_history}
-{function_results_context}
-### OBJECTIVES
-{direct_objective_context}
-{direct_objective}
-{direct_objective_status}
-### STATE
-{state_text}
-### LONG-TERM MEMORY OVERVIEW
-{memory_context}
-### SKILL LIBRARY
-{skill_context}
-### SUBAGENT REGISTRY
-{subagent_context}
-"""
-
-        return prompt
+        # --- Assemble prompt: least-changing sections first (see MAP_INFO_MARKERS) ---
+        map_info, state_rest = _split_state_text(state_text)
+        objectives = "\n".join(part for part in (direct_objective_context, direct_objective, direct_objective_status) if part)
+        lasting = "" if is_simplest else _tagged("objectives", objectives)
+        lasting += _tagged("long_term_memory", memory_context)
+        if not is_simplest:
+            lasting += _tagged("skill_library", skill_context) + _tagged("subagent_registry", subagent_context)
+        lasting += _tagged("map_info", map_info)
+        changing = (
+            _tagged("last_result", function_results_context)
+            + _tagged("recent_steps", action_history)
+            + _tagged("state", state_rest)
+        )
+        return f"{bootstrap_block}{lasting}{changing}Step: {step_count}\n"
 
 
     def _is_title_sequence(self, game_state_data: Dict[str, Any]) -> bool:

@@ -1495,6 +1495,24 @@ prompt. That came to 1.1 tiles walked per minute.
 - Found while instrumenting (Phase 5): a fixed 1 s sleep after every step, and a full
   get_game_state after every step just to read the end position.
 
+## Speed plan, Phase 1: cache-friendly prompt order (2026-11-04)
+- The prompt opened with "# Step: N" and the previous result, so Ollama reused nothing
+  after the system prompt and tools (8.25K tokens); ~5.6K tokens were read again each
+  step.
+- `_build_structured_prompt` now goes from the sections that change least to the ones
+  that change every step: `<objectives>`, `<long_term_memory>`, `<skill_library>`,
+  `<subagent_registry>`, `<map_info>` (EXITS and TRAINERS, moved out of the state by
+  `_split_state_text`), then `<last_result>`, `<recent_steps>`, `<state>`, and
+  "Step: N" last. The ASCII map's legend is in SIMPLE.md (it never changes) and no
+  longer in each prompt; SIMPLE.md and three tool descriptions name the tagged sections.
+- The memory, skill and subagent overviews are cached in the agent until a call that
+  may write a store (`STORE_WRITING_TOOLS`) or for 10 steps, instead of 3 MCP calls a
+  step.
+- speed_report and /ai_feed find the previous result up to `</last_result>`.
+- *Verified:* local_tests/test_prompt_cache.py: two consecutive steps on ROUTE 101 (the
+  player one tile on) share every byte up to `<last_result>`; the overviews are fetched
+  once; a memory write refreshes them. The old builder fails both.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

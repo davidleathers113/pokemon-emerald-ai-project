@@ -100,8 +100,9 @@ def _previous_result(prompt):
     start = text.find("RESULTS FROM PREVIOUS STEP")
     if start == -1:
         return ""
-    end = text.find("### ", start)
-    return text[start:end if end != -1 else len(text)]
+    # The block ends at the next section: "</last_result>" (tagged prompts) or "### ".
+    ends = [i for i in (text.find("</last_result>", start), text.find("### ", start)) if i != -1]
+    return text[start:min(ends) if ends else len(text)]
 
 
 def _result_failed(prompt):

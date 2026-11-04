@@ -164,7 +164,7 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "name": "process_memory",
         "scaffolds": ALL_SCAFFOLDS,
         "description": (
-            "Manage long-term memory. The LONG-TERM MEMORY OVERVIEW in your "
+            "Manage long-term memory. The <long_term_memory> section of your "
             "prompt shows all entry IDs. Use 'read' to get full details, "
             "'add' to create, 'update' to modify, 'delete' to remove."
         ),
@@ -237,7 +237,7 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "name": "process_skill",
         "scaffolds": _STANDARD_SCAFFOLDS,
         "description": (
-            "Manage the skill library. The SKILL LIBRARY section in your "
+            "Manage the skill library. The <skill_library> section of your "
             "prompt shows all skill IDs. Use 'read' to get full details, "
             "'add' to create, 'update' to modify, 'delete' to remove."
         ),
@@ -403,7 +403,7 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "name": "process_subagent",
         "scaffolds": _STANDARD_SCAFFOLDS,
         "description": (
-            "Manage the subagent registry. The SUBAGENT REGISTRY section in "
+            "Manage the subagent registry. The <subagent_registry> section of "
             "your prompt shows all subagent IDs. Use 'read' to get full "
             "config, 'add' to create, 'update' to modify, 'delete' to "
             "remove (built-ins cannot be deleted)."

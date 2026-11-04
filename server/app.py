@@ -1439,8 +1439,9 @@ def _step_result(prompt: str) -> Tuple[Optional[str], Optional[bool]]:
     start = text.find("RESULTS FROM PREVIOUS STEP")
     if start == -1:
         return None, None
-    end = text.find("### ", start)
-    block = text[start:end if end != -1 else len(text)]
+    # The block ends at the next section: "</last_result>" (tagged prompts) or "### ".
+    ends = [i for i in (text.find("</last_result>", start), text.find("### ", start)) if i != -1]
+    block = text[start:min(ends) if ends else len(text)]
     success = False if '"success": false' in block else (True if '"success": true' in block else None)
     return _quoted_field(block, "summary") or _quoted_field(block, "error"), success
 
