@@ -1571,6 +1571,28 @@ prompt. That came to 1.1 tiles walked per minute.
   test_play_endpoints.py (/player_position on MT CHIMNEY: right tile, <0.2 s). Each
   fails on the old code.
 
+## David's party rule: the weakest leads, then holds the Exp. Share (2026-11-04)
+- David (verbatim): "I want the pokemon with the lowest level to always be in the first
+  spot in the party so that it is the one that gets trained. That is, until we have the
+  exp share. Then the weakest pokemon in the party should always hold the exp share."
+- Harness behaviour: `POST /maintain_party`, called by the agent at the start of every
+  step, acts only when the player can walk (no battle, text, menu or scene). The weakest
+  is the lowest level among those that can battle (no egg, not fainted); ties go to the
+  most EXP still needed for the next level (`menu_state.exp_to_next_level`, gSpeciesInfo
+  growthRate → gExperienceTables), then party order. Party of 1: nothing.
+  - No Exp. Share (bag or held): `set_lead` puts the weakest in slot 1.
+  - With it: `give_item` has the weakest hold it (taken from the old holder first; what
+    the new holder held goes to the bag).
+  - What it did is the step's `party_rule` result and a 👥 row on the /play feed.
+- `give_item(item, pokemon)`: model tool and macro (START → POKéMON → ITEM → GIVE / TAKE),
+  checked in the party's held items (`PokemonData.held_item`, now parsed).
+- train() no longer sends in a trainee that holds the Exp. Share.
+- *Verified:* local_tests/test_party_rule.py on the live MT CHIMNEY save: AZUMARILL Lv18
+  put first, then no change; a fainted lowest skipped; an egg never chosen; the tie
+  rule; nothing in a battle or a conversation; the Exp. Share given to the weakest, moved
+  when it changes (RAM level), a held item swapped back to the bag. Plus the agent's
+  report (test_prompt_cache) and train (test_train_macro).
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

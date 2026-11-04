@@ -464,6 +464,35 @@ def test_trainee_not_leading_still_gets_the_exp():
     assert _by_name(s, "SHROOMISH").experience > exp_before
 
 
+def test_a_trainee_holding_the_exp_share_stays_on_the_bench():
+    """David (2026-11-04): once we have the Exp. Share the weakest holds it, and it levels
+    "regardless of who's doing the fighting". train no longer brings such a trainee in.
+    test_wild_two_party.state (TORCHIC out, SHROOMISH benched), with SHROOMISH read as
+    holding the Exp. Share (the party read is wrapped: its held item is in the encrypted
+    part of the Pokémon data)."""
+    import dataclasses
+
+    from server import menu_state as ms
+
+    s = server()
+    s.load(WILD_TWO)
+    real = s.srv._train_party
+
+    def holding():
+        return [(pid, dataclasses.replace(mon, held_item=ms.ITEM_EXP_SHARE) if mon.species_name.upper() == "SHROOMISH" else mon)
+                for pid, mon in real()]
+
+    s.srv._train_party = holding
+    try:
+        r = s.call("mcp_train", {"trainee": "SHROOMISH", "max_minutes": 0.2, "reasoning": "test"})
+    finally:
+        s.srv._train_party = real
+    print("   ", r["summary"])
+    first = r["battles"][0]
+    print("      ", first)
+    assert not first.get("trainee_sent_in") and first["switched"] is False, first
+
+
 def test_train_switches_against_a_threat():
     s = server()
     _shroomish_out_against(s, (TYPE_FLYING, TYPE_FLYING))

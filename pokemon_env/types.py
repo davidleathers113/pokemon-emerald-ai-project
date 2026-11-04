@@ -23,6 +23,8 @@ class PokemonData:
     # first or second ability; ability is its name from the ROM ("HUGE POWER").
     ability_num: int = 0
     ability: Optional[str] = None
+    # The item id it holds (pret struct PokemonSubstruct0 heldItem; 0 = nothing).
+    held_item: int = 0
 
     @property
     def is_asleep(self) -> bool:

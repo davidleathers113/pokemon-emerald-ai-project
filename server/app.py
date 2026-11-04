@@ -6573,6 +6573,9 @@ async def _train_battle(
             record["switched"] = record["switched"] or bool(result.get("success"))
         elif (
             not record.get("trainee_sent_in")
+            # Holding the Exp. Share it earns EXP from the bench (David's rule: the weakest
+            # holds it once we have it), so it never needs to come in.
+            and dict(party)[trainee_pid].held_item != ms.ITEM_EXP_SHARE
             and not record["switched"]  # it was out already (switched out for the partner)
             and not record["trainee_fought"]
             and _train_can_take_a_turn(party, trainee_pid)
@@ -7722,6 +7725,273 @@ async def mcp_set_lead(request: dict = None):
         "status": "LEAD",
         "summary": f"{name} now leads the party, so it starts every battle and earns its EXP. Party: {listing}.{walk}",
     }
+
+
+# -- held items: give_item / take, and David's party rule (maintain_party) ------------
+
+# Presses allowed through the texts of giving or taking an item ("X was given the Y to
+# hold.", "...already holding Y. Would you like to switch the two items?" YES).
+HELD_ITEM_TEXT_PRESSES = 10
+
+
+def _party_ready(r) -> bool:
+    from server import menu_state as ms
+
+    return ms.callback2_is(r, ms.CB2_UPDATE_PARTY_MENU) and ms.task_running(r, ms.TASK_PARTY_CHOOSE) and not ms.fade_active(r)
+
+
+def _bag_ready(r) -> bool:
+    from server import menu_state as ms
+
+    return ms.callback2_is(r, ms.CB2_BAG_MENU_RUN) and ms.task_running(r, ms.TASK_BAG_INPUT) and not ms.fade_active(r)
+
+
+async def _close_field_menus(source: str) -> bool:
+    for _ in range(6):  # B backs out of the party screen, then the START menu
+        if _player_can_walk():
+            return True
+        await _macro_press(["B"], source)
+        await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+    return _player_can_walk()
+
+
+async def _step_cursor(read, goal: int, source: str) -> bool:
+    """Move a list cursor read by `read(reader)` to goal one press at a time, each waited
+    for (presses sent while a screen's text prints are dropped)."""
+    from server import menu_state as ms
+
+    for _ in range(10):
+        at = _mem(read)
+        if at == goal:
+            return True
+        await _macro_press(ms.list_presses(at, goal)[:1], source)
+        await _await_game(lambda: _mem(read) != at, MACRO_MENU_FRAMES)
+    return _mem(read) == goal
+
+
+async def _open_item_submenu(index: int, source: str) -> Optional[str]:
+    """START → POKéMON → party slot `index` → ITEM: GIVE / TAKE / CANCEL open, or why not."""
+    from server import menu_state as ms
+
+    await _macro_press(["START"], source)
+    if not await _await_game(lambda: _mem(ms.start_menu_open), MACRO_MENU_FRAMES):
+        return "The START menu did not open."
+    actions = _mem(ms.start_menu_actions)
+    if ms.MENU_ACTION_POKEMON not in actions:
+        return "The START menu has no POKéMON entry."
+    if not await _step_cursor(ms.start_menu_cursor, actions.index(ms.MENU_ACTION_POKEMON), source):
+        return "Could not put the START menu cursor on POKéMON."
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES * 2):
+        return "Chose POKéMON but the party screen did not open."
+    if not await _step_cursor(ms.party_menu_slot, index, source):
+        return f"Could not put the party cursor on slot {index + 1}."
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(lambda r: ms.MENU_ITEM in ms.party_menu_actions(r)), MACRO_MENU_FRAMES):
+        return f"Slot {index + 1}'s menu did not open (or has no ITEM)."
+    options = _mem(ms.party_menu_actions)
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, options.index(ms.MENU_ITEM), source):
+        return "Could not put the menu cursor on ITEM."
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(lambda r: ms.MENU_GIVE in ms.party_menu_actions(r)), MACRO_MENU_FRAMES):
+        return "Chose ITEM but GIVE / TAKE did not open."
+    return None
+
+
+def _held_items() -> List[int]:
+    with memory_lock:
+        return [p.held_item for p in env.memory_reader.read_party_pokemon() or []]
+
+
+async def _take_held_item(index: int, source: str) -> Optional[str]:
+    """Take what party slot `index` holds into the bag; None when done, else why not."""
+    from server import menu_state as ms
+
+    if not _held_items()[index]:
+        return None
+    error = await _open_item_submenu(index, source)
+    if error is None:
+        options = _mem(ms.party_menu_actions)
+        if await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, options.index(ms.MENU_TAKE_ITEM), source):
+            await _macro_press(["A"], source)
+            # "Received the X from Y." then back to the party list.
+            for _ in range(HELD_ITEM_TEXT_PRESSES):
+                if not _held_items()[index] and await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES):
+                    break
+                await _macro_press(["A"], source)
+        else:
+            error = "Could not put the menu cursor on TAKE."
+    closed = await _close_field_menus(source)
+    if error:
+        return error + ("" if closed else " Could not close every menu: look at the screen.")
+    return None if not _held_items()[index] else "The item is still held (is the bag full?)."
+
+
+async def _give_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
+    """Give item_id from the bag to party slot `index` (what it held goes to the bag)."""
+    from server import menu_state as ms
+
+    pocket = next((p for p in range(5) if item_id in _mem(lambda r: ms.bag_pocket_item_ids(r, p))), None)
+    if pocket is None:
+        return "That item is not in the bag."
+    error = await _open_item_submenu(index, source)
+    if error is None:
+        options = _mem(ms.party_menu_actions)
+        if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, options.index(ms.MENU_GIVE), source):
+            error = "Could not put the menu cursor on GIVE."
+        else:
+            await _macro_press(["A"], source)
+            if not await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES * 2):
+                error = "Chose GIVE but the bag did not open."
+    if error is None:
+        for press in ms.pocket_presses(_mem(ms.bag_pocket), pocket):
+            await _macro_press([press], source)
+            await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES)
+        listed = _mem(lambda r: ms.bag_pocket_item_ids(r, pocket))
+        if _mem(ms.bag_pocket) != pocket or item_id not in listed:
+            error = "Could not find the item in its bag pocket."
+        elif not await _step_cursor(lambda r: ms.bag_cursor_index(r, pocket), listed.index(item_id), source):
+            error = "Could not put the bag cursor on the item."
+        else:
+            await _macro_press(["A"], source)
+            # "X was given the Y to hold.", or "...already holding Z. Switch the two
+            # items?" whose cursor starts on YES: A through to the party list again.
+            for _ in range(HELD_ITEM_TEXT_PRESSES):
+                if _held_items()[index] == item_id and await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES):
+                    break
+                await _macro_press(["A"], source)
+    closed = await _close_field_menus(source)
+    if error:
+        return error + ("" if closed else " Could not close every menu: look at the screen.")
+    return None if _held_items()[index] == item_id else "The Pokémon does not hold the item afterwards."
+
+
+def _item_name(item_id: int) -> str:
+    from pokemon_env.emerald_utils import _item_id_to_name
+
+    return str(_item_id_to_name(item_id) or f"item {item_id}").upper()
+
+
+@app.post("/mcp/give_item")
+async def mcp_give_item(request: dict = None):
+    """MCP Tool: outside battle, have a party Pokémon hold an item, in one call.
+
+    The item comes from the bag, or from the party member holding it (taken first);
+    whatever the Pokémon held goes to the bag, so nothing is lost. By hand: START →
+    POKéMON → the Pokémon → ITEM → GIVE → the item in the bag (→ YES to swap). David
+    (2026-11-04): the weakest Pokémon should hold the Exp. Share (maintain_party).
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import menu_state as ms
+
+    source = "give_item"
+    request = request or {}
+    wanted_item, wanted_mon = str(request.get("item") or "").strip(), request.get("pokemon")
+    if not wanted_item or wanted_mon is None or str(wanted_mon).strip() == "":
+        return _refusal('item and pokemon are required, e.g. give_item("EXP SHARE", "NUMEL").')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+        bag = {i: _mem_bag_ids(env.memory_reader, i) for i in range(5)}
+    index = _train_member([(0, p) for p in party], wanted_mon)
+    if index is None:
+        names = ", ".join(f"{i + 1}. {p.species_name.upper()}" for i, p in enumerate(party))
+        return _refusal(f"{wanted_mon} is not in your party ({names}), or it is an egg.")
+    name = party[index].species_name.upper()
+    key = ms.name_key(wanted_item)
+    candidates = {i for ids in bag.values() for i in ids} | {p.held_item for p in party if p.held_item}
+    item_id = next((i for i in candidates if ms.name_key(_item_name(i)) == key), None)
+    if item_id is None:
+        return _refusal(f"{wanted_item} is neither in the bag nor held by a party Pokémon.")
+    item = _item_name(item_id)
+    if party[index].held_item == item_id:
+        return {"success": True, "status": "HELD", "summary": f"{name} already holds the {item}."}
+    moved = ""
+    with _turbo():
+        holder = next((i for i, p in enumerate(party) if p.held_item == item_id), None)
+        in_bag = any(item_id in ids for ids in bag.values())
+        if not in_bag and holder is not None:
+            error = await _take_held_item(holder, source)
+            if error:
+                return _refusal(f"Could not take the {item} from {party[holder].species_name.upper()}: {error}")
+            moved = f" (taken from {party[holder].species_name.upper()})"
+        before = party[index].held_item
+        error = await _give_from_bag(index, item_id, source)
+    if error:
+        return _refusal(f"{name} was not given the {item}: {error}{_screen_note()}")
+    swapped = f"; its {_item_name(before)} went to the bag" if before else ""
+    return {"success": True, "status": "GIVEN", "summary": f"{name} now holds the {item}{moved}{swapped}."}
+
+
+def _mem_bag_ids(reader, pocket: int) -> List[int]:
+    from server import menu_state as ms
+
+    return ms.bag_pocket_item_ids(reader, pocket)
+
+
+def _party_rule_target(party) -> Optional[int]:
+    """The party slot David's rule wants trained: the lowest level among those that can
+    battle (not an egg, not fainted); ties go to the one with the most EXP still needed
+    for its next level, then to party order. None with nobody eligible."""
+    from server import menu_state as ms
+
+    able = [(i, p) for i, p in enumerate(party) if not p.is_egg and p.current_hp > 0]
+    if not able:
+        return None
+    with memory_lock:
+        needs = {i: ms.exp_to_next_level(env.memory_reader, p.species_id, p.level, p.experience) for i, p in able}
+    return min(able, key=lambda ip: (ip[1].level, -needs[ip[0]], ip[0]))[0]
+
+
+@app.post("/maintain_party")
+async def maintain_party(request: dict = None):
+    """David's rule (2026-11-04, verbatim): "I want the pokemon with the lowest level to
+    always be in the first spot in the party so that it is the one that gets trained.
+    That is, until we have the exp share. Then the weakest pokemon in the party should
+    always hold the exp share."
+
+    Harness behaviour, not advice (the model wouldn't keep it up): the agent calls this
+    at the start of every step. It acts only when the player can walk (no battle, text,
+    menu or scene). Before the Exp. Share (in the bag or held) it puts the lowest-level
+    eligible Pokémon in slot 1 (set_lead); after, it has that Pokémon hold the Exp. Share
+    (give_item). Returns {"changed", "summary"}.
+    """
+    from server import menu_state as ms
+    from server.field_control import DIALOGUE_NONE
+
+    nothing = {"changed": False, "summary": ""}
+    if env is None or _mem(lambda r: r.is_in_battle()) or not _player_can_walk() or _field_status() != DIALOGUE_NONE:
+        return nothing
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+        share_in_bag = any(ms.ITEM_EXP_SHARE in _mem_bag_ids(env.memory_reader, p) for p in range(5))
+    target = _party_rule_target(party)
+    if target is None or len(party) < 2:
+        return nothing
+    mon = party[target]
+    who = f"{mon.species_name.upper()} (lowest level, Lv{mon.level})"
+    holder = next((i for i, p in enumerate(party) if p.held_item == ms.ITEM_EXP_SHARE), None)
+    if share_in_bag or holder is not None:
+        if holder == target:
+            return nothing
+        result = await mcp_give_item({"item": _item_name(ms.ITEM_EXP_SHARE), "pokemon": str(target + 1)})
+        summary = f"Exp. Share given to {who}" + (f", from {party[holder].species_name.upper()}" if holder is not None else "")
+    else:
+        if target == 0:
+            return nothing
+        result = await mcp_set_lead({"pokemon": str(target + 1)})
+        summary = f"Lead set to {who}"
+    if not result.get("success"):
+        summary = f"Party rule not applied ({summary.lower()} failed): {result.get('error') or result.get('summary')}"
+    _pause_events.append({
+        "time": datetime.datetime.utcnow().isoformat(), "kind": "party", "source": "harness", "text": summary,
+    })
+    del _pause_events[:-PAUSE_EVENTS_KEPT]
+    logger.info(f"👥 maintain_party: {summary}")
+    return {"changed": bool(result.get("success")), "summary": summary + "."}
 
 
 @app.post("/mcp/buy_item")

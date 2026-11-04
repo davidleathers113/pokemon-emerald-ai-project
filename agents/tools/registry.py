@@ -765,6 +765,26 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "required": ["pokemon", "reasoning"],
         },
     },
+    # David (2026-11-04): the weakest Pokémon holds the Exp. Share once we have it (the
+    # harness keeps that up itself; this is for any other held item).
+    {
+        "name": "give_item",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Outside battle: have a party Pokemon hold an item, in one call. The item comes "
+            "from the bag or from the teammate holding it; what the Pokemon held goes back "
+            "to the bag, so nothing is lost."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "item": {"type_": "STRING", "description": "The item's name, e.g. 'EXP SHARE'."},
+                "pokemon": {"type_": "STRING", "description": "Party Pokemon name or slot 1-6, e.g. 'NUMEL'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why it should hold it."},
+            },
+            "required": ["item", "pokemon", "reasoning"],
+        },
+    },
     # Seen live: switch-training cost ~3 model decisions per wild battle (walk into the
     # grass, switch_pokemon, use_move); train runs the whole loop server-side.
     {

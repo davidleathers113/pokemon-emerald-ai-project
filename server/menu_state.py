@@ -145,6 +145,19 @@ G_SPECIAL_VAR_ITEM_ID = 0x0203CE7C       # set to the chosen item when its conte
 G_PARTY_MENU = 0x0203CEC8
 S_PARTY_MENU_INTERNAL = 0x0203CEC4
 MENU_SWITCH = 1  # party_menu.c MENU_SWITCH, the field selection menu's "SWITCH"
+MENU_ITEM = 3    # party_menu.c MENU_ITEM: opens GIVE / TAKE / CANCEL
+MENU_GIVE = 4
+MENU_TAKE_ITEM = 5
+ITEM_EXP_SHARE = 182                       # include/constants/items.h
+FLAG_RECEIVED_EXP_SHARE = 0x110            # include/constants/flags.h (Mr. Stone, Devon 3F)
+ITEMS_POCKET = 0                           # the bag's ITEMS pocket (where the Exp. Share goes)
+# EXP to the next level (David's lead rule's tie-break): pret gSpeciesInfo[species]
+# (28 bytes) +0x13 growthRate indexes gExperienceTables[growthRate][level] (u32[6][101]).
+G_SPECIES_INFO = 0x083203CC
+SPECIES_INFO_SIZE = 28
+SPECIES_GROWTH_RATE = 0x13
+G_EXPERIENCE_TABLES = 0x0831F72C
+MAX_LEVEL = 100
 MENU_SHIFT = 10  # party_menu.c MENU_SHIFT, the battle selection menu's first entry
 # party_menu.c MENU_SEND_OUT: the same menu when a fainted Pokémon must be replaced.
 MENU_SEND_OUT = 11
@@ -315,6 +328,16 @@ def active_battler_personality(reader) -> int:
 # ---------------------------------------------------------------------------
 # Party
 # ---------------------------------------------------------------------------
+
+
+def exp_to_next_level(reader, species_id: int, level: int, experience: int) -> int:
+    """EXP a Pokémon still needs for its next level (0 at level 100), from the ROM's
+    tables: gExperienceTables[gSpeciesInfo[species].growthRate][level + 1] - experience."""
+    if level >= MAX_LEVEL:
+        return 0
+    growth = reader._read_u8(G_SPECIES_INFO + SPECIES_INFO_SIZE * species_id + SPECIES_GROWTH_RATE)
+    needed = reader._read_u32(G_EXPERIENCE_TABLES + 4 * ((MAX_LEVEL + 1) * growth + level + 1))
+    return max(0, needed - int(experience or 0))
 
 
 def party_personalities(reader) -> List[int]:

@@ -109,6 +109,8 @@ const PlayPanels = (() => {
     let label = `${escapeHtml(e.kind)} by ${source}${text}`;
     if (e.kind === "pause") label = `⏸ Paused by ${source}${text}`;
     if (e.kind === "resume") label = `▶ Resumed by ${source}${text}`;
+    // David's party rule, applied by the harness ("Lead set to NUMEL (lowest level, Lv20)").
+    if (e.kind === "party") label = `👥 ${escapeHtml(e.text || "")}`;
     return `<div class="event ${e.kind === "pause" ? "ev-pause" : "ev-resume"}">`
       + `<span class="t">${fmtClock(parseUtc(e.time))}</span><span>${label}</span></div>`;
   }

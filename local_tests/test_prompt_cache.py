@@ -143,6 +143,32 @@ def test_people_and_things_come_from_the_map_json():
     assert pa._map_things('{"objects": [], "bg_events": []}') == "" and pa._map_things("not json") == ""
 
 
+def test_beaten_trainers_are_marked_in_the_people_line():
+    """Seen live on MT CHIMNEY (17,18), 17:20-17:25 UTC: the people line named SHELBY's
+    sprite at (16,18) as a trainer though she was beaten; the model kept walking to her.
+    A trainer not in the state's TRAINERS list (the unbeaten ones) is marked beaten."""
+    from test_phase4_agent import pa
+
+    json_line = json.dumps({"objects": [
+        {"x": 16, "y": 18, "graphics_id": "OBJ_EVENT_GFX_EXPERT_F", "trainer_type": "TRAINER_TYPE_NORMAL"},
+        {"x": 27, "y": 17, "graphics_id": "OBJ_EVENT_GFX_BEAUTY", "trainer_type": "TRAINER_TYPE_NORMAL"},
+    ]})
+    state = "\n".join([
+        "TRAINERS not yet beaten on this map:",
+        "- SHIRLEY at (27, 17); SHEILA at (29, 7)",
+        "",
+        "Map Data (JSON):",
+        json_line,
+    ])
+    info, _ = pa._split_state_text(state)
+    print("    " + info.splitlines()[-1])
+    assert "EXPERT F (trainer, already beaten: nothing more to do) at (16, 18)" in info, info
+    assert "BEAUTY (trainer) at (27, 17)" in info, info
+    # No TRAINERS block: every trainer on the map is beaten.
+    info, _ = pa._split_state_text("Map Data (JSON):\n" + json_line)
+    assert info.count("already beaten") == 2, info
+
+
 def test_a_failed_result_is_sent_once():
     """Server refusals set "error" and "summary" to the same text: only one goes in."""
     agent = _agent()
@@ -281,6 +307,21 @@ def test_waiting_for_the_queue_polls_instead_of_sleeping_a_second():
         agent._wait_for_actions_complete()
     took = time.time() - started
     assert calls.call_count == 3 and took < 0.6, (calls.call_count, took)
+
+
+def test_a_party_rule_change_reaches_the_next_prompt():
+    """David's party rule (server maintain_party) runs at the start of each step; what it
+    did is put in <last_result> like a tool result, and nothing when it did nothing."""
+    agent = _bare_agent()
+    agent.mcp_adapter.call_tool.side_effect = lambda name, args: (
+        {"changed": True, "summary": "Lead set to NUMEL (lowest level, Lv19)."} if name == "maintain_party" else {}
+    )
+    agent._maintain_party()
+    block = agent._get_function_results_context()
+    assert "party_rule" in block and "Lead set to NUMEL (lowest level, Lv19)." in block, block
+    agent.mcp_adapter.call_tool.side_effect = lambda name, args: {"changed": False, "summary": ""}
+    agent._maintain_party()
+    assert agent._get_function_results_context() == ""
 
 
 def test_a_store_write_refreshes_the_overviews():

@@ -173,7 +173,7 @@ def truncate_middle(text: Any, max_chars: int) -> Any:
 # when its presses are done, like use_move.
 MACRO_TOOLS = (
     "heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to",
-    "teach_move", "set_lead",
+    "teach_move", "set_lead", "give_item",
 )
 # Battle calls decided for one match-up (who is out on each side): they carry the
 # get_game_state battle_key the model saw. Seen live: switch_pokemon("BRELOOM"), chosen
@@ -308,9 +308,26 @@ EMPTY_STORE_OVERVIEWS = ("No skills learned yet.", "No subagents registered yet.
 MAP_JSON_MARKER = "Map Data (JSON):"
 
 
-def _map_things(map_json_line: str) -> str:
+def _trainer_spots(trainers_block: str) -> set:
+    """The (x, y) of every trainer in the state's TRAINERS block ("- MAXIE at (13, 6);
+    TABITHA at (12, 11)"): the ones not beaten yet."""
+    spots = set()
+    for part in str(trainers_block or "").split(" at (")[1:]:
+        inside = part.split(")")[0]
+        numbers = [p.strip() for p in inside.split(",")]
+        if len(numbers) == 2 and all(n.lstrip("-").isdigit() for n in numbers):
+            spots.add((int(numbers[0]), int(numbers[1])))
+    return spots
+
+
+def _map_things(map_json_line: str, unbeaten: Optional[set] = None) -> str:
     """'PEOPLE & THINGS: OLD WOMAN at (19, 39); ITEM BALL at (2, 4); sign at (14, 6)' from
-    the Map Data JSON line, or "" when there is nothing (or it can't be read)."""
+    the Map Data JSON line, or "" when there is nothing (or it can't be read).
+
+    A trainer whose tile is not among `unbeaten` (the TRAINERS block's) is marked beaten.
+    Seen live on MT CHIMNEY (17,18), 17:20-17:25 UTC: the line named "EXPERT F (trainer)" at
+    (16,18), SHELBY, already beaten; the model kept walking to her to battle her.
+    """
     try:
         data = json.loads(map_json_line)
     except ValueError:
@@ -318,7 +335,10 @@ def _map_things(map_json_line: str) -> str:
     things = []
     for obj in data.get("objects") or []:
         name = str(obj.get("graphics_id") or "someone").replace("OBJ_EVENT_GFX_", "").replace("_", " ")
-        trainer = " (trainer)" if str(obj.get("trainer_type") or "").endswith(("NORMAL", "BURIED")) else ""
+        trainer = ""
+        if str(obj.get("trainer_type") or "").endswith(("NORMAL", "BURIED")):
+            beaten = unbeaten is not None and (obj.get("x"), obj.get("y")) not in unbeaten
+            trainer = " (trainer, already beaten: nothing more to do)" if beaten else " (trainer)"
         things.append(f"{name}{trainer} at ({obj.get('x')}, {obj.get('y')})")
     for event in data.get("bg_events") or []:
         kind = str(event.get("type") or "").replace("_", " ")
@@ -334,6 +354,15 @@ def _split_state_text(state_text: str) -> Tuple[str, str]:
     lines = str(state_text or "").splitlines()
     info: List[str] = []
     rest: List[str] = []
+    # Trainers not beaten yet, for marking the beaten ones among the map's people. With
+    # no TRAINERS block every trainer on the map is beaten (or there are none).
+    marker = MAP_INFO_MARKERS[1]
+    at = next((n for n, line in enumerate(lines) if line.strip() == marker), None)
+    trainers_block = ""
+    if at is not None:
+        end = next((n for n in range(at + 1, len(lines)) if not lines[n].strip()), len(lines))
+        trainers_block = "\n".join(lines[at + 1:end])
+    unbeaten = _trainer_spots(trainers_block)
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -348,7 +377,7 @@ def _split_state_text(state_text: str) -> Tuple[str, str]:
                 info.append("\n".join(block))
             continue
         if bare == MAP_JSON_MARKER:
-            things = _map_things(lines[i + 1]) if i + 1 < len(lines) else ""
+            things = _map_things(lines[i + 1], unbeaten) if i + 1 < len(lines) else ""
             if things:
                 info.append(things)
             i += 2
@@ -446,6 +475,7 @@ class MCPToolAdapter:
                 # Pokemon MCP tools
                 "get_game_state": "/mcp/get_game_state",
                 "player_position": "/player_position",
+                "maintain_party": "/maintain_party",
                 "get_map_data": "/mcp/get_map_data",
                 "press_buttons": "/mcp/press_buttons",
                 "navigate_to": "/mcp/navigate_to",
@@ -2874,6 +2904,20 @@ class PokeAgent:
         if function_name in STORE_WRITING_TOOLS:
             self._store_ctx_cache = None
 
+    def _maintain_party(self) -> None:
+        """Ask the server to apply David's party rule; report a change in <last_result>."""
+        try:
+            result = self.mcp_adapter.call_tool("maintain_party", {})
+        except Exception as e:
+            logger.warning(f"maintain_party failed: {e}")
+            return
+        summary = result.get("summary") if isinstance(result, dict) else None
+        if summary:
+            logger.info(f"👥 {summary}")
+            self._store_function_result_for_context(
+                "party_rule", json.dumps({"success": bool(result.get("changed")), "summary": summary})
+            )
+
     def _end_position(self) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
         """(location, (x, y)) where the step left the player, from the server's light
         /player_position; (None, None) if it can't be read.
@@ -3612,6 +3656,13 @@ Step {step_count}"""
                 # before spending a model call on the screen.
                 self._auto_advance_dialogue()
                 self._step_timing["auto_advance_s"] = round(time.time() - part_start, 2)
+
+                # David's party rule (server maintain_party): the lowest-level Pokémon
+                # leads, or holds the Exp. Share once there is one. Applied by the
+                # harness when the player can walk; a change is reported like a result.
+                part_start = time.time()
+                self._maintain_party()
+                self._step_timing["maintain_party_s"] = round(time.time() - part_start, 2)
 
                 # Fetch game state
                 part_start = time.time()
