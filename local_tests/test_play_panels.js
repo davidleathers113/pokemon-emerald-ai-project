@@ -24,6 +24,41 @@ function slice(html, marker, until) {
 }
 
 const tests = {
+  // Seen on David's page: "55/55 HP · NONE" in red, which read like an error.
+  test_no_status_shows_nothing() {
+    const mon = { slot: 2, species: "NUMEL", level: 19, hp: 55, max_hp: 55, status: "NONE", moves: [] };
+    const html = P.renderParty({ party: [mon], badges: [], balls: [] });
+    assert.ok(html.includes("55/55 HP") && !html.includes("NONE") && !html.includes('class="status"'), html);
+    const poisoned = P.renderParty({ party: [{ ...mon, status: "PSN" }], badges: [], balls: [] });
+    assert.ok(poisoned.includes('<span class="status">PSN</span>'), poisoned);
+  },
+
+  // Seen after a restart: "#2 thinking, #1, #7, #6, #5…" (step numbers start again).
+  test_a_restart_is_marked_between_runs() {
+    const feed = {
+      now: "2026-11-04T16:41:00", paused: false, in_flight: { since: "2026-11-04T16:40:30", step: 2 }, events: [],
+      steps: [
+        { step: 1, time: "2026-11-04T16:40:30", tool: "go_to", args: {}, reasoning: "", result: null, success: null, duration_s: null },
+        { step: 7, time: "2026-11-04T16:38:00", tool: "use_move", args: {}, reasoning: "", result: "ok", success: true, duration_s: 30 },
+        { step: 6, time: "2026-11-04T16:37:30", tool: "use_move", args: {}, reasoning: "", result: "ok", success: true, duration_s: 30 },
+      ],
+    };
+    const html = P.renderFeed(feed, P.parseUtc(feed.now), {});
+    const divider = html.indexOf("— restarted");
+    assert.ok(divider !== -1, html);
+    assert.ok(html.indexOf("#1") < divider && divider < html.indexOf("#7"), html);
+    assert.strictEqual(html.split("— restarted").length, 2, html);  // one restart, one divider
+    assert.ok(html.includes('data-step="1@2026-11-04T16:40:30"'), html);  // keys stay unique across runs
+  },
+
+  // Right after a restart /objectives has no sequence yet (seen: "0 of 0 … done").
+  test_progress_says_loading_before_objectives_exist() {
+    const empty = { mode: null, story: { done: 0, total: 0, current_id: null, objectives: [] },
+      battling: { done: 0, total: 0, current_id: null, objectives: [] } };
+    const html = P.renderProgress(empty, [], {});
+    assert.ok(html.includes("Loading objectives") && !html.includes("0 of 0"), html);
+  },
+
   test_escape_html() {
     assert.strictEqual(P.escapeHtml(`<a href="x">'&'</a>`),
       "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
@@ -40,11 +75,14 @@ const tests = {
     assert.ok(Number.isNaN(P.parseUtc(null)));
   },
 
+  // Rows are keyed "step@time" (data-step="60@2026-…"), not by the step number alone:
+  // the numbers start again at each server restart. These tests used to match
+  // data-step="60" exactly; they now match the key's step prefix.
   test_feed_in_flight_row_counts_from_since() {
     const html = P.renderFeed(FEED, NOW);
     assert.ok(html.includes("thinking… 12 s"), html);
     assert.ok(html.includes("#61"));
-    assert.ok(html.indexOf("inflight") < html.indexOf('data-step="60"'), "in-flight row is on top");
+    assert.ok(html.indexOf("inflight") < html.indexOf('data-step="60@'), "in-flight row is on top");
     assert.ok(P.renderFeed(FEED, NOW + 60000).includes("thinking… 1 m 12 s"));
     assert.ok(!P.renderFeed({ ...FEED, in_flight: null }, NOW).includes("thinking…"));
   },
@@ -57,17 +95,17 @@ const tests = {
     assert.ok(html.includes("33.2 s"));
     assert.ok(html.includes(`<span class="t">${P.fmtClock(Date.UTC(2026, 10, 4, 16, 9, 20, 500))}</span>`));
     assert.ok(html.includes("Arrived: now at (7,0) on ROUTE 112"));
-    assert.ok(html.includes('<div class="step fail" data-step="58">'));
-    const failed = slice(html, 'data-step="58"', 'data-step="57"');
+    assert.ok(html.includes('<div class="step fail" data-step="58@2026-11-04T16:06:40">'));
+    const failed = slice(html, 'data-step="58@', 'data-step="57@');
     assert.ok(failed.includes('class="result fail"'), failed);
-    assert.ok(!slice(html, 'data-step="60"', 'data-step="59"').includes("fail"));
-    assert.ok(slice(html, 'data-step="57"', "</div></div>").includes("result pending"));
+    assert.ok(!slice(html, 'data-step="60@', 'data-step="59@').includes("fail"));
+    assert.ok(slice(html, 'data-step="57@', "</div></div>").includes("result pending"));
   },
 
   test_feed_events_interleave_by_time() {
     const html = P.renderFeed(FEED, NOW);
-    const order = ['data-step="60"', 'data-step="59"', "▶ Resumed by human", 'data-step="58"',
-      "⏸ Paused by stall_watch: SAME_TILE: 6 steps on (12,9)", 'data-step="57"'];
+    const order = ['data-step="60@', 'data-step="59@', "▶ Resumed by human", 'data-step="58@',
+      "⏸ Paused by stall_watch: SAME_TILE: 6 steps on (12,9)", 'data-step="57@'];
     const at = order.map((m) => html.indexOf(m));
     assert.ok(at.every((i) => i !== -1), JSON.stringify(at));
     assert.deepStrictEqual([...at].sort((a, b) => a - b), at, "rows newest first, events between steps");
@@ -75,8 +113,9 @@ const tests = {
   },
 
   test_feed_expanded_rows_stay_open() {
-    assert.ok(P.renderFeed(FEED, NOW, { 59: true }).includes('class="step open" data-step="59"'));
-    assert.ok(P.renderFeed(FEED, NOW).includes('class="step" data-step="59"'));
+    const key = "59@2026-11-04T16:08:02.250";
+    assert.ok(P.renderFeed(FEED, NOW, { [key]: true }).includes(`class="step open" data-step="${key}"`));
+    assert.ok(P.renderFeed(FEED, NOW).includes(`class="step" data-step="${key}"`));
   },
 
   test_feed_escapes_model_text() {

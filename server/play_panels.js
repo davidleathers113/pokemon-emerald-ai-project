@@ -6,6 +6,9 @@ const PlayPanels = (() => {
   const BADGE_NAMES = ["Stone", "Knuckle", "Dynamo", "Heat", "Balance", "Feather", "Mind", "Rain"];
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const MAX_EVENTS = 10;
+  // The party's status names for "no status problem": nothing is shown for them
+  // (seen on David's page: "55/55 HP · NONE" in red read like an error).
+  const HEALTHY_STATUSES = new Set(["", "OK", "NONE", "NORMAL"]);
 
   function escapeHtml(value) {
     if (value === null || value === undefined) return "";
@@ -83,7 +86,9 @@ const PlayPanels = (() => {
   }
 
   function stepRow(s, expanded) {
-    const open = expanded && expanded[s.step] ? " open" : "";
+    // Step numbers start again at each server restart: the time keeps the key unique.
+    const key = `${s.step}@${s.time}`;
+    const open = expanded && expanded[key] ? " open" : "";
     const fail = s.success === false ? " fail" : "";
     const dur = typeof s.duration_s === "number" ? `${s.duration_s.toFixed(1)} s` : "";
     const reasoning = s.reasoning
@@ -91,7 +96,7 @@ const PlayPanels = (() => {
     const result = s.result === null || s.result === undefined
       ? `<div class="result pending">…</div>`
       : `<div class="result${fail}">${escapeHtml(s.result)}</div>`;
-    return `<div class="step${fail}${open}" data-step="${escapeHtml(s.step)}">`
+    return `<div class="step${fail}${open}" data-step="${escapeHtml(key)}">`
       + `<div class="step-head"><span class="t">${fmtClock(parseUtc(s.time))}</span>`
       + `<span class="n">#${escapeHtml(s.step)}</span>`
       + `<code class="call">${escapeHtml(fmtCall(s.tool, s.args))}</code>`
@@ -113,7 +118,7 @@ const PlayPanels = (() => {
   function renderFeed(feed, nowMs, expanded) {
     if (!feed) return `<div class="empty">Waiting for the AI…</div>`;
     const steps = Array.isArray(feed.steps) ? feed.steps : [];
-    const items = steps.map((s) => ({ ms: parseUtc(s.time), html: stepRow(s, expanded) }));
+    const items = steps.map((s) => ({ ms: parseUtc(s.time), step: Number(s.step), html: stepRow(s, expanded) }));
     // Only events inside the window the steps cover, or a long history of
     // pauses would push the steps out of the feed.
     const stepTimes = items.map((i) => i.ms).filter(Number.isFinite);
@@ -135,7 +140,25 @@ const PlayPanels = (() => {
         + `thinking… ${fmtElapsed(since, nowMs)}</span></div></div>`;
     }
     if (!items.length && !f) return `${html}<div class="empty">No steps yet.</div>`;
-    return html + items.map((i) => i.html).join("");
+    return html + withRestartDividers(items).map((i) => i.html).join("");
+  }
+
+  // Newest first, step numbers fall; where an older step's number is not below the
+  // newer one's, the server was restarted in between (its numbering starts again).
+  // Seen on David's page after a restart: "#2 thinking, #1, #7, #6, #5…".
+  function withRestartDividers(items) {
+    const out = [];
+    let newer = null;
+    for (const item of items) {
+      if (Number.isFinite(item.step)) {
+        if (newer && item.step >= newer.step) {
+          out.push({ html: `<div class="event restart">— restarted ${fmtClock(newer.ms)} —</div>` });
+        }
+        newer = item;
+      }
+      out.push(item);
+    }
+    return out;
   }
 
   function hpClass(hp, max) {
@@ -157,7 +180,9 @@ const PlayPanels = (() => {
       ? ` <span class="nick">“${escapeHtml(p.nickname)}”</span>` : "";
     let status = "";
     if (hp <= 0) status = ` · <span class="status">Fainted</span>`;
-    else if (p.status && p.status !== "OK") status = ` · <span class="status">${escapeHtml(p.status)}</span>`;
+    else if (p.status && !HEALTHY_STATUSES.has(String(p.status).toUpperCase())) {
+      status = ` · <span class="status">${escapeHtml(p.status)}</span>`;
+    }
     const moves = (Array.isArray(p.moves) ? p.moves : []).map((m) => {
       const noPp = m.pp === 0 ? " no-pp" : "";
       return `<li class="move${noPp}"><span class="mv">${escapeHtml(m.name)}</span>`
@@ -234,6 +259,9 @@ const PlayPanels = (() => {
     const toggles = openChapters || {};
     const story = objectives.story || { objectives: [] };
     const list = Array.isArray(story.objectives) ? story.objectives : [];
+    // Right after a server restart the objectives are loaded with the agent's first
+    // step; until then /objectives has none ("0 of 0 … done" read like a fault).
+    if (!list.length) return `<div class="empty">Loading objectives… (they load with the AI's first step)</div>`;
     const done = typeof story.done === "number" ? story.done : list.filter((o) => o.status === "done").length;
     const total = typeof story.total === "number" ? story.total : list.length;
     const pips = BADGE_NAMES.map((name, i) => {
