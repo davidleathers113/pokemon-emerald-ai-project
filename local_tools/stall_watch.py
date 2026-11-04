@@ -134,17 +134,34 @@ def rows_after(rows: list, watch_from: str) -> list:
     return kept
 
 
+def newest_time(rows: list) -> str:
+    """The newest row's own timestamp, the cutoff for rows_after ("" sorts before all).
+
+    Rows are stamped by the game container (UTC); the watcher runs on the Mac (local
+    time, five hours behind). Seen live: a cutoff from the Mac's clock let every row of
+    the last five hours through, so a stall already handled paused the agent again 11 s
+    after the unpause. Taking the cutoff from the rows themselves needs no time zone.
+    """
+    from datetime import datetime
+
+    stamps = []
+    for row in rows:
+        try:
+            stamps.append(datetime.fromisoformat(row["timestamp"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return max(stamps).isoformat() if stamps else "0001-01-01T00:00:00"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--no-pause", action="store_true", help="only report, never pause the agent")
     args = parser.parse_args()
-    from datetime import datetime
-
     last_seen = None  # timestamp of the decision a stall was reported on
-    # Only decisions made after this count: the watcher's start, then each unpause
-    # (whoever unpaused has dealt with what came before).
-    watch_from = datetime.now().isoformat()
+    # Only decisions newer than the newest one at the watcher's start, then at each
+    # unpause, count (whoever unpaused has dealt with what came before).
+    watch_from = newest_time(_latest_decisions())
     was_paused = False
     down = 0
     while True:
@@ -152,7 +169,7 @@ def main() -> int:
             paused = bool(_get("/agent_pause").get("paused"))
             down = 0
             if was_paused and not paused:
-                watch_from = datetime.now().isoformat()
+                watch_from = newest_time(_latest_decisions())
             was_paused = paused
         except Exception:
             down += 1

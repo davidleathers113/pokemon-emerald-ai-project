@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "local_tools"))
-from stall_watch import rows_after, stall_reason
+from stall_watch import newest_time, rows_after, stall_reason
 
 
 def _row(tool, args=None, loc="ROUTE 117", xy=(47, 5), ts="t"):
@@ -48,6 +48,20 @@ def test_rows_from_before_the_watch_started_are_not_judged():
     new = _row("go_to", {"place": "Route 117"}, xy=(0, 6), ts="2026-11-04T06:18:10")
     assert rows_after(old + [new], "2026-11-04T06:17:36") == [new]
     assert rows_after([{"timestamp": "garbled"}, new], "2026-11-04T06:17:36") == [new]
+
+
+def test_the_cutoff_is_taken_from_the_rows_own_clock():
+    """Seen live: rows are stamped in UTC (06:35) and the Mac's clock read 01:35; a cutoff
+    from the Mac's clock let every row through, and 11 s after an unpause the REPEAT
+    already handled (use_move LEECH SEED x4) paused the agent again."""
+    seeded = [_row("use_move", {"move": "LEECH SEED"}, ts=f"2026-11-04T06:34:4{i}.5") for i in range(4)]
+    assert stall_reason(seeded).startswith("REPEAT")
+    cutoff = newest_time(seeded)  # unpaused, no decision since
+    assert cutoff == "2026-11-04T06:34:43.500000"
+    assert stall_reason(rows_after(seeded, cutoff)) == ""
+    after = seeded + [_row("use_move", {"move": "LEECH SEED"}, ts="2026-11-04T06:35:30")]
+    assert rows_after(after, cutoff) == after[-1:]  # only the new decision is judged
+    assert newest_time([]) == "0001-01-01T00:00:00" and rows_after(seeded, newest_time([])) == seeded
 
 
 def test_battles_and_progress_are_not_stalls():

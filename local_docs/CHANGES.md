@@ -1115,6 +1115,13 @@ prompt. That came to 1.1 tiles walked per minute.
 - Seen live 01:17: after a restart the new run's trajectory file began with the previous
   run's rows (timestamps kept), and the stall already handled paused the agent again.
   The watcher now judges only rows after its start or the last unpause (`rows_after`).
+- Seen live 01:35 (my first version of that cutoff): rows are stamped in the container's
+  UTC, the watcher ran on the Mac's local clock five hours behind, so the cutoff let
+  every row through and a REPEAT already handled paused the agent again 11 s after the
+  unpause. The cutoff is now the newest row's own timestamp at start/unpause
+  (`newest_time`), so no clock or time zone is involved. Test
+  `test_the_cutoff_is_taken_from_the_rows_own_clock`; on the live trajectory the cutoff
+  passes 0 old rows.
 - *Verified:* `test_stall_watch.py` 6/6 (two new; the old three-walks test assumed a row
   is where its call ended and now adds the next row). Replaying every run file from
   2026-11-04: the Verdanturf report is gone; the real stalls (navigate_to ×3 at (0,6) on
