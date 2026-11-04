@@ -613,7 +613,11 @@ def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
     if not root:
         return None
     try:
-        built = build_json_map(map_dir, root, include_grid=True, include_ascii=False)
+        # Every badge: the map's own layout, never a badge-dependent variant
+        # (ascii_map_loader CONDITIONAL_SELECTORS). With none, PetalburgCity_Gym came back
+        # as the 9x8 lobby numbered from row 0, while its warps are in the 9x112 map's
+        # coordinates, so no door of the gym joined anything.
+        built = build_json_map(map_dir, root, include_grid=True, include_ascii=False, badge_count=8)
     except Exception as e:  # a broken neighbour must not take the prompt down with it
         logger.warning(f"Porymap: could not build grid for {map_dir}: {e}")
         return None
@@ -621,6 +625,101 @@ def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
     if not grid:
         return None
     return tuple("".join(str(cell) for cell in row) for row in grid)
+
+
+@lru_cache(maxsize=None)
+def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
+    """For each of the map's warp_events, in order: (its layout tile (tile id, behavior,
+    collision, elevation) or None, whether a bg_event with a script is on that tile).
+
+    Tiles come from the decomp's own layout, never an ASCII override: an override draws
+    only walls and floor, and RustboroCity's draws its gym door as plain floor.
+    """
+    from utils.mapping.pokeemerald_parser import PokeemeraldLayoutParser, PokeemeraldMapLoader
+
+    root = _get_pokeemerald_root()
+    map_file = Path(root) / "data" / "maps" / map_dir / "map.json" if root and map_dir else None
+    if map_file is None or not map_file.is_file():
+        return ()  # an override with its own warps (PetalburgCity_Gym_Lobby) has no map.json
+    try:
+        with open(map_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+        layout = PokeemeraldMapLoader(Path(root)).get_layout_name_from_map(map_dir)
+        tiles = PokeemeraldLayoutParser(Path(root)).get_metatiles_with_behavior(layout) if layout else None
+    except Exception as e:  # unreadable: every warp counts as an ordinary one, as before
+        logger.warning(f"Porymap: could not read tiles for {map_dir}: {e}")
+        return ()
+    tiles = tiles or []
+    scripted = {
+        (int(bg.get("x", -1)), int(bg.get("y", -1))) for bg in data.get("bg_events") or [] if bg.get("script")
+    }
+    out = []
+    for warp in data.get("warp_events") or []:
+        x, y = int(warp.get("x", -1)), int(warp.get("y", -1))
+        tile = tiles[y][x] if 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
+        out.append((tuple(tile) if tile is not None and len(tile) > 2 else None, (x, y) in scripted))
+    return tuple(out)
+
+
+@lru_cache(maxsize=None)
+def arrival_only_warps(map_dir: str) -> frozenset:
+    """Indexes in the map's warp_events of the warps that only mark where a warp arrives.
+
+    pret src/field_control_avatar.c: stepping on a warp event warps only when the tile's
+    metatile behavior is a warp one (TryStartWarpEventScript → IsWarpMetatileBehavior);
+    arrow warps (TryArrowWarp → IsArrowWarpMetatileBehavior) and doors check their own.
+    A warp event on walkable ground with none of those behaviors never fires: it is where
+    a warp from elsewhere puts the player. LavaridgeTown_Gym_1F has three, spots B1F's
+    geysers throw the player up to (e.g. (3,6)); listed as exits, they drew routes onto
+    tiles that go nowhere. Seen live: PETALBURG CITY GYM (6,59)/(7,59), plain floor in
+    Alexia's room, fire nothing. A warp in a wall (collision) still counts: doors that
+    scripts open at run time (PetalburgCity_Gym's sign doors, sign_door_warps; the Elite
+    Four's) are walls in the static layout.
+    """
+    return frozenset(i for i, (tile, _) in enumerate(_warp_tiles(map_dir)) if lands_only(tile))
+
+
+def lands_only(tile: Optional[tuple]) -> bool:
+    """Whether a warp event on this tile (tile id, behavior, collision, elevation) never
+    fires: walkable ground without a warp behavior (arrival_only_warps)."""
+    if tile is None or len(tile) < 3:
+        return False
+    return not tile[2] and str(getattr(tile[1], "name", tile[1])) not in _WARP_BEHAVIORS
+
+
+# Behaviors a warp event fires on (pret src/metatile_behavior.c): IsWarpMetatileBehavior's
+# doors, ladders, escalators, holes, geysers and pads, and IsArrowWarpMetatileBehavior's
+# arrows (MetatileBehavior_IsNorthArrowWarp counts MB_STAIRS_OUTSIDE_ABANDONED_SHIP,
+# IsSouthArrowWarp MB_WATER_SOUTH_ARROW_WARP and MB_SHOAL_CAVE_ENTRANCE). The water ones
+# stay too (Route131's way into Sky Pillar reads as MB_DEEP_WATER here, UnionRoom's way
+# out as MB_BRIDGE_OVER_OCEAN): no walk stands on them, and dropping a real one would
+# hide it from EXITS.
+_WARP_BEHAVIORS = frozenset({
+    "ANIMATED_DOOR", "NON_ANIMATED_DOOR", "WATER_DOOR", "DEEP_SOUTH_WARP", "LADDER",
+    "UP_ESCALATOR", "DOWN_ESCALATOR", "LAVARIDGE_GYM_B1F_WARP", "LAVARIDGE_GYM_1F_WARP",
+    "AQUA_HIDEOUT_WARP", "MT_PYRE_HOLE", "MOSSDEEP_GYM_WARP", "BATTLE_PYRAMID_WARP",
+    "CRACKED_FLOOR_HOLE", "EAST_ARROW_WARP", "WEST_ARROW_WARP", "NORTH_ARROW_WARP",
+    "SOUTH_ARROW_WARP", "WATER_SOUTH_ARROW_WARP", "STAIRS_OUTSIDE_ABANDONED_SHIP",
+    "SHOAL_CAVE_ENTRANCE", "DEEP_WATER", "OCEAN_WATER", "BRIDGE_OVER_OCEAN",
+})
+
+
+@lru_cache(maxsize=None)
+def sign_door_warps(map_dir: str) -> frozenset:
+    """Indexes in the map's warp_events of doors gone through by reading them: the warp's
+    tile can't be walked onto (collision) and a bg_event with a script stands on it.
+
+    pret data/maps/PetalburgCity_Gym: each room door is a warp whose tile has a sign
+    (BG_EVENT_PLAYER_FACING_ANY), e.g. PetalburgCity_Gym_EventScript_SpeedRoomDoor at
+    (1,105): MSGBOX_YESNO "…ROOM,' the sign says. Do you want to go through?", YES →
+    warpdoor MAP_PETALBURG_CITY_GYM 7,85 (warp 3's tile); a locked door says "The door
+    appears to be locked." Seen live: walking up into (7,79) is BLOCKED; A, then YES, went
+    through.
+    """
+    return frozenset(
+        i for i, (tile, scripted) in enumerate(_warp_tiles(map_dir))
+        if scripted and tile is not None and tile[2]
+    )
 
 
 def connection_open_span(conn: Dict[str, Any]) -> Optional[set]:
@@ -723,6 +822,16 @@ def _map_trainers(map_dir: str) -> Tuple[Tuple[int, int, str, int], ...]:
         scripts = (map_path / "scripts.inc").read_text(encoding="utf-8")
     except (OSError, ValueError):
         return ()
+    # Floors of one place can keep their scripts in a sibling's file: pret has
+    # LavaridgeTown_Gym_B1F_EventScript_Jace in LavaridgeTown_Gym_1F/scripts.inc.
+    stem = map_dir.rpartition("_")[0]
+    if stem:
+        for sibling in sorted(map_path.parent.glob(f"{stem}_*/scripts.inc")):
+            if sibling.parent != map_path:
+                try:
+                    scripts += "\n" + sibling.read_text(encoding="utf-8")
+                except OSError:
+                    continue
     ids = _trainer_ids()
     out = []
     for obj in objects:
@@ -734,13 +843,18 @@ def _map_trainers(map_dir: str) -> Tuple[Tuple[int, int, str, int], ...]:
         body = scripts[start + len(label): body_end if body_end != -1 else len(scripts)]
         for line in body.splitlines():
             words = line.replace(",", " ").split()
-            if len(words) >= 2 and words[0].startswith("trainerbattle") and words[1] in ids:
-                name = words[1][len("TRAINER_"):]
+            # The trainer comes first (`trainerbattle_single TRAINER_JOSH, ...`), or after
+            # the battle type in the generic macro (pret LavaridgeTown_Gym_1F: `trainerbattle
+            # TRAINER_BATTLE_CONTINUE_SCRIPT, TRAINER_COLE, ...`), whose gym trainers were
+            # all missing here.
+            trainer = next((word for word in words[1:3] if word in ids), None)
+            if words and words[0].startswith("trainerbattle") and trainer:
+                name = trainer[len("TRAINER_"):]
                 # TRAINER_ROXANNE_1 -> ROXANNE: the number is the rematch tier.
                 head, _, tail = name.rpartition("_")
                 if head and tail.isdigit():
                     name = head
-                out.append((int(obj.get("x", 0)), int(obj.get("y", 0)), name.replace("_", " "), ids[words[1]]))
+                out.append((int(obj.get("x", 0)), int(obj.get("y", 0)), name.replace("_", " "), ids[trainer]))
                 break
     return tuple(out)
 
@@ -799,7 +913,12 @@ def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str]) -> List[str]
         else:
             how = ""
         lines.append(f"- {edge} edge of the map{how} -> {_readable_map_name(conn.get('map', '?'))}")
-    for warp in json_map.get("warps", []):
+    # Warps in the map's own order (an override with its own warps has no map.json of
+    # that name, so none are left out there).
+    arrival_only = arrival_only_warps(str(json_map.get("name") or ""))
+    for i, warp in enumerate(json_map.get("warps", [])):
+        if i in arrival_only:
+            continue  # only where a warp from elsewhere lands; stepping on it does nothing
         lines.append(
             f"- door/warp at ({warp.get('x', '?')}, {warp.get('y', '?')}) -> "
             f"{_readable_map_name(warp.get('dest_map', '?'))}"

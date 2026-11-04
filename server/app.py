@@ -1027,18 +1027,41 @@ def _settle_move_check() -> None:
     _finish_action(data)
 
 
-def _drop_rest_of_sequence(seq_id: int) -> int:
-    """Remove this sequence's still-queued presses; returns how many were dropped."""
+def _drop_rest_of_sequence(seq_id: int, keep_facing_presses: bool = False) -> int:
+    """Remove this sequence's still-queued presses; returns how many were dropped.
+
+    keep_facing_presses (after a BLOCKED step): the presses up to the next direction
+    stay; they act on what the player now faces. Seen live in PETALBURG CITY GYM:
+    [UP, A] at a room door (read, not walked into) lost its A to the BLOCKED UP.
+    """
     global action_queue
+    from server.field_control import DIRECTION_DELTAS
+
     with action_queue_lock:
-        kept = [a for a in action_queue if not (isinstance(a, dict) and a.get("seq_id") == seq_id)]
+        mine = [a for a in action_queue if isinstance(a, dict) and a.get("seq_id") == seq_id]
+        mine.sort(key=lambda a: a.get("seq_index", 0))
+        stays = set()
+        if keep_facing_presses:
+            for a in mine:
+                if a.get("button") in DIRECTION_DELTAS:
+                    break
+                stays.add(id(a))
+        kept = [
+            a for a in action_queue
+            if not (isinstance(a, dict) and a.get("seq_id") == seq_id) or id(a) in stays
+        ]
         dropped = len(action_queue) - len(kept)
         action_queue[:] = kept
+        kept_indexes = {a.get("seq_index") for a in mine if id(a) in stays}
     # Skipped presses never happened: take them out of the recent-actions list the
     # state text is built from (it also expects an end_pos on every completed press).
     recent_button_presses[:] = [
         entry for entry in recent_button_presses
-        if not (entry.get("seq_id") == seq_id and not entry.get("completed"))
+        if not (
+            entry.get("seq_id") == seq_id
+            and not entry.get("completed")
+            and entry.get("sequence_index") not in kept_indexes
+        )
     ]
     return dropped
 
@@ -1062,7 +1085,7 @@ def _judge_move(check: Dict[str, Any], after) -> None:
     verdict = judge_direction_press(button, before, after, check["previous"])
     if verdict is None:
         return
-    skipped = _drop_rest_of_sequence(seq_id)
+    skipped = _drop_rest_of_sequence(seq_id, keep_facing_presses=verdict == BLOCKED)
     total = report["total"] if report else skipped + 1
     location = _location_name()
     if verdict == BLOCKED:
@@ -4744,20 +4767,33 @@ def _nothing_happened_note(buttons: List[str], before) -> str:
     return note
 
 
-def _refuse_repeat_of_blocked_press(buttons: List[str]) -> Optional[Dict[str, Any]]:
-    """Refuse a call that starts with the very press that was just blocked from this tile."""
+def _refuse_repeat_of_blocked_press(buttons: List[str]) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+    """Leave out the very press that was just blocked from this tile when a call starts
+    with it: (the buttons to press, None), or ([], a refusal) when nothing else is left.
+
+    Only the repeats of the blocked direction go. Seen live in PETALBURG CITY GYM: the
+    door at (7,79) is read, not walked into (UP is BLOCKED, A asks "Do you want to go
+    through?"); [UP, A] was refused whole, so the A never reached the door, and the model
+    cycled UP / [UP, A] for six calls.
+    """
     global last_blocked_press
     blocked = last_blocked_press
     if not blocked or not buttons:
-        return None
+        return buttons, None
     snap = _field_snapshot()
     if snap is None:
-        return None
+        return buttons, None
     if (snap.x, snap.y, snap.map_id) != (blocked["x"], blocked["y"], blocked["map_id"]):
         last_blocked_press = None  # moved on: the old block no longer applies
-        return None
+        return buttons, None
     if buttons[0] != blocked["button"] or not snap.field_free:
-        return None
+        return buttons, None
+    rest = list(buttons)
+    while rest and rest[0] == blocked["button"]:
+        rest.pop(0)
+    if rest:
+        logger.info(f"🚫 {blocked['button']} left out (already BLOCKED at ({snap.x},{snap.y})); pressing {rest}")
+        return rest, None
     message = (
         f"Not pressed: {blocked['button']} from ({snap.x},{snap.y}) was already BLOCKED there, so it "
         f"would do nothing again. To leave this map use go_to_exit (see EXITS); to reach a tile on this "
@@ -4772,7 +4808,7 @@ def _refuse_repeat_of_blocked_press(buttons: List[str]) -> Optional[Dict[str, An
     if hint:
         message += f" {hint}"
     logger.info(f"🚫 {message}")
-    return {"success": False, "error": message, "status": "REFUSED", "summary": message, "buttons_queued": []}
+    return [], {"success": False, "error": message, "status": "REFUSED", "summary": message, "buttons_queued": []}
 
 
 # go_to_exit: a second look for a map change before a walk is called a failure.
@@ -4794,6 +4830,70 @@ async def _await_map_change(old_map_id, timeout_s: float):
                 return snap
         await asyncio.sleep(0.1)
     return snap
+
+
+def _went_through(plan: Dict[str, Any], before, snap) -> bool:
+    """go_to_exit: did the walk take the planned exit? The map changed, or, for a warp to
+    another spot of the same map (plan "arrival_here"), the player stands at its landing
+    tile (game_tools.came_through_warp)."""
+    from server import game_tools
+
+    if snap is None or before is None:
+        return False
+    if snap.map_id != before.map_id:
+        return True
+    arrival = plan.get("arrival_here")
+    if not arrival:
+        return False
+    ox, oy = plan.get("coord_offset") or (0, 0)
+    return game_tools.came_through_warp(tuple(arrival), tuple(plan["warp_tile"]), (snap.x - ox, snap.y - oy))
+
+
+async def _await_exit(plan: Dict[str, Any], before, timeout_s: float):
+    """_await_map_change, and for a warp within the map: until the player stands at its
+    landing tile and can walk (the map id never changes, so that wait would run out)."""
+    if not plan.get("arrival_here"):
+        return await _await_map_change(before.map_id, timeout_s)
+    deadline = time.monotonic() + timeout_s
+    snap = _field_snapshot()
+    while time.monotonic() < deadline:
+        snap = _field_snapshot()
+        if snap is not None and snap.map_id != before.map_id:
+            return await _await_map_change(before.map_id, max(0.1, deadline - time.monotonic()))
+        if snap is not None and snap.field_free and _went_through(plan, before, snap):
+            return snap
+        await asyncio.sleep(0.1)
+    return snap
+
+
+async def _open_sign_door(plan: Dict[str, Any], source: str) -> Optional[str]:
+    """In front of a sign door (game_tools.plan_exit_route kind "sign_door"): face it, press
+    A, and answer YES to "Do you want to go through?". None once YES is pressed, else why
+    not (e.g. the door's "The door appears to be locked.", read and closed).
+
+    pret data/maps/PetalburgCity_Gym/scripts.inc, e.g. EventScript_SpeedRoomDoor: lockall,
+    MSGBOX_YESNO, YES → EnterRoom (closemessage, delay 30, warpdoor). Seen live: UP into
+    the door at (7,79) was BLOCKED (it only turned the player), then A and YES went through.
+    """
+    from server import menu_state as ms
+
+    snap = _field_snapshot()
+    if snap is not None and snap.facing != plan["face"]:
+        await _macro_press([plan["face"]], source)  # the door is a wall: this only turns
+    await _macro_press(["A"], source)
+    asked, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+    if not asked:
+        await _close_dialogue(source)
+        said = _quote(texts)
+        return f"reading the door at {tuple(plan['warp_tile'])} asked nothing ({said or 'nothing was said'})"
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor == 1 and cursor.cursor == 1:
+        await _macro_press(["UP"], source)
+        cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor != 1 or cursor.cursor != 0:
+        return f"the door's YES/NO cursor is not on YES (cursor {cursor.cursor}); answer it yourself"
+    await _macro_press(["A"], source)  # YES
+    return None
 
 
 async def _settle_after_sequence(before, report: Optional[Dict[str, Any]]) -> None:
@@ -4915,58 +5015,77 @@ async def mcp_go_to_exit(request: dict):
                     ActionRequest(buttons=buttons, source="go_to_exit", metadata={"exit": plan["label"]}, check_movement=True)
                 )
                 report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
-            snap = await _await_map_change(before.map_id, 4.0 if plan["kind"] == "warp" else 1.5)
+            snap = await _await_exit(plan, before, 4.0 if plan["kind"] == "warp" else 1.5)
             # A rock or tree on the way that the party can clear: clear it, plan again.
             used = await _clear_obstacle((report or {}).get("blocked_tile"), "go_to_exit")
             if used:
                 cleared.append(f"used {used} at {tuple(report['blocked_tile'])}")
                 continue
             person = (report or {}).get("blocked_by_person")
-            if not person or snap is None or snap.map_id != before.map_id or tuple(person) in avoid:
+            if not person or snap is None or _went_through(plan, before, snap) or tuple(person) in avoid:
                 break
             avoid.append(tuple(person))
         from_text = first_from
+        walk_stopped = bool(report and (report.get("blocked") or report.get("interrupted")))
+        ox, oy = plan.get("coord_offset") or (0, 0)
+
+        # A sign door is read, not stepped on: from the tile in front, A and YES.
+        door_trouble = None
+        if (
+            plan["kind"] == "sign_door"
+            and snap is not None
+            and not _went_through(plan, before, snap)
+            and (snap.x - ox, snap.y - oy) == tuple(plan["target"])
+        ):
+            door_trouble = await _open_sign_door(plan, "go_to_exit")
+            if door_trouble is None:
+                snap = await _await_exit(plan, before, 4.0)
 
         # Arrow warps (house mats, cave mouths) fire when the player walks off them.
         pushes_tried = []
         if (
             plan["kind"] == "warp"
             and snap is not None
-            and snap.map_id == before.map_id
-            and not (report and (report.get("blocked") or report.get("interrupted")))
+            and not _went_through(plan, before, snap)
+            and not walk_stopped
         ):
             grid = plan["grid"]
-            ox, oy = plan.get("coord_offset") or (0, 0)
             local = (snap.x - ox, snap.y - oy)
             if local == tuple(plan["target"]):
                 last_move = buttons[-1] if buttons else None
                 for push in warp_push_directions(grid, plan.get("raw_tiles"), local[0], local[1], last_move)[:2]:
                     pushes_tried.append(push)
                     await take_action(ActionRequest(buttons=[push], source="go_to_exit"))
-                    snap = await _await_map_change(before.map_id, 4.0)
-                    if snap is not None and snap.map_id != before.map_id:
+                    snap = await _await_exit(plan, before, 4.0)
+                    if _went_through(plan, before, snap):
                         break
 
-        if snap is None or snap.map_id == before.map_id:
+        if not _went_through(plan, before, snap):
             # The map can change after the wait above gave up (a slow fade); look again
             # before calling the walk a failure.
-            snap = await _await_map_change(before.map_id, LATE_MAP_CHANGE_S)
+            snap = await _await_exit(plan, before, LATE_MAP_CHANGE_S)
         location = _location_name()
         now = _position_text(snap, location)
         response = {"exit": plan["label"], "from": from_text, "now": now, "path_length": len(plan["buttons"])}
         on_the_way = f" On the way: {'; '.join(cleared)}." if cleared else ""
-        if snap is not None and snap.map_id != before.map_id:
+        if _went_through(plan, before, snap):
             response["success"] = True
             response["summary"] = f"Arrived: now at {now} (took exit: {plan['label']}).{on_the_way}"
             return response
         response["success"] = False
-        if report and (report.get("blocked") or report.get("interrupted")):
+        if walk_stopped:
             reason = report.get("blocked") or report.get("interrupted")
+        elif door_trouble:
+            reason = door_trouble
         elif pushes_tried:
             reason = f"reached the warp tile but it did not fire (tried {', '.join(pushes_tried)})"
+        elif plan.get("arrival_here"):
+            reason = f"the walk ended without arriving at {tuple(plan['arrival_here'])}, where that warp leads"
         else:
             reason = "the walk ended without leaving the map"
-        response["error"] = f"Did not leave the map ({plan['label']}): {reason}"
+        # A warp within the map is not "leaving" it: say what did not happen.
+        what = "Did not go through" if plan.get("arrival_here") else "Did not leave the map"
+        response["error"] = f"{what} ({plan['label']}): {reason}"
         response["summary"] = f"{response['error']} Now at {now}."
         return response
     except Exception as e:
@@ -5241,9 +5360,11 @@ async def mcp_press_buttons(request: dict):
             logger.info(f"🎮 Agent chose to WAIT (no buttons pressed) - {reasoning}")
             return {"success": True, "buttons_queued": [], "action": "WAIT", "summary": "Waited (no buttons pressed)."}
 
-        refusal = _refuse_repeat_of_blocked_press(actual_buttons)
+        asked_for = actual_buttons
+        actual_buttons, refusal = _refuse_repeat_of_blocked_press(actual_buttons)
         if refusal is not None:
             return refusal
+        left_out = len(asked_for) - len(actual_buttons)
 
         # Call the existing take_action function to ensure metrics tracking
         action_request = ActionRequest(
@@ -5260,6 +5381,11 @@ async def mcp_press_buttons(request: dict):
         nothing = _nothing_happened_note(actual_buttons, before)
         if nothing:
             response_dict["summary"] += f" {nothing}"
+        if left_out:
+            response_dict["summary"] = (
+                f"Not pressed: {asked_for[0]} x{left_out} (already BLOCKED from this tile; you face that way). "
+                + response_dict["summary"]
+            )
 
         # Include warning if any buttons were invalid
         if invalid_buttons:
@@ -7416,7 +7542,8 @@ async def _walk_along(
             step = await _ride_cable_car(source, route[0][1])
         else:
             step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
-        if _location_name() != location:
+        # A warp within the map (game_tools.tile_route) succeeds without a new map name.
+        if _location_name() != location or step.get("success"):
             crossed.add((location, route[0][0]))
             entered.append(_location_name())
         elif not _mem(lambda r: r.is_in_battle()) and _player_can_walk():
@@ -7428,6 +7555,52 @@ async def _walk_along(
                 continue
             return entered, f'go_to_exit("{route[0][0]}") did not get there ({step.get("summary") or step.get("error")})'
     return entered, "the walk took too many steps"
+
+
+async def _cross_to(target_tiles, goal: str, source: str, again: str) -> Tuple[List[str], Optional[str]]:
+    """Before a walk to target_tiles (this map, in the walking tools' coordinates): when
+    none is on the part of the map the player can walk to but game_tools.tile_route knows
+    a way there through warps (holes, geysers, doors within the map), take it one
+    go_to_exit at a time (_walk_along: wild battles are run from, a trainer battle or a
+    question stops it). Returns (maps entered on the way, why it stopped short or None);
+    ([], None) when no crossing is needed or none is known (the walk then says why).
+
+    Seen live: talk_to(13,9) for Flannery in LAVARIDGE TOWN GYM 1F answered "Could not
+    reach a tile next to (13,9): No path found from (9, 9) to (12, 9)".
+    """
+    from server import game_tools
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    snap = _field_snapshot()
+    location = _location_name()
+    map_dir = ROM_TO_PORYMAP_MAP.get(location, "")
+    if snap is None or not map_dir:
+        return [], None
+    badges = _mem(lambda r: len(r.read_badges() or []))
+    ox, oy = game_tools.map_coord_offset(map_dir, badges)
+    tiles = [(tx + ox, ty + oy) for tx, ty in target_tiles]
+    route = await run_in_threadpool(game_tools.tile_route, map_dir, (snap.x, snap.y), tiles)
+    if not route:
+        return [], None
+
+    def next_route(here: str, position):
+        return game_tools.tile_route(map_dir, position, tiles, here_dir=ROM_TO_PORYMAP_MAP.get(here, ""))
+
+    def arrived() -> bool:
+        here = _field_snapshot()
+        return (
+            here is not None
+            and _location_name() == location
+            and game_tools.tile_route(map_dir, (here.x, here.y), tiles) == []
+        )
+
+    logger.info(f"{source}: {goal} is through {' → '.join(name for _, name in route)}")
+    with _turbo():
+        return await _walk_along(next_route, arrived, goal, source, again, GO_TO_MAX_MAPS)
+
+
+def _crossing_note(entered: List[str]) -> str:
+    return f"Went through {' → '.join(entered)} to get there. " if entered else ""
 
 
 GO_TO_MAX_MAPS = 15
@@ -7537,6 +7710,10 @@ async def mcp_talk_to(request: dict = None):
     Gym), the model aimed navigate_to at the person's own tile, which can't be stood on,
     and shuffled between the tiles around them for many minutes without facing them and
     pressing A. One call now does all of it; a battle that starts is left to use_move.
+
+    When the person is on a part of the map reached only through warps (Flannery, in
+    LAVARIDGE TOWN GYM 1F, beyond its holes and B1F's geysers), _cross_to takes that way
+    first and the summary names it.
     """
     if env is None:
         return {"success": False, "error": "Emulator not initialized"}
@@ -7551,6 +7728,26 @@ async def mcp_talk_to(request: dict = None):
     refused = _field_refusal(source)
     if refused:
         return refused
+    if _field_snapshot() is None:
+        return _refusal("The player's position could not be read.")
+    entered, why = await _cross_to(
+        [(x - dx, y - dy) for dx, dy in DIRECTION_DELTAS.values()],
+        f"the person at ({x},{y})",
+        source,
+        f"talk_to({x}, {y}) again",
+    )
+    if why:
+        return _refusal(f"Did not reach ({x},{y}): {why}. {_crossing_note(entered)}".strip())
+    result = await _talk_next_to(x, y, source)
+    result["summary"] = _crossing_note(entered) + str(result.get("summary") or "")
+    return result
+
+
+async def _talk_next_to(x: int, y: int, source: str) -> Dict[str, Any]:
+    """talk_to's walk to a tile beside (x, y) on this part of the map, the turn, A and
+    the reading."""
+    from server.field_control import DIRECTION_DELTAS
+
     snap = _field_snapshot()
     if snap is None:
         return _refusal("The player's position could not be read.")
@@ -7563,7 +7760,12 @@ async def mcp_talk_to(request: dict = None):
     for sx, sy, facing in sides:
         snap = _field_snapshot()
         if snap is None or (snap.x, snap.y) != (sx, sy):
-            walk = await mcp_navigate_to({"x": sx, "y": sy, "variance": "none", "reason": f"{source}: next to ({x},{y})", "consider_npcs": True})
+            # through_warps False: _cross_to already took any way through warps, and
+            # each side alone must not send the walk off through them.
+            walk = await mcp_navigate_to({
+                "x": sx, "y": sy, "variance": "none", "reason": f"{source}: next to ({x},{y})",
+                "consider_npcs": True, "through_warps": False,
+            })
             if _mem(lambda r: r.is_in_battle()):
                 return _refusal(f"A battle started on the way to ({x},{y}): fight it with use_move, then talk_to again.")
             snap = _field_snapshot()
@@ -9141,9 +9343,24 @@ async def mcp_navigate_to(request: dict):
         except (ValueError, TypeError):
             return {"success": False, "error": f"Invalid coordinates: x={x}, y={y}"}
 
+        # A tile beyond warps of this map (holes, geysers, doors within it): go through
+        # them first (_cross_to). Seen live: navigate_to(13,9) in LAVARIDGE TOWN GYM 1F
+        # answered "No path found" while the way was down a hole and up a geyser.
+        went = ""
+        if request.get("through_warps", True) and not request.get("_beside"):
+            entered, why = await _cross_to([(x, y)], f"({x},{y})", "navigate_to", f"navigate_to({x}, {y}) again")
+            went = _crossing_note(entered)
+            if why:
+                return _refusal(f"Did not reach ({x},{y}): {why}. {went}".strip())
+
+        def told(result: Dict[str, Any]) -> Dict[str, Any]:
+            if went:
+                result["summary"] = went + str(result.get("summary") or result.get("error") or "")
+            return result
+
         beside = await _navigate_beside_someone(request, x, y)
         if beside is not None:
-            return beside
+            return told(beside)
 
         # Calculate path and get buttons
         # Operator use (not in the model's tool list): tiles to walk round, [[x, y], ...].
@@ -9169,7 +9386,7 @@ async def mcp_navigate_to(request: dict):
             hint = exit_hint()
             if hint:
                 result["error"] = f"{result.get('error', 'navigate_to failed')} {hint}"
-            return result
+            return told(result)
 
         # Queue buttons via take_action to ensure metrics tracking
         buttons = result.get("buttons", [])
@@ -9196,7 +9413,7 @@ async def mcp_navigate_to(request: dict):
             if used:
                 again = await mcp_navigate_to({**request, "_cleared": cleared_before + 1})
                 again["summary"] = f"Used {used} at {tuple(tile)} on the way. {again.get('summary', '')}".strip()
-                return again
+                return told(again)
 
         response = {
             "success": True,
@@ -9230,7 +9447,7 @@ async def mcp_navigate_to(request: dict):
             hint = exit_hint()
             if hint:
                 response["summary"] += f" {hint}"
-        return response
+        return told(response)
     except Exception as e:
         logger.error(f"Error in navigate_to: {e}")
         return {"success": False, "error": str(e)}

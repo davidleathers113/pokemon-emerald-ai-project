@@ -323,9 +323,14 @@ def load_pathfinding_state(env) -> tuple:
                         state["map"]["porymap"]["warps"] = json_map.get("warps", [])
                         # The tiles that really warp (map.json warp_events): the builder
                         # moves its "warps" next to the door, so these are kept apart.
+                        # Spots warps only land on are plain floor (arrival_only_warps).
+                        from utils.mapping.porymap_state import arrival_only_warps
+
+                        landing = arrival_only_warps(porymap_map_name)
                         state["map"]["porymap"]["raw_warps"] = [
                             (int(w.get("x", -1)), int(w.get("y", -1)))
-                            for w in _raw_map_json(porymap_map_name).get("warp_events") or []
+                            for i, w in enumerate(_raw_map_json(porymap_map_name).get("warp_events") or [])
+                            if i not in landing
                         ]
                         # Floor switches and scene triggers that would fire if stepped on:
                         # walks go round them unless that is the only way (find_path).
@@ -565,18 +570,28 @@ def navigate_to_direct(
         return {"success": False, "error": str(e)}
 
 
-def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None) -> list:
+def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, live_tile=None) -> list:
     """Every exit the EXITS prompt line lists, with the coordinates go_to_exit needs.
 
     Warp coordinates come from the map's raw warp_events: the json_map copies are
     nudged toward the map edge for display (a house's exit mats at y=8 are listed at
     y=9), and walking to the listed tile would miss the warp.
+
+    Warps that only mark a landing spot (porymap_state.arrival_only_warps) are left out,
+    unless live_tile(x, y), the tile in the game's map buffer now, shows a warp behavior
+    there: scripts can lay one down (pret PetalburgCity_Gym_OnLoad opens the doors of
+    rooms whose trainer is beaten).
     """
     import json as _json
 
     from pokemon_env.porymap_paths import get_porymap_root
     from server.field_control import EDGE_NAMES
-    from utils.mapping.porymap_state import _readable_map_name, connection_open_span
+    from utils.mapping.porymap_state import (
+        _readable_map_name,
+        arrival_only_warps,
+        connection_open_span,
+        sign_door_warps,
+    )
 
     exits = []
     for conn in json_map.get("connections", []) or []:
@@ -606,7 +621,11 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None) -> 
             logger.warning(f"go_to_exit: could not read warps from {map_file}: {e}")
     listed = json_map.get("warps", []) or []
     ox, oy = coord_offset or (0, 0)
+    arrival_only = arrival_only_warps(porymap_map_name or "")
+    sign_doors = sign_door_warps(porymap_map_name or "")
     for i, warp in enumerate(raw_warps):
+        if i in arrival_only and not _fires_now(live_tile, warp):
+            continue  # a spot warps land on: stepping on it goes nowhere
         name = _readable_map_name(warp.get("dest_map", "?"))
         shown = listed[i] if i < len(listed) else warp
         listed_xy = (shown.get("x"), shown.get("y"))
@@ -617,8 +636,54 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None) -> 
             "listed_xy": listed_xy,
             "name": name,
             "label": f"door/warp at ({listed_xy[0]}, {listed_xy[1]}) -> {name}",
+            "dest_map": str(warp.get("dest_map", "")),
+            "arrival": warp_arrival(warp),
+            # Read from the tile in front, not stepped on (porymap_state.sign_door_warps).
+            "sign_door": i in sign_doors,
         })
     return exits
+
+
+def _fires_now(live_tile, warp: dict) -> bool:
+    """list_map_exits: the game's map buffer shows a warp behavior on the warp's tile."""
+    from utils.mapping.porymap_state import lands_only
+
+    if live_tile is None:
+        return False
+    try:
+        tile = live_tile(int(warp.get("x", -1)), int(warp.get("y", -1)))
+    except Exception as e:  # the live read is a refinement; the static data stands
+        logger.debug(f"live tile unreadable: {e}")
+        return False
+    return tile is not None and len(tile) > 2 and not tile[2] and not lands_only(tile)
+
+
+def warp_arrival(warp: dict) -> Optional[Tuple[int, int]]:
+    """The tile a warp puts the player on, in its destination map's coordinates: the
+    destination's warp_events[dest_warp_id] (pret src/overworld.c
+    SetWarpDestinationToMapWarp, SetPlayerCoordsFromWarp). None when the destination is
+    set at run time."""
+    from utils.mapping.porymap_state import _map_dirs_by_const
+
+    dest = _map_dirs_by_const().get(str(warp.get("dest_map", "")))
+    try:
+        target = (_raw_map_json(dest).get("warp_events") or [])[int(warp.get("dest_warp_id"))]
+    except (TypeError, ValueError, IndexError):
+        return None
+    return int(target.get("x", -1)), int(target.get("y", -1))
+
+
+def came_through_warp(arrival: Tuple[int, int], warp_tile: Tuple[int, int], position: Tuple[int, int]) -> bool:
+    """Whether the player at position went through a warp that leads to another spot of
+    the same map (the map id does not change, so only where the player stands tells).
+
+    On the arrival tile, or one tile off it: pret src/field_effect.c
+    LavaridgeGymB1FWarpExitEffect_PopOut throws the player one tile east of where a
+    geyser lands them. Still on the warp tile means it did not fire.
+    """
+    if tuple(position) == tuple(warp_tile):
+        return False
+    return abs(position[0] - arrival[0]) + abs(position[1] - arrival[1]) <= 1
 
 
 @lru_cache(maxsize=256)
@@ -1219,7 +1284,7 @@ def _walk_exits(map_dir: str) -> tuple:
     the area beside them to the area they arrive in.
     """
     from server.field_control import EDGE_NAMES
-    from utils.mapping.porymap_state import _map_dirs_by_const, _readable_map_name, _static_grid
+    from utils.mapping.porymap_state import _map_dirs_by_const, _readable_map_name, _static_grid, arrival_only_warps
 
     raw = _raw_map_json(map_dir)
     grid = _static_grid(map_dir) if raw else None
@@ -1264,7 +1329,10 @@ def _walk_exits(map_dir: str) -> tuple:
     # of it, the argument names the warp's tile too, as the EXITS list shows it (a
     # two-tile doormat leads to one spot, so its name alone is enough).
     found = []
-    for warp in warps:
+    arrival_only = arrival_only_warps(map_dir)
+    for i, warp in enumerate(warps):
+        if i in arrival_only:
+            continue  # where warps land (porymap_state.arrival_only_warps), not a way off
         dest = _map_dirs_by_const().get(str(warp.get("dest_map", "")))
         try:
             dest_warp = (_raw_map_json(dest).get("warp_events") or [])[int(warp.get("dest_warp_id"))]
@@ -1478,7 +1546,7 @@ def _far_map_hint(map_dir: str, matches, position: Optional[Tuple[int, int]] = N
 
 def _walk_paths(
     map_dir: str, matches, position: Optional[Tuple[int, int]] = None, other_parts_of_here: bool = False,
-    rides: bool = False,
+    rides: bool = False, goal: Optional[frozenset] = None,
 ) -> List[List[Tuple[str, str]]]:
     """Ways on foot to every map `matches(readable map name)` accepts, nearest first.
 
@@ -1495,6 +1563,9 @@ def _walk_paths(
     whose part of the map another way in reaches as well, and more, is dropped. Seen
     live: go_to("Jagged Pass") from Lavaridge entered at the bottom, below one-way ledges;
     from the top (Mt. Chimney, by Cable Car) the ledges lead everywhere, the bottom too.
+
+    goal: (map dir, area) nodes to reach instead of maps `matches` accepts (tile_route);
+    the ways to the nearest of them, [] among them when the player's area is one.
     """
     if not map_dir:
         return []
@@ -1522,7 +1593,11 @@ def _walk_paths(
         return out
 
     frontier, hits, seen_maps = with_jumps(start), [], set() if other_parts_of_here else {map_dir}
+    if goal is not None:
+        hits = [node for node in frontier if node in goal]
     for _ in range(_FAR_MAP_MAX_STEPS):
+        if hits and goal is not None:
+            break  # the goal's nearest areas: no way through more exits is wanted
         nxt = []
         for node in frontier:
             for from_area, exit_arg, dest, dest_area, name in _walk_exits(node[0]) + (_ride_exits(node[0]) if rides else ()):
@@ -1531,12 +1606,14 @@ def _walk_paths(
                     continue
                 parent[target] = (node, exit_arg, name)
                 nxt.append(target)
-                if dest in seen_maps and not (rides and dest != map_dir):
+                if goal is not None or (dest in seen_maps and not (rides and dest != map_dir)):
                     continue
                 seen_maps.add(dest)
                 if matches(name):
                     hits.append(target)
         frontier = with_jumps(nxt)
+        if goal is not None:
+            hits = [node for node in frontier if node in goal]
         if not frontier:
             break
     if rides:
@@ -1561,6 +1638,39 @@ def _walk_paths(
         # to SLATEPORT (7), only because the search met Mauville first.
         paths.sort(key=lambda p: (len(p), _exit_distance(map_dir, position, p[0][0]) if p else 0))
     return paths
+
+
+def tile_route(
+    map_dir: str, position: Optional[Tuple[int, int]], target_tiles, here_dir: Optional[str] = None
+) -> Optional[List[Tuple[str, str]]]:
+    """[(go_to_exit argument, name of the map entered), ...]: the way through warps, edges
+    and ledge jumps from the player at position (on here_dir, default map_dir) to a part
+    of map_dir holding any of target_tiles (map_dir's coordinates). [] when the player's
+    part already holds one (a ledge jump down counts), None when none can be reached.
+
+    Seen live: in LAVARIDGE TOWN GYM 1F, talk_to(13,9) (Flannery) answered "No path found
+    from (9, 9) to (12, 9)": her side of the floor is reached only by dropping through
+    holes to B1F and riding geysers back up. PETALBURG CITY GYM's rooms are joined by
+    doors that warp within the same map.
+    """
+    if not map_dir:
+        return None
+    areas = _route_areas(map_dir)
+    goal = frozenset((map_dir, areas[tuple(t)]) for t in target_tiles if tuple(t) in areas)
+    if not goal:
+        return None
+    paths = _walk_paths(here_dir or map_dir, lambda name: False, position, goal=goal)
+    return paths[0] if paths else None
+
+
+def map_coord_offset(map_dir: str, badge_count: int) -> Tuple[int, int]:
+    """(offset_x, offset_y) between map_dir's coordinates and the ones the walking tools
+    use there (local = map - offset): non-zero only on an override map that is a cut-out
+    of the map (ascii_map_loader PetalburgCity_Gym_Lobby, before the 4th badge)."""
+    from utils.mapping.ascii_map_loader import get_effective_map_name, get_override
+
+    override = get_override(get_effective_map_name(map_dir, badge_count=badge_count)) or {}
+    return int(override.get("offset_x", 0)), int(override.get("offset_y", 0))
 
 
 def _exit_distance(map_dir: str, position: Tuple[int, int], exit_arg: str) -> int:
@@ -1935,17 +2045,41 @@ def place_route(location_name: str, position: Optional[Tuple[int, int]], target:
     return None
 
 
+def _live_tile_reader(env):
+    """(x, y) map coordinates -> the metatile in the game's map buffer now, or None
+    (utils/mapping/dynamic_map_overlay: the buffer has a 7-tile border)."""
+    from utils.mapping.dynamic_map_overlay import GBA_MAP_BORDER_OFFSET
+
+    reader = getattr(env, "memory_reader", None)
+    if reader is None:
+        return None
+
+    def tile(x: int, y: int):
+        if not getattr(reader, "_map_buffer_addr", None) and not reader._find_map_buffer_addresses():
+            return None
+        rows = reader.read_map_metatiles(
+            x_start=x + GBA_MAP_BORDER_OFFSET, y_start=y + GBA_MAP_BORDER_OFFSET, width=1, height=1
+        )
+        return rows[0][0] if rows and rows[0] else None
+
+    return tile
+
+
 def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: Tuple = ()) -> dict:
     """Resolve an EXITS entry to a walkable route (caller holds the emulator lock).
 
     Edge exits: the reachable standable tile on that edge nearest the player, then one
     more press off the edge. Warps: the warp tile itself (doors and stairs fire when
-    stepped on; the caller handles arrow warps that fire when walked off).
+    stepped on; the caller handles arrow warps that fire when walked off). Sign doors
+    (kind "sign_door"): the nearest tile in front of the door, and "face", the press
+    that turns to it. Every warp plan has "warp_tile", and "arrival_here": the tile it
+    lands on when it leads to another spot of this same map, else None.
 
     avoid: map tiles (raw map coordinates) to treat as blocked, e.g. where a person
     stopped the last walk.
     """
     from server.field_control import (
+        DIRECTION_DELTAS,
         EDGE_BUTTON,
         edge_candidates,
         end_of_path,
@@ -1959,7 +2093,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     if not json_map or not grid:
         return {"success": False, "error": f"No map data for {location}; walk with press_buttons instead."}
 
-    exits = list_map_exits(json_map, source.get("porymap_map_name"), coord_offset)
+    exits = list_map_exits(json_map, source.get("porymap_map_name"), coord_offset, _live_tile_reader(env))
     if not exits:
         return {"success": False, "error": f"{location} has no exits in the map data."}
     matches = match_exits(exits, exit_query)
@@ -1973,6 +2107,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     pos = state.get("player", {}).get("position", {})
     ox, oy = coord_offset or (0, 0)
     start = (int(pos.get("x", 0)) - ox, int(pos.get("y", 0)) - oy)
+    this_map = _raw_map_json(source.get("porymap_map_name") or "").get("id")
 
     blocked = [(int(x) - ox, int(y) - oy) for x, y in avoid] or None
 
@@ -2021,18 +2156,35 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 tried.append(f"{exit_entry['label']}: no walkable path to that edge from {start}")
         else:
             tile = (exit_entry["x"], exit_entry["y"])
-            buttons = route_to(tile)
-            if buttons is None:
-                tried.append(f"{exit_entry['label']}: no walkable path to the warp at {tile}")
-                continue
+            # A warp to another spot of this map: the map id won't change, so the caller
+            # judges it by where the player ends up (came_through_warp), in plan coordinates.
+            arrival = exit_entry.get("arrival")
+            here = arrival is not None and exit_entry.get("dest_map") == this_map
+            way = {
+                "warp_tile": tile,
+                "arrival_here": (arrival[0] - ox, arrival[1] - oy) if here else None,
+            }
+            if exit_entry.get("sign_door"):
+                # Read from a tile beside it, facing it (porymap_state.sign_door_warps).
+                fronts = []
+                for button, (dx, dy) in DIRECTION_DELTAS.items():
+                    front = (tile[0] - dx, tile[1] - dy)
+                    buttons = route_to(front)
+                    if buttons is not None:
+                        fronts.append((len(buttons), front, button, buttons))
+                if not fronts:
+                    tried.append(f"{exit_entry['label']}: no walkable path to a tile in front of the door at {tile}")
+                    continue
+                _, front, button, buttons = min(fronts)
+                way.update({"kind": "sign_door", "target": front, "face": button})
+            else:
+                buttons = route_to(tile)
+                if buttons is None:
+                    tried.append(f"{exit_entry['label']}: no walkable path to the warp at {tile}")
+                    continue
+                way.update({"kind": "warp", "target": tile})
             if best is None or len(buttons) < len(best["buttons"]):
-                best = {
-                    "kind": "warp",
-                    "label": exit_entry["label"],
-                    "target": tile,
-                    "buttons": buttons,
-                    "final_button": None,
-                }
+                best = {**way, "label": exit_entry["label"], "buttons": buttons, "final_button": None}
 
     if best is None:
         return {
