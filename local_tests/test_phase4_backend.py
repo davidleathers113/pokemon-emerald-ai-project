@@ -281,6 +281,29 @@ def test_call_responses_sends_cap_and_retries_transient_only():
     assert len(calls) == 1
 
 
+def test_frame_goes_last_so_a_new_frame_keeps_the_prompt_text_cached():
+    # Ollama renders a message's images before its text, so a frame inside the text
+    # message broke the prefix cache at every new screen (cached stuck at 8,914 live).
+    from PIL import Image
+
+    backend = _make_backend()
+    sent = []
+
+    def fake_create(**kwargs):
+        sent.append(kwargs["input"])
+        return type("R", (), {"output": [], "usage": None, "output_text": ""})()
+
+    with mock.patch.object(backend.client.responses, "create", side_effect=fake_create):
+        for colour in ("red", "blue"):
+            backend.get_query(Image.new("RGB", (240, 160), colour), "the same prompt", "test")
+    first, second = sent
+    assert first[0] == second[0] == {"role": "user", "content": [{"type": "input_text", "text": "the same prompt"}]}
+    assert [p["type"] for p in first[-1]["content"]] == ["input_image"]
+    assert first[-1] != second[-1], "the two frames differ only in the last message"
+    assert len(first) == 2
+    assert backend._responses_input(None, "text only") == [first[0] | {"content": [{"type": "input_text", "text": "text only"}]}]
+
+
 # --------------------------------------------------------------------------
 # Malformed tool-call JSON
 # --------------------------------------------------------------------------

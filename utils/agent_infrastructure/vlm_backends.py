@@ -554,6 +554,25 @@ class OpenAIBackend(VLMBackend):
         """Extract reasoning for logging from response/adapter (all parts, including parallel tool calls)."""
         return _extract_thinking_from_gemini_like_response(response)
 
+    def _responses_input(self, img, text: str) -> list:
+        """The prompt text, then the frame(s) in a user message of their own after it.
+
+        Why not one message with both: Ollama's qwen3-vl template renders a message's images
+        BEFORE its text, so each new frame changed the prompt right after the tools and the
+        prefix cache stopped there. Seen live (2026-11-04, local_tools/cache_probe.py, two
+        consecutive steps with different frames): frame inside the text message, cached
+        8,914 tokens and 25.7 s; frame as its own last message, cached 9,844 and 21.8 s.
+        """
+        images = img if isinstance(img, list) else [img]
+        frames = [
+            {"type": "input_image", "image_url": f"data:image/png;base64,{self._prepare_image_base64(i)}"}
+            for i in images if i is not None
+        ]
+        messages = [{"role": "user", "content": [{"type": "input_text", "text": text}]}]
+        if frames:
+            messages.append({"role": "user", "content": frames})
+        return messages
+
     def get_query(
         self,
         img: Union[Image.Image, np.ndarray, List[Union[Image.Image, np.ndarray]]],
@@ -568,17 +587,7 @@ class OpenAIBackend(VLMBackend):
         """
         start_time = time.time()
 
-        # Build Responses API input (input_text + input_image)
-        content_parts = [{"type": "input_text", "text": text}]
-        if isinstance(img, list):
-            for i in img:
-                image_base64 = self._prepare_image_base64(i)
-                content_parts.append({"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"})
-        else:
-            image_base64 = self._prepare_image_base64(img)
-            content_parts.append({"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"})
-
-        input_data = {"role": "user", "content": content_parts}
+        input_data = self._responses_input(img, text)
 
         try:
             response = self._call_responses(
