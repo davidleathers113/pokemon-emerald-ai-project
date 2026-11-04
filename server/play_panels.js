@@ -294,9 +294,17 @@ const PlayPanels = (() => {
       + (chapters || `<div class="empty">No story objectives.</div>`) + battling;
   }
 
+  // A different /health server_id than the one this page first saw: the game server
+  // restarted, maybe with new page code, so the page reloads once. David (2026-11-04)
+  // keeps one tab open now that restarts no longer open a new one.
+  function serverRestarted(seenId, health) {
+    const id = health && health.server_id;
+    return Boolean(seenId && id && id !== seenId);
+  }
+
   return {
     escapeHtml, parseUtc, fmtClock, fmtElapsed, fmtCall,
-    renderFeed, renderParty, renderProgress, groupChapters,
+    renderFeed, renderParty, renderProgress, groupChapters, serverRestarted,
   };
 })();
 

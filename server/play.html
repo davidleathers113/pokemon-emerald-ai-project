@@ -213,9 +213,17 @@ function renderMode() {
   modeBtn.textContent = paused ? "You are playing — hand back to AI" : "AI is playing — take control";
 }
 
+let serverId = null;  // /health's server_id when this page loaded
+
 async function refreshState() {
   try {
-    await api("/health");
+    const health = await api("/health");
+    // A restarted server may serve new page code: reload once to run it.
+    if (typeof serverRestarted !== "undefined" && serverRestarted(serverId, health)) {
+      location.reload();
+      return;
+    }
+    serverId = serverId || health.server_id || null;
     const state = await api("/agent_pause");
     setOnline(true);
     if (!busy) { paused = state.paused; renderMode(); }

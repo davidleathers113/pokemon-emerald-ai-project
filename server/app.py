@@ -1350,6 +1350,12 @@ async def get_player_position():
     return {"location": _location_name(), "x": snap.x if snap else None, "y": snap.y if snap else None}
 
 
+# This server process, for an open /play tab to notice a restart: it reloads once to
+# pick up new page code. David (2026-11-04) asked for no new tab on every restart
+# (play-local.sh OPEN_BROWSER), so the tab he keeps open must not run stale code.
+SERVER_ID = f"{os.getpid()}-{time.time():.0f}"
+
+
 @app.get("/health")
 async def get_health():
     """Health check: healthy only while the game loop is emulating frames.
@@ -1373,7 +1379,7 @@ async def get_health():
                 "timestamp": now,
             },
         )
-    return {"status": "healthy", "last_frame_age_s": round(frame_age, 3), "timestamp": now}
+    return {"status": "healthy", "last_frame_age_s": round(frame_age, 3), "timestamp": now, "server_id": SERVER_ID}
 
 
 # Local addition: lets a human pause the autonomous agent (agents/PokeAgent.py waits

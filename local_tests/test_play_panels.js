@@ -234,6 +234,17 @@ const tests = {
     for (const url of ['"/ai_feed"', '"/dashboard"', '"/objectives"']) assert.ok(html.includes(url), url);
     assert.ok(html.includes("pollFrame, 100"), "frame poll untouched");
   },
+
+  // David (2026-11-04): restarts no longer open a new tab, so the open one reloads
+  // itself once when /health names a new server, to run any new page code.
+  reloads_once_when_the_server_restarted() {
+    assert.strictEqual(P.serverRestarted(null, { server_id: "7-100" }), false, "first sight: remember it");
+    assert.strictEqual(P.serverRestarted("7-100", { server_id: "7-100" }), false);
+    assert.strictEqual(P.serverRestarted("7-100", { server_id: "9-200" }), true);
+    assert.strictEqual(P.serverRestarted("7-100", { status: "healthy" }), false, "an older server sends no id");
+    const html = fs.readFileSync(path.join(ROOT, "server", "play.html"), "utf8");
+    assert.ok(html.includes("serverRestarted(serverId, health)") && html.includes("location.reload()"));
+  },
 };
 
 let failures = 0;

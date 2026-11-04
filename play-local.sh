@@ -14,6 +14,15 @@ cd "$(dirname "$0")"
 NAME=emerald-ai
 IMAGE=emerald-harness:local
 PORT="${PORT:-8000}"
+# OPEN_BROWSER=1 opens the /play page. Off by default: David (2026-11-04) "Every time it
+# restarts, it opens up a new tab without closing the old tab." The open tab recovers
+# by itself after a restart (and reloads once for new page code), so the URLs are printed.
+OPEN_BROWSER="${OPEN_BROWSER:-0}"
+open_play_page() {
+    if [ "$OPEN_BROWSER" = "1" ]; then
+        open "http://127.0.0.1:$PORT/play"
+    fi
+}
 # "ollama" = the harness's OpenAI backend pointed at Ollama on this Mac. Any other
 # value is passed to the harness as-is (openai, gemini, ...) and uses real API keys,
 # so an OPENAI_API_KEY exported for other work can't silently send the game to OpenAI.
@@ -99,7 +108,7 @@ case "$(container_state)" in
     running)
         if healthy; then
             echo "Already running. Watch at http://127.0.0.1:$PORT/play  (stop with: $0 stop)"
-            open "http://127.0.0.1:$PORT/play"
+            open_play_page
             exit 0
         fi
         die "container $NAME is running but the game server isn't answering on port $PORT.
@@ -273,4 +282,4 @@ PY
 echo "  Play/controller: http://127.0.0.1:$PORT/play"
 echo "  AI thinking:     http://127.0.0.1:$PORT/stream"
 echo "  Stop with:       $0 stop"
-open "http://127.0.0.1:$PORT/play"
+open_play_page

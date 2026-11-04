@@ -44,6 +44,11 @@ def main():
     check("emulator up, no frame yet", 503)
     srv.last_frame_monotonic = time.monotonic()
     check("frame just emulated", 200)
+    # The open /play tab reloads when this changes (a restarted server, new page code).
+    code, body = status_of(asyncio.run(srv.get_health()))
+    has_id = bool(body.get("server_id")) and body["server_id"] == srv.SERVER_ID
+    failures += not has_id
+    print(f"{'PASS' if has_id else 'FAIL'} healthy answer names this server: {body.get('server_id')}")
     srv.last_frame_monotonic = time.monotonic() - (srv.HEALTH_MAX_FRAME_AGE_S + 1)
     check("no frame for longer than the limit", 503)
     print("ALL PASSED" if not failures else f"{failures} FAILED")
