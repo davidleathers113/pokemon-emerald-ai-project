@@ -565,6 +565,11 @@ class PokemonEmeraldReader:
 
                     # Parse the Pokemon data
                     pokemon = parse_pokemon(pokemon_data)
+                    if pokemon.species_name.startswith("Species_"):
+                        # Seen live: a caught MARILL showed as "Species_183", so "Train
+                        # Marill to Lv18" found no Marill in the party. The local table
+                        # lists only Hoenn-dex species; the ROM's gSpeciesNames has all.
+                        pokemon.species_name = self._battle_species_name(pokemon.species_id)
                     party.append(pokemon)
 
                     logger.info(f"Slot {i}: Parsed Pokemon = {pokemon}")

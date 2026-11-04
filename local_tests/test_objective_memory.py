@@ -262,6 +262,28 @@ def test_a_pokemon_named_before_it_evolved_is_still_found():
     assert s.srv._train_member(party, "BLAZIKEN") is None  # a later form is not this one
 
 
+def test_a_pokemon_from_outside_the_hoenn_dex_is_named():
+    """Seen live: a caught MARILL Lv13 read as "Species_183" in the party, so "Train Marill
+    to Lv18" saw no Marill and would have become "catch another". The local name table
+    lists only Hoenn-dex species. test_marill_in_party.state is the live party: BRELOOM,
+    COMBUSKEN, SABLEYE, MARILL Lv13 (slot 4), on ROUTE 117 (18,14)."""
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_marill_in_party.state")
+    with s.srv.memory_lock:
+        names = [p.species_name for p in s.srv.env.memory_reader.read_party_pokemon()]
+    print("   ", names)
+    assert names[3] == "Marill" and not any(n.startswith("Species_") for n in names), names
+    assert s.srv._party_condition("level_marill_18") == (False, "MARILL is Lv13 of 18 needed")
+    assert s.srv._catch_wanted({"story": {"id": "m", "completion_condition": "level_marill_18"}}) == {}
+    party = s.srv._train_party()
+    assert s.srv._train_member(party, "MARILL") == 3
+    assert s.srv._train_member(party, "marill") == 3
+    import asyncio
+
+    text = asyncio.run(s.srv.mcp_get_game_state())["state_text"]
+    assert "Marill" in text and "Species_" not in text, text
+
+
 def test_insert_objective_goes_before_the_current_one_and_persists():
     from agents.objectives.direct_objectives import DirectObjectiveManager
 

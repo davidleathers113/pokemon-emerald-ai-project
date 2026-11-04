@@ -1120,6 +1120,17 @@ prompt. That came to 1.1 tiles walked per minute.
   2026-11-04: the Verdanturf report is gone; the real stalls (navigate_to ×3 at (0,6) on
   ROUTE 117, 06:17) still fire.
 
+## Party Pokémon from outside the Hoenn dex are named (2026-11-04, WEAKNESSES R18)
+- Seen live: a caught MARILL Lv13 read as "Species_183" in the party, so the story step
+  "Train Marill to Lv18" found no Marill and train("MARILL") had nothing to train.
+- `read_party_pokemon` replaces a "Species_N" name with the ROM's gSpeciesNames entry
+  (`_battle_species_name`, which the battle view already used): "Marill".
+- *Verified:* `test_a_pokemon_from_outside_the_hoenn_dex_is_named` on
+  test_marill_in_party.state (saved from the live game): party names, `level_marill_18`
+  → "MARILL is Lv13 of 18 needed", no catch wanted, `_train_member` finds slot 4, and the
+  prompt says Marill. Without the fix the party reads 'Species_183'. Objective-memory
+  22/22.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
