@@ -197,6 +197,57 @@ def test_brief_reasoning_is_opt_in_and_reaches_every_rationale_field():
         assert registry.build_tools_for_scaffold("simple") == default  # the registry was not changed
 
 
+def _game_state(screen="overworld", location="ROUTE 101", dialogue=False, battle=False):
+    return {
+        "location": location,
+        "raw_state": {"game": {
+            "game_state": screen, "is_in_battle": battle, "dialog_text": "Hi!" if dialogue else None,
+            "dialogue_detected": {"has_dialogue": dialogue},
+        }},
+    }
+
+
+def test_the_frame_goes_out_only_when_the_text_cannot_describe_the_screen():
+    """Speed plan, Phase 4 (SCREENSHOT_POLICY=needed): dialogue, menus and other screens,
+    a new map, the first step of a battle and every 5th step get the frame; a walk on a
+    known map or a battle menu after its first step does not."""
+    from test_phase4_agent import pa
+
+    seen = {"location": "ROUTE 101", "in_battle": False, "frame_step": 10}
+    cases = [
+        (_game_state(), 11, False),
+        (_game_state(), 15, True),                       # every 5 steps
+        (_game_state(screen="menu"), 11, True),
+        (_game_state(screen="title"), 11, True),
+        (_game_state(dialogue=True), 11, True),
+        (_game_state(location="OLDALE TOWN"), 11, True),  # first step on a new map
+        (_game_state(screen="battle", battle=True), 11, True),  # a battle just started
+    ]
+    for state, step, want in cases:
+        send, why = pa.frame_needed(state, seen, step)
+        assert send is want, (state["raw_state"]["game"]["game_state"], state["location"], step, why)
+    in_battle = {"location": "ROUTE 101", "in_battle": True, "frame_step": 10}
+    assert pa.frame_needed(_game_state(screen="battle", battle=True), in_battle, 11)[0] is False
+
+
+def test_the_screenshot_policy_is_always_unless_switched():
+    import os
+    from unittest import mock
+
+    from test_phase4_agent import pa
+
+    agent = _agent()
+    with mock.patch.dict(os.environ, {"SCREENSHOT_POLICY": ""}):
+        for step in range(1, 4):
+            assert agent._apply_screenshot_policy(_game_state(), "FRAME", step) == "FRAME"
+    agent = _agent()
+    with mock.patch.dict(os.environ, {"SCREENSHOT_POLICY": "needed"}):
+        sent = [agent._apply_screenshot_policy(_game_state(), "FRAME", step) for step in range(1, 8)]
+    # Step 1: a new map; then every 5 steps (6); none on 2-5 and 7.
+    assert sent == ["FRAME", None, None, None, None, "FRAME", None], sent
+    assert agent._step_timing["frame"] == 0
+
+
 def test_a_store_write_refreshes_the_overviews():
     agent = _agent()
     agent._gather_store_context()

@@ -1544,6 +1544,19 @@ prompt. That came to 1.1 tiles walked per minute.
   rationale fields ask for one line and nothing else differs. test_phase4_backend's two
   default-cap assertions now read the constant (comment says why).
 
+## Speed plan, Phase 4: the screenshot, an experiment behind a switch (2026-11-04)
+- `local_tools/image_token_probe.py`: the same prompt to Ollama with and without the
+  frame; prints the frame's prompt tokens (expected ~1,024: Ollama's image floor for
+  qwen3-vl). Uses Ollama's one slot: run it with the agent paused.
+- `SCREENSHOT_POLICY=needed` (default "always"): the frame only when the text state
+  can't describe the screen (`frame_needed`: any screen but the overworld or a battle,
+  dialogue, the first step on a new map or of a battle) and every 5th step. Each step
+  records "frame" 1/0; speed_report prints the share of steps that sent it.
+- Gate (the plan): adopt only if stalls, invalid calls and objectives per hour stay
+  within noise over ≥2 h each way.
+- *Verified:* test_prompt_cache.py: each rule of frame_needed; "always" sends every
+  step; "needed" on one map sends steps 1 and 6 of 7.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

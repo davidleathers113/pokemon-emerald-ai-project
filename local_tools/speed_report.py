@@ -200,7 +200,9 @@ def report(run_dir, steps, llm_log=None):
         "from": rows[0]["timestamp"],
         "to": rows[-1]["timestamp"],
         "step_s": _summary(step_s),
-        "timing_s": {k: _summary(v) for k, v in timing.items()},
+        "timing_s": {k: _summary(v) for k, v in timing.items() if k != "frame"},
+        # Steps that sent the screenshot (SCREENSHOT_POLICY=needed sends fewer).
+        "frame_share": round(sum(timing["frame"]) / len(timing["frame"]), 2) if timing.get("frame") else None,
         "prompt_section_chars": {k: _summary(v) for k, v in sections.items()},
         "model": {mode: {k: _summary(v) for k, v in data.items()} for mode, data in model.items() if data},
         "quality": {
@@ -224,6 +226,8 @@ def _print(result):
     print(f"  step time: median {s.get('median')} s, p90 {s.get('p90')} s")
     for key, value in result["timing_s"].items():
         print(f"  {key}: median {value.get('median')} s, p90 {value.get('p90')} s")
+    if result.get("frame_share") is not None:
+        print(f"  steps that sent the screenshot: {round(100 * result['frame_share'])}%")
     for mode, data in result["model"].items():
         parts = [f"{k} {v.get('median')}/{v.get('p90')}" for k, v in data.items()]
         print(f"  {mode} (n={next(iter(data.values())).get('n')}, median/p90): " + ", ".join(parts))

@@ -258,6 +258,39 @@ STORE_WRITING_TOOLS = frozenset({
 # written by something other than this agent's calls still shows up).
 STORE_CONTEXT_REFRESH_STEPS = 10
 
+# Speed plan, Phase 4 (an experiment, off by default): Ollama pads qwen3-vl's 240x160
+# frame to its 1,024-token image floor, ~1K tokens read every step. SCREENSHOT_POLICY=
+# needed sends the frame only when the text state can't describe the screen (anything
+# but the overworld or a battle menu, dialogue, the first step on a new map or of a
+# battle) and every FRAME_REFRESH_STEPS steps; "always" (the default) sends it every step.
+SCREENSHOT_POLICY_ENV = "SCREENSHOT_POLICY"
+FRAME_REFRESH_STEPS = 5
+TEXT_DESCRIBED_SCREENS = ("overworld", "battle")
+
+
+def screenshot_policy() -> str:
+    return "needed" if os.environ.get(SCREENSHOT_POLICY_ENV, "").strip().lower() == "needed" else "always"
+
+
+def frame_needed(game_state_data: Dict[str, Any], last: Dict[str, Any], step: int) -> Tuple[bool, str]:
+    """(send the frame?, why) under SCREENSHOT_POLICY=needed. `last` is what the agent
+    remembers of the last step: its location, whether it was a battle, and the step the
+    last frame went out on."""
+    game = ((game_state_data.get("raw_state") or {}).get("game") or {}) if isinstance(game_state_data, dict) else {}
+    screen = game.get("game_state")
+    dialogue = game.get("dialogue_detected") if isinstance(game.get("dialogue_detected"), dict) else {}
+    if screen not in TEXT_DESCRIBED_SCREENS:
+        return True, f"screen is {screen or 'unknown'}"
+    if game.get("dialog_text") or dialogue.get("has_dialogue"):
+        return True, "dialogue on screen"
+    if game_state_data.get("location") != last.get("location"):
+        return True, "first step on this map"
+    if bool(game.get("is_in_battle")) and not last.get("in_battle"):
+        return True, "a battle just started"
+    if last.get("frame_step") is None or step - last["frame_step"] >= FRAME_REFRESH_STEPS:
+        return True, f"every {FRAME_REFRESH_STEPS} steps"
+    return False, "the text state describes the screen"
+
 
 # Speed plan, Phase 2: what the state repeats. Its own action history (the prompt's
 # <recent_steps> covers it), and the map's JSON (median 5.7K characters): its warps and
@@ -2892,6 +2925,26 @@ class PokeAgent:
         if function_name in STORE_WRITING_TOOLS:
             self._store_ctx_cache = None
 
+    def _apply_screenshot_policy(self, game_state_data: Dict[str, Any], screenshot_b64: Optional[str], step: int) -> Optional[str]:
+        """The frame to send this step: always under the default policy; under
+        SCREENSHOT_POLICY=needed only when frame_needed says so. Recorded in the step's
+        timing ("frame": 1/0) for local_tools/speed_report.py."""
+        last = getattr(self, "_frame_memory", {})
+        game = ((game_state_data.get("raw_state") or {}).get("game") or {}) if isinstance(game_state_data, dict) else {}
+        send, why = True, "policy always"
+        if screenshot_policy() == "needed" and screenshot_b64:
+            send, why = frame_needed(game_state_data, last, step)
+        self._frame_memory = {
+            "location": game_state_data.get("location") if isinstance(game_state_data, dict) else None,
+            "in_battle": bool(game.get("is_in_battle")),
+            "frame_step": step if (send and screenshot_b64) else last.get("frame_step"),
+        }
+        self._step_timing["frame"] = 1 if (send and screenshot_b64) else 0
+        if not send:
+            logger.info(f"🖼️  No frame this step ({why})")
+            return None
+        return screenshot_b64
+
     def _build_optimized_prompt(self, game_state_result: str, step_count: int) -> str:
         """Build optimized prompt by combining base_prompt.md with current game context.
         
@@ -3608,6 +3661,7 @@ Step {step_count}"""
                     game_state_data, screenshot_b64 = {}, None
                 # The match-up this decision is made for (BATTLE_DECISION_TOOLS).
                 self._seen_battle = game_state_data.get("battle_key") if isinstance(game_state_data, dict) else None
+                screenshot_b64 = self._apply_screenshot_policy(game_state_data, screenshot_b64, next_step)
 
                 # Build prompt (conditional based on optimization mode), trimming
                 # the oldest history if it would not fit the context budget.
