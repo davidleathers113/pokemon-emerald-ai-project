@@ -637,7 +637,8 @@ def parse_pokemon(data):
         trainer_id=box['otId'],
         nickname=box['nickname'],
         experience=box['substructs'][0]['experience'],
-        is_egg=bool(box['substructs'][3]['isEgg'])
+        is_egg=bool(box['substructs'][3]['isEgg']),
+        ability_num=int(box['substructs'][3]['abilityNum']),
     )
 
 

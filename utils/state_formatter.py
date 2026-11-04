@@ -337,7 +337,9 @@ def _format_state_summary(state_data):
 def _battle_mon_line(mon):
     hp = f"HP {mon['hp']}/{mon['max_hp']}" if mon['hp'] > 0 else "fainted"
     status = f", {mon['status']}" if mon.get('status', 'OK') != 'OK' else ""
-    return f"{mon['name'].upper()} Lv{mon['level']} ({'/'.join(mon['types'])}), {hp}{status}"
+    # The game's own ability for the Pokémon out (gBattleMons): LEVITATE, HUGE POWER...
+    ability = f", {mon['ability_name']}" if mon.get('ability_name') else ""
+    return f"{mon['name'].upper()} Lv{mon['level']} ({'/'.join(mon['types'])}), {hp}{status}{ability}"
 
 
 def _effectiveness_label(move):
@@ -736,7 +738,9 @@ def _format_party_info(player_data, game_data):
                         status = pokemon.get('status', 'Normal')
                     hp = pokemon.get('current_hp', '?')
                     max_hp = pokemon.get('max_hp', '?')
-                    context_parts.append(f"  {i+1}. {species} (Lv.{level}) HP: {hp}/{max_hp} Status: {status}")
+                    # David wants a HUGE POWER Marill (not Thick Fat): the ability is shown.
+                    ability = f", {pokemon['ability']}" if pokemon.get('ability') and not is_egg else ""
+                    context_parts.append(f"  {i+1}. {species} (Lv.{level}{ability}) HP: {hp}/{max_hp} Status: {status}")
         else:
             context_parts.append("No Pokemon in party")
     else:

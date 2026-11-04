@@ -1220,6 +1220,20 @@ prompt. That came to 1.1 tiles walked per minute.
   `test_a_fixed_damage_move_is_best_when_it_does_more`; the Lyle test's `expected == 120`
   (power units) is now `15` (HP, capped at WURMPLE's 15) with a comment.
 
+## Abilities (2026-11-04, WEAKNESSES R22; David: catch a Huge Power Marill)
+- pret: Emerald picks a Pokémon's ability with the box mon's abilityNum bit
+  (GetMonAbility → GetAbilityBySpecies: gSpeciesInfo abilities[abilityNum], +0x16/+0x17),
+  not personality & 1. CreateBoxMon sets the bit only when the species has a second
+  ability.
+- `parse_pokemon` fills `PokemonData.ability_num`; `read_party_pokemon` names it
+  (`species_ability`, `ability_name` from gAbilityNames 0x0831B6DB in pret's symbols).
+  The state's party entries carry `ability`; PARTY STATUS lines read
+  "Marill (Lv.13, HUGE POWER)". Battle-view lines add the game's gBattleMons ability.
+- *Verified:* the live Marill (test_marill_in_party.state) has abilityNum 1 → HUGE POWER;
+  the other three read EFFECT SPORE, BLAZE, KEEN EYE. On Isaac's ARON (two abilities)
+  the reading from gEnemyParty equals the game's gBattleMons ability (STURDY); the first
+  check read the wrong enemy slot (gBattlerPartyIndexes names the one out).
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.

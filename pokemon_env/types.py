@@ -19,7 +19,11 @@ class PokemonData:
     nickname: Optional[str] = None
     experience: Optional[int] = None
     is_egg: bool = False
-    
+    # The box mon's abilityNum bit (pret struct PokemonSubstruct3) picks the species'
+    # first or second ability; ability is its name from the ROM ("HUGE POWER").
+    ability_num: int = 0
+    ability: Optional[str] = None
+
     @property
     def is_asleep(self) -> bool:
         """Check if the Pokémon is asleep"""

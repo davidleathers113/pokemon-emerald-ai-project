@@ -307,6 +307,31 @@ def test_a_fixed_damage_move_is_best_when_it_does_more():
     assert any("NIGHT SHADE GHOST 1 PP" in line and "~24 HP" in line for line in format_battle_view(view))
 
 
+def test_abilities_read_as_the_game_reads_them():
+    """The ability from a Pokémon's abilityNum bit and its species' gSpeciesInfo entry
+    must be the one the game puts in gBattleMons (pret GetAbilityBySpecies). Breeder
+    Isaac's second Pokémon, ARON, has two (STURDY / ROCK HEAD): parse it from gEnemyParty
+    and compare with gBattleMons[1].ability once it is out."""
+    from pokemon_env.emerald_utils import Pokemon_format, parse_pokemon
+    import struct as _struct
+
+    s = server()
+    s.load(ISAAC)
+    r = s.call("mcp_use_move", {"move": _view(s)["best_move"]["name"], "reasoning": "test"})
+    assert r["success"] and _view(s)["target"]["name"] == "Aron", r
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        size = _struct.calcsize("<" + Pokemon_format)
+        slot = reader._read_u16(0x0202406E + 2)  # gBattlerPartyIndexes[1]: the enemy party slot out
+        aron = parse_pokemon(bytes(reader.read_memory(0x02024744 + size * slot, size)))  # gEnemyParty[slot]
+        mine = reader.ability_name(reader.species_ability(aron.species_id, aron.ability_num))
+        games = reader.ability_name(reader._read_u8(FOE + 0x20))
+        both = [reader.ability_name(a) for a in bytes(reader.read_memory(0x083203CC + 28 * aron.species_id + 0x16, 2))]
+    print(f"    ARON abilityNum {aron.ability_num}: {mine}; the game: {games}; species: {both}")
+    assert both == ["STURDY", "ROCK HEAD"], both
+    assert mine == games, (mine, games)
+
+
 def _run_all():
     import test_movement_feedback as harness
 

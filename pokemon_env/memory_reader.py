@@ -77,6 +77,7 @@ EFFECTS_MAJOR_STATUS = (EFFECT_SLEEP, EFFECT_TOXIC, EFFECT_POISON, EFFECT_PARALY
 
 # Damage estimate (estimate_damage): pret battle_move_effects.h, abilities.h and
 # pokemon.c gStatStageRatios (stage -6..+6 as numerator/denominator).
+G_ABILITY_NAMES = 0x0831B6DB  # gAbilityNames, pret symbols (78 x 13 bytes)
 FLAG_BADGE01_GET = 0x867  # pret flags.h SYSTEM_FLAGS + 0x7; badges 2-8 follow
 EFFECT_EXPLOSION = 7
 EFFECT_SUPER_FANG = 40
@@ -612,6 +613,7 @@ class PokemonEmeraldReader:
                         # Marill to Lv18" found no Marill in the party. The local table
                         # lists only Hoenn-dex species; the ROM's gSpeciesNames has all.
                         pokemon.species_name = self._battle_species_name(pokemon.species_id)
+                    pokemon.ability = self.ability_name(self.species_ability(pokemon.species_id, pokemon.ability_num))
                     party.append(pokemon)
 
                     logger.info(f"Slot {i}: Parsed Pokemon = {pokemon}")
@@ -1544,6 +1546,21 @@ class PokemonEmeraldReader:
         raw = bytes(self.read_memory(ADDRESSES["gSpeciesInfo"] + 28 * species_id, 28))
         return [raw[6], raw[7]]
 
+    def species_ability(self, species_id: int, ability_num: int) -> int:
+        """ABILITY_* id: pret GetAbilityBySpecies, abilities[abilityNum] of the species'
+        gSpeciesInfo entry (28 bytes, abilities[2] at +0x16/+0x17).
+
+        David wants a HUGE POWER Marill (Huge Power doubles Attack; the other is Thick Fat).
+        A species with one ability has abilityNum 0 (pret CreateBoxMon sets the bit only
+        when abilities[1] is not ABILITY_NONE)."""
+        raw = bytes(self.read_memory(ADDRESSES["gSpeciesInfo"] + 28 * species_id + 0x16, 2))
+        return raw[1] if ability_num and raw[1] else raw[0]
+
+    def ability_name(self, ability_id: int) -> str:
+        """'HUGE POWER': gAbilityNames from ROM (ABILITY_NAME_LENGTH 12 + 1 bytes each)."""
+        raw = bytes(self.read_memory(G_ABILITY_NAMES + 13 * ability_id, 13))
+        return EmeraldCharmap().decode(raw).strip() or f"ABILITY {ability_id}"
+
     def move_type_and_power(self, move_name: str) -> Optional[Tuple[int, int]]:
         """'MEGA_DRAIN' (the party reader's spelling) -> (TYPE_* id, power) from gBattleMoves."""
         try:
@@ -1803,6 +1820,7 @@ class PokemonEmeraldReader:
             },
             "stat_stages": [b - 256 if b >= 128 else b for b in bytes(self.read_memory(base + 0x18, 8))],
             "ability": self._read_u8(base + 0x20),
+            "ability_name": self.ability_name(self._read_u8(base + 0x20)),
         }
 
     def read_battle_view(self) -> Optional[Dict[str, Any]]:
@@ -3064,7 +3082,8 @@ class PokemonEmeraldReader:
                         "types": [t.name for t in [pokemon.type1, pokemon.type2] if t],
                         "moves": pokemon.moves,
                         "move_pp": pokemon.move_pp,
-                        "nickname": pokemon.nickname
+                        "nickname": pokemon.nickname,
+                        "ability": pokemon.ability,
                     }
                     for pokemon in party
                 ]

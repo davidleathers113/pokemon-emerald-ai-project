@@ -287,6 +287,24 @@ def test_a_pokemon_from_outside_the_hoenn_dex_is_named():
     assert "Marill" in text and "Species_" not in text, text
 
 
+def test_party_abilities_are_shown():
+    """David wants a HUGE POWER Marill (Huge Power doubles Attack; the other is Thick Fat),
+    so a second one is caught if this one isn't. The ability is the species' abilities[
+    abilityNum] (pret GetAbilityBySpecies); test_battle_view checks that against the game."""
+    import asyncio
+
+    s = server()
+    s.load(Path(__file__).resolve().parent / "test_marill_in_party.state")
+    with s.srv.memory_lock:
+        party = s.srv.env.memory_reader.read_party_pokemon()
+    print("   ", [(p.species_name, p.ability_num, p.ability) for p in party])
+    marill = party[3]
+    assert marill.ability == ("HUGE POWER" if marill.ability_num else "THICK FAT"), marill
+    assert [p.ability for p in party[:3]] == ["EFFECT SPORE", "BLAZE", "KEEN EYE"], party
+    text = asyncio.run(s.srv.mcp_get_game_state())["state_text"]
+    assert f"Marill (Lv.13, {marill.ability})" in text, text
+
+
 def test_insert_objective_goes_before_the_current_one_and_persists():
     from agents.objectives.direct_objectives import DirectObjectiveManager
 
