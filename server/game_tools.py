@@ -338,6 +338,10 @@ def load_pathfinding_state(env) -> tuple:
                         # Rocks and trees the party can clear: walkable for the planner
                         # (at a cost), cleared by the walk when it bumps into one.
                         state["map"]["porymap"]["clearable"] = list(clearable_obstacles(porymap_map_name))
+                        # Water the party can Surf joins the walk (pathfinding._water_step);
+                        # the walk starts Surf when it bumps into the water (server
+                        # _start_surf).
+                        state["map"]["porymap"]["surf"] = can_surf()
                         state["map"]["porymap"]["raw_tiles"] = raw_tiles
 
                         # For selected dynamic maps (e.g. Mauville Gym), replace static
@@ -510,7 +514,8 @@ def navigate_to_direct(
                         if cell == "#":
                             error_msg += " - Target is blocked by a wall or obstacle"
                         elif cell == "W":
-                            error_msg += " - Target requires Surf (water)"
+                            # With Surf the planner crosses water already: no way is no way.
+                            error_msg += " - Target is water that no shore here reaches" if can_surf() else " - Target requires Surf (water)"
                         elif cell in ["X", "?"]:
                             error_msg += " - Target is out of bounds or unexplored"
                         else:
@@ -602,7 +607,7 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, liv
         exits.append({
             "kind": "edge",
             "direction": direction,
-            "open_span": connection_open_span(conn),
+            "open_span": connection_open_span(conn, surf=can_surf()),
             "dead_ends": _edge_dead_ends(
                 porymap_map_name or "", str(conn.get("map", "")), direction, int(conn.get("offset", 0) or 0)
             ),
@@ -987,8 +992,15 @@ FIELD_MOVE_OBSTACLES = {
     "OBJ_EVENT_GFX_CUTTABLE_TREE": ("CUT", 1),
     "OBJ_EVENT_GFX_BREAKABLE_ROCK": ("ROCK_SMASH", 3),
 }
+# Surf (outside battle) needs the Balance Badge: pret src/field_control_avatar.c
+# GetInteractedWaterScript checks FlagGet(FLAG_BADGE05_GET) and PartyHasMonWithSurf; the
+# script it runs (data/scripts/surf.inc EventScript_UseSurf, checkpartymove MOVE_SURF)
+# skips eggs.
+SURF = "SURF"
+# Every field move the walks use, by the badge number that allows it outside battle.
+FIELD_MOVE_BADGES = {**{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5}
 # () -> set of field moves usable now (known by a party Pokémon, badge set), installed by
-# the server. None: no obstacle is clearable.
+# the server. None: no obstacle is clearable and no water crossable.
 field_moves_reader = None
 
 
@@ -1026,6 +1038,23 @@ def clearable_obstacles(map_dir: str) -> dict:
         if move in usable:
             out[(int(obj.get("x", -1)), int(obj.get("y", -1)))] = move
     return out
+
+
+def can_surf() -> bool:
+    """A party Pokémon (not an egg) knows SURF and the Balance Badge is set: the game
+    offers "Would you like to SURF?" facing water from the shore."""
+    return SURF in _usable_field_moves()
+
+
+def surf_start_tile(map_dir: str, tile) -> bool:
+    """Whether the map's (x, y) is water Surf can be started onto (pathfinding
+    SURF_START_BEHAVIORS), by the decomp's layout."""
+    from utils.mapping.pathfinding import is_surf_start
+    from utils.mapping.porymap_state import layout_tiles
+
+    tiles = layout_tiles(map_dir) if map_dir else ()
+    x, y = int(tile[0]), int(tile[1])
+    return 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) and is_surf_start(tiles[y][x])
 
 
 # () -> squashed names of the items in the bag (_squash_name), installed by the server.
@@ -1186,12 +1215,45 @@ def _route_areas(map_dir: str) -> dict:
     Seen live: on GRANITE CAVE 1F a row of east-facing ledges cuts the ladder from B1F
     (4,21) off from Steven's Room; counted two-way, the route sent the AI up that
     ladder, where the door can only be seen.
+
+    When the party can Surf (can_surf), water is part of the areas too: it joins the
+    shores it can be surfed from and landed on (_surf_layout).
     """
-    return _walk_areas_without(map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True)
+    return _walk_areas_without(map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True, can_surf())
 
 
 @lru_cache(maxsize=None)
-def _walk_areas_without(map_dir: str, obstacles: frozenset, ledges_are_walls: bool = False) -> dict:
+def _surf_layout(map_dir: str) -> tuple:
+    """(water, start, shore, elevation) from the map's layout (porymap_state.layout_tiles):
+    the tiles a surfer moves on (pathfinding.is_surf_water), those of them Surf can be
+    started onto (is_surf_start), the land it starts from and lands on (is_shore), and
+    each tile's elevation. Empty sets when the layout can't be read or isn't the size of
+    the map's grid (an ASCII override)."""
+    from utils.mapping.pathfinding import is_shore, is_surf_start, is_surf_water
+    from utils.mapping.porymap_state import _static_grid, layout_tiles
+
+    tiles = layout_tiles(map_dir) if map_dir else ()
+    grid = _static_grid(map_dir) if map_dir else None
+    if not tiles or not grid or len(tiles) != len(grid) or any(len(a) != len(b) for a, b in zip(tiles, grid)):
+        return frozenset(), frozenset(), frozenset(), {}
+    cells = [((x, y), tile) for y, row in enumerate(tiles) for x, tile in enumerate(row)]
+    return (
+        frozenset(pos for pos, tile in cells if is_surf_water(tile)),
+        frozenset(pos for pos, tile in cells if is_surf_start(tile)),
+        frozenset(pos for pos, tile in cells if is_shore(tile)),
+        {pos: tile[3] for pos, tile in cells if len(tile) > 3},
+    )
+
+
+@lru_cache(maxsize=None)
+def _walk_areas_without(
+    map_dir: str, obstacles: frozenset, ledges_are_walls: bool = False, surf: bool = False
+) -> dict:
+    """surf: water joins the areas, with the steps pathfinding._water_step allows: from
+    a shore onto water Surf can start on and back, water to water, and straight under a
+    bridge (elevation 15) to the water beyond it. The bridge's own tiles stay with the
+    land at its ends: a surfer passes under it and can't climb onto it."""
+    from utils.mapping.pathfinding import BRIDGE_ELEVATION
     from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid
 
     grid = _static_grid(map_dir) if map_dir else None
@@ -1202,24 +1264,51 @@ def _walk_areas_without(map_dir: str, obstacles: frozenset, ledges_are_walls: bo
         for y, row in enumerate(grid)
     ] if obstacles else grid
     blocked = set(_EDGE_BLOCKED) | (set(_LEDGE_STEPS) if ledges_are_walls else set())
+    water, start, shore, elevation = _surf_layout(map_dir) if surf else (frozenset(), frozenset(), frozenset(), {})
+
+    def inside(x: int, y: int) -> bool:
+        return 0 <= y < len(grid) and 0 <= x < len(grid[y])
+
+    def open_tile(x: int, y: int) -> bool:
+        return (x, y) in water or grid[y][x] not in blocked
+
+    def steps(x: int, y: int):
+        here_water = (x, y) in water
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not inside(nx, ny):
+                continue
+            there_water = (nx, ny) in water
+            if here_water and not there_water and elevation.get((nx, ny)) == BRIDGE_ELEVATION:
+                while inside(nx, ny) and elevation.get((nx, ny)) == BRIDGE_ELEVATION:
+                    nx, ny = nx + dx, ny + dy
+                if (nx, ny) in water:
+                    yield nx, ny
+                continue
+            if not open_tile(nx, ny):
+                continue
+            if here_water != there_water:
+                land, sea = ((nx, ny), (x, y)) if here_water else ((x, y), (nx, ny))
+                if land not in shore or sea not in start:
+                    continue
+            yield nx, ny
+
     area: dict = {}
     number = -1
     for y0, row in enumerate(grid):
         for x0, cell in enumerate(row):
-            if cell in blocked or (x0, y0) in area:
+            if not open_tile(x0, y0) or (x0, y0) in area:
                 continue
             number += 1
             stack = [(x0, y0)]
             area[(x0, y0)] = number
             while stack:
                 x, y = stack.pop()
-                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                    if (nx, ny) in area or ny < 0 or ny >= len(grid) or nx < 0 or nx >= len(grid[ny]):
+                for nxt in steps(x, y):
+                    if nxt in area:
                         continue
-                    if grid[ny][nx] in blocked:
-                        continue
-                    area[(nx, ny)] = number
-                    stack.append((nx, ny))
+                    area[nxt] = number
+                    stack.append(nxt)
     return area
 
 
@@ -1249,7 +1338,6 @@ def _areas_at(map_dir: str, x: int, y: int, areas: Optional[dict] = None) -> set
     return {areas[c] for c in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)) if c in areas}
 
 
-@lru_cache(maxsize=256)
 def _edge_dead_ends(map_dir: str, dest_const: str, direction: str, offset: int) -> frozenset:
     """Positions along this map's edge (x for up/down, y for left/right, this map's frame)
     whose arrival tile next door is in an area with no way on but back here.
@@ -1258,6 +1346,12 @@ def _edge_dead_ends(map_dir: str, dest_const: str, direction: str, offset: int) 
     y=6, and landed on ROUTE 117 (0,6): a one-tile notch walled in on three sides, so
     every walk and train call from there failed. Route 117 goes on from y=8.
     """
+    return _edge_dead_ends_with(map_dir, dest_const, direction, offset, can_surf())
+
+
+@lru_cache(maxsize=256)
+def _edge_dead_ends_with(map_dir: str, dest_const: str, direction: str, offset: int, surf: bool) -> frozenset:
+    """_edge_dead_ends, kept per Surf ability: the areas it reads (_route_areas) change with it."""
     from utils.mapping.porymap_state import _map_dirs_by_const, _static_grid
 
     dest = _map_dirs_by_const().get(dest_const)
@@ -1365,7 +1459,6 @@ CABLE_CAR_STATIONS = {
 }
 
 
-@lru_cache(maxsize=None)
 def _ride_exits(map_dir: str) -> tuple:
     """_walk_exits' shape for a ride (RIDE_EXIT) from this map, or () if it has none.
 
@@ -1373,6 +1466,12 @@ def _ride_exits(map_dir: str) -> tuple:
     walked into Jagged Pass's bottom (14,40), below one-way ledges, where the tall grass
     can't be reached; the way to it is the Cable Car up to Mt. Chimney.
     """
+    return _ride_exits_with(map_dir, can_surf())
+
+
+@lru_cache(maxsize=None)
+def _ride_exits_with(map_dir: str, surf: bool) -> tuple:
+    """_ride_exits, kept per Surf ability: the areas it names (_route_areas) change with it."""
     from utils.mapping.porymap_state import _readable_map_name, _map_dirs_by_const
 
     ride = CABLE_CAR_STATIONS.get(map_dir)
@@ -1537,8 +1636,10 @@ def _far_map_hint(map_dir: str, matches, position: Optional[Tuple[int, int]] = N
             lines.append(f'{path[0][1]} is through an exit of this map: go_to_exit("{exit_arg}").')
             continue
         way = " → ".join(name for _, name in path)
+        # The areas joined across water when the party can Surf (_route_areas).
+        how = "on foot (and by Surf over water)" if can_surf() else "on foot"
         lines.append(
-            f"{path[-1][1]} is not next to this map; the way on foot is {way}. "
+            f"{path[-1][1]} is not next to this map; the way {how} is {way}. "
             f'go_to_exit("{exit_arg}") takes the first step.'
         )
     return " ".join(lines)
@@ -2110,6 +2211,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     this_map = _raw_map_json(source.get("porymap_map_name") or "").get("id")
 
     blocked = [(int(x) - ox, int(y) - oy) for x, y in avoid] or None
+    surf = bool(state.get("map", {}).get("porymap", {}).get("surf"))
 
     def route_to(tile):
         if tile == start:
@@ -2125,7 +2227,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     tried = []
     for exit_entry in matches:
         if exit_entry["kind"] == "edge":
-            candidates = edge_candidates(grid, exit_entry["direction"])
+            candidates = edge_candidates(grid, exit_entry["direction"], surf=surf)
             span = exit_entry.get("open_span")
             if span is not None:
                 # Only where the neighbouring map is walkable too (span is in full-map coords).
@@ -2192,7 +2294,9 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
             "error": (
                 f"Cannot reach '{exit_query}' from ({pos.get('x')}, {pos.get('y')}) on {location}: "
                 + "; ".join(tried)
-                + ". A ledge (one-way), water (needs Surf) or a person may be in the way."
+                # With Surf the plan crosses water already: water is no reason then.
+                + (". A ledge (one-way) or a person may be in the way." if surf
+                   else ". A ledge (one-way), water (needs Surf) or a person may be in the way.")
             ),
         }
     best.update({

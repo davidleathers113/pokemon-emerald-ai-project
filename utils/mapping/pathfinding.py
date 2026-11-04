@@ -49,6 +49,64 @@ BRIDGE_ELEVATION = 15
 # warps and the cycling road (_get_blocked_positions).
 PASSABLE_WITH_COLLISION = frozenset({"D", "S", "&", "←", "→", "↑", "↓", "↗", "↖", "↘", "↙"})
 
+# Surf. Seen live (twice): with SURF on AZUMARILL and the Balance Badge, go_to("Route 119")
+# from ROUTE 118 said it "can't be reached on foot" and the AI stalled at the river at
+# (17,10); by hand it was A facing the water, YES to "Would you like to SURF?", and walk.
+# Water a surfer moves on: pret src/metatile_behavior.c sTileBitAttributes,
+# TILE_FLAG_SURFABLE. Left out though surfable there: MB_WATERFALL (going up it needs
+# WATERFALL, pret GetInteractedWaterScript), the MB_*_CURRENTs (pret field_player_avatar.c
+# ForcedMovement slides the surfer along them, so a walk planned step by step loses its
+# place) and MB_WATER_DOOR / MB_WATER_SOUTH_ARROW_WARP, which are exits ('D'/'S').
+SURF_WATER_BEHAVIORS = frozenset({
+    "POND_WATER", "INTERIOR_DEEP_WATER", "DEEP_WATER", "SOOTOPOLIS_DEEP_WATER", "OCEAN_WATER",
+    "NO_SURFACING", "SEAWEED", "SEAWEED_NO_SURFACING",
+})
+# Water Surf can be started onto: pret MetatileBehavior_IsSurfableFishableWater (less the
+# currents, as above), checked by IsPlayerFacingSurfableFishableWater.
+SURF_START_BEHAVIORS = frozenset({
+    "POND_WATER", "INTERIOR_DEEP_WATER", "DEEP_WATER", "SOOTOPOLIS_DEEP_WATER", "OCEAN_WATER",
+})
+# pret ELEVATION_DEFAULT: IsPlayerFacingSurfableFishableWater wants the player at it
+# (PlayerGetElevation() == 3) and facing an elevation mismatch, and CanStopSurfing lands
+# only on a tile at it. Water itself is elevation 1, so the shore is where 3 meets 1.
+SHORE_ELEVATION = 3
+# The elevation of water in the layouts (and so of a surfer on it).
+WATER_ELEVATION = 1
+# Planner cost of starting Surf: like a rock to smash, a stop, a question and an
+# animation, so a way on land of about as many steps is taken instead.
+SURF_START_COST = CLEARABLE_TILE_COST
+
+
+def tile_behavior_name(tile) -> str:
+    """The MetatileBehavior name of a (tile id, behavior, collision, elevation) tile, or ''."""
+    if not tile or len(tile) < 2:
+        return ""
+    behavior = tile[1]
+    name = getattr(behavior, "name", None)
+    if name is not None:
+        return str(name)
+    if MetatileBehavior is None:
+        return ""
+    try:
+        return MetatileBehavior(int(behavior)).name
+    except (TypeError, ValueError):
+        return ""
+
+
+def is_surf_water(tile) -> bool:
+    """Water a surfer can move onto: a SURF_WATER_BEHAVIORS tile without a collision bit."""
+    return tile_behavior_name(tile) in SURF_WATER_BEHAVIORS and not (len(tile) > 2 and tile[2])
+
+
+def is_surf_start(tile) -> bool:
+    """Water Surf can be started onto from the shore (SURF_START_BEHAVIORS)."""
+    return is_surf_water(tile) and tile_behavior_name(tile) in SURF_START_BEHAVIORS
+
+
+def is_shore(tile) -> bool:
+    """Land a surfer can step off onto, and Surf can start from: elevation 3, no collision."""
+    return bool(tile) and len(tile) > 3 and tile[3] == SHORE_ELEVATION and not tile[2] and not is_surf_water(tile)
+
 
 @dataclass
 class Node:
@@ -424,6 +482,8 @@ class Pathfinder:
                     "triggers": porymap.get("triggers", []),
                     # Rocks/trees the party can clear (game_tools.clearable_obstacles).
                     "clearable": porymap.get("clearable", []),
+                    # The party can Surf now (game_tools.can_surf): water joins the walk.
+                    "surf": bool(porymap.get("surf")),
                 }
 
                 # Include raw tiles with elevation if available
@@ -525,7 +585,14 @@ class Pathfinder:
             start_row = grid[start_pos[1]]
             if start_pos[0] < len(start_row):
                 player_in_water = start_row[start_pos[0]] == "W"
-        
+
+        def surfable(x: int, y: int) -> bool:
+            """Water the party can Surf on (map_data "surf"); where the walk may enter and
+            leave it is _water_step's call."""
+            if not map_data.get("surf") or not raw_tiles or not (0 <= y < len(raw_tiles)):
+                return False
+            return 0 <= x < len(raw_tiles[y]) and is_surf_water(raw_tiles[y][x])
+
         game_type = os.environ.get("GAME_TYPE", "emerald")
         red_block_symbols = {"#", "X", "!", "P", "T", "B", "^", "U", "C", "=", "t", "D", "S", "G"}  # "!": sign (blocked); "?": hidden item (walkable); "t": cuttable tree; "D"/"S": doors/stairs (warp player out of map); "G": Card Key gate
         block_symbols = red_block_symbols if game_type.upper() == "RED" else {"#", "X"}
@@ -554,7 +621,7 @@ class Pathfinder:
                         if start_pos and pos == start_pos:
                             # Starting position is always walkable
                             continue
-                        if not player_in_water:
+                        if not player_in_water and not surfable(x, y):
                             # Player on ground can't access water
                             blocked.add(pos)
                         # else: player in water, don't block other water tiles
@@ -668,7 +735,7 @@ class Pathfinder:
                         if start_pos and pos == start_pos:
                             # Starting position is always walkable
                             continue
-                        if not player_in_water:
+                        if not player_in_water and not surfable(x, y):
                             # Player on ground can't access water
                             blocked.add(pos)
                         # else: player in water, don't block other water tiles
@@ -899,6 +966,53 @@ class Pathfinder:
 
         return warps
 
+    def _water_step(
+        self,
+        from_pos: Tuple[int, int],
+        to_pos: Tuple[int, int],
+        map_data: Dict,
+        carried_elevation: Optional[int] = None,
+    ) -> Optional[bool]:
+        """Whether a step into, on or out of Surf water is possible; None for a step that
+        has nothing to do with water (the usual checks decide).
+
+        pret src/field_player_avatar.c: Surf starts only facing surfable water from
+        elevation 3 (IsPlayerFacingSurfableFishableWater); a surfer (elevation 1, the
+        water's) moves over water and, like any walker, under a bridge (elevation 15 keeps
+        its elevation, ObjectEventUpdateElevation); stepping onto an elevation-3 tile
+        ends Surf (CanStopSurfing). Any other step between water and land is refused,
+        though the game might allow some (an elevation-0 tile next to water): a missing
+        way is better than a walk that ends in the water's edge.
+        """
+        raw_tiles = map_data.get("raw_tiles")
+        if not raw_tiles:
+            return None
+
+        def tile(pos):
+            x, y = pos
+            if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]):
+                found = raw_tiles[y][x]
+                return found if found and len(found) > 3 else None
+            return None
+
+        here, there = tile(from_pos), tile(to_pos)
+        if here is None or there is None:
+            return None
+        from_water, to_water = is_surf_water(here), is_surf_water(there)
+        # Under a bridge the surfer keeps the water's elevation (carried_elevation).
+        surfing = from_water or (
+            here[3] == BRIDGE_ELEVATION and carried_elevation is not None and carried_elevation == WATER_ELEVATION
+        )
+        if surfing:
+            if to_water or there[3] in (BRIDGE_ELEVATION, SHORE_ELEVATION):
+                return True
+            # A door in the water (MB_WATER_DOOR, MB_WATER_SOUTH_ARROW_WARP: Scorched Slab).
+            dest_symbol = map_data["grid"][to_pos[1]][to_pos[0]]
+            return dest_symbol in ("D", "S") and "WATER" in tile_behavior_name(there)
+        if not to_water:
+            return None
+        return bool(map_data.get("surf")) and is_shore(here) and is_surf_start(there)
+
     def _can_move_to(
         self,
         from_pos: Tuple[int, int],
@@ -945,6 +1059,10 @@ class Pathfinder:
         # Calculate movement direction
         dx = to_pos[0] - from_pos[0]  # positive = moving east, negative = moving west
         dy = to_pos[1] - from_pos[1]  # positive = moving south, negative = moving north
+
+        water_step = self._water_step(from_pos, to_pos, map_data, carried_elevation)
+        if water_step is not None:
+            return water_step
 
         # ========================================================================
         # Elevation Checking Logic
@@ -1278,10 +1396,14 @@ class Pathfinder:
             - Tuple of (None, best_node) if no complete path found (for partial paths)
         """
         raw_tiles = map_data.get("raw_tiles") or []
+        surf = bool(map_data.get("surf"))
+
+        def raw_tile(pos):
+            x, y = pos
+            return raw_tiles[y][x] if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]) else None
 
         def elevation(pos):
-            x, y = pos
-            tile = raw_tiles[y][x] if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]) else None
+            tile = raw_tile(pos)
             return tile[3] if tile and len(tile) > 3 else None
 
         def carried_after(carried, pos):
@@ -1357,6 +1479,8 @@ class Pathfinder:
                                 move_cost = self.grass_cost
                 if neighbor_pos in clearable:
                     move_cost = CLEARABLE_TILE_COST
+                elif surf and is_surf_water(raw_tile(neighbor_pos)) and not is_surf_water(raw_tile((current.x, current.y))):
+                    move_cost = SURF_START_COST
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)

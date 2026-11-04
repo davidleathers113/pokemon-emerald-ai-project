@@ -628,6 +628,26 @@ def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
 
 
 @lru_cache(maxsize=None)
+def layout_tiles(map_dir: str) -> Tuple[Tuple[tuple, ...], ...]:
+    """A map's tiles from the decomp's own layout, (tile id, behavior, collision,
+    elevation) per cell by row; () when it can't be read. Never an ASCII override: an
+    override draws only walls and floor (RustboroCity's draws its gym door as plain
+    floor) and keeps no elevation."""
+    from utils.mapping.pokeemerald_parser import PokeemeraldLayoutParser, PokeemeraldMapLoader
+
+    root = _get_pokeemerald_root()
+    if not root or not map_dir:
+        return ()
+    try:
+        layout = PokeemeraldMapLoader(Path(root)).get_layout_name_from_map(map_dir)
+        tiles = PokeemeraldLayoutParser(Path(root)).get_metatiles_with_behavior(layout) if layout else None
+    except Exception as e:  # unreadable: callers fall back to what they did without tiles
+        logger.warning(f"Porymap: could not read tiles for {map_dir}: {e}")
+        return ()
+    return tuple(tuple(tuple(tile) for tile in row) for row in tiles or ())
+
+
+@lru_cache(maxsize=None)
 def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
     """For each of the map's warp_events, in order: (its layout tile (tile id, behavior,
     collision, elevation) or None, whether a bg_event with a script is on that tile).
@@ -635,8 +655,6 @@ def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
     Tiles come from the decomp's own layout, never an ASCII override: an override draws
     only walls and floor, and RustboroCity's draws its gym door as plain floor.
     """
-    from utils.mapping.pokeemerald_parser import PokeemeraldLayoutParser, PokeemeraldMapLoader
-
     root = _get_pokeemerald_root()
     map_file = Path(root) / "data" / "maps" / map_dir / "map.json" if root and map_dir else None
     if map_file is None or not map_file.is_file():
@@ -644,12 +662,10 @@ def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
     try:
         with open(map_file, encoding="utf-8") as fh:
             data = json.load(fh)
-        layout = PokeemeraldMapLoader(Path(root)).get_layout_name_from_map(map_dir)
-        tiles = PokeemeraldLayoutParser(Path(root)).get_metatiles_with_behavior(layout) if layout else None
-    except Exception as e:  # unreadable: every warp counts as an ordinary one, as before
-        logger.warning(f"Porymap: could not read tiles for {map_dir}: {e}")
+    except (OSError, ValueError) as e:  # unreadable: every warp counts as an ordinary one, as before
+        logger.warning(f"Porymap: could not read {map_file}: {e}")
         return ()
-    tiles = tiles or []
+    tiles = layout_tiles(map_dir)
     scripted = {
         (int(bg.get("x", -1)), int(bg.get("y", -1))) for bg in data.get("bg_events") or [] if bg.get("script")
     }
@@ -722,8 +738,15 @@ def sign_door_warps(map_dir: str) -> frozenset:
     )
 
 
-def connection_open_span(conn: Dict[str, Any]) -> Optional[set]:
-    """Positions along this map's edge where the connected map is walkable.
+def edge_blocked(surf: bool = False) -> set:
+    """_EDGE_BLOCKED, less water when the party can Surf: a surfer crosses a map edge
+    over water like a walker over ground (the sea routes east of Lilycove)."""
+    return set(_EDGE_BLOCKED) - ({"W"} if surf else set())
+
+
+def connection_open_span(conn: Dict[str, Any], surf: bool = False) -> Optional[set]:
+    """Positions along this map's edge where the connected map is walkable (or, with
+    surf, surfable).
 
     A map edge only leads somewhere where the tile across it, on the neighbouring map,
     can be stood on: Oldale Town's whole south row is open ground, but Route 101 has
@@ -736,23 +759,24 @@ def connection_open_span(conn: Dict[str, Any]) -> Optional[set]:
     grid = _static_grid(map_dir) if map_dir else None
     if direction not in ("up", "down", "left", "right") or not grid:
         return None
+    blocked = edge_blocked(surf)
     offset = int(conn.get("offset", 0) or 0)
     if direction in ("up", "down"):
         row = grid[-1] if direction == "up" else grid[0]
-        return {i + offset for i, cell in enumerate(row) if cell not in _EDGE_BLOCKED}
+        return {i + offset for i, cell in enumerate(row) if cell not in blocked}
     width = max(len(row) for row in grid)
     col = width - 1 if direction == "left" else 0
     return {
         y + offset for y, row in enumerate(grid)
-        if col < len(row) and row[col] not in _EDGE_BLOCKED
+        if col < len(row) and row[col] not in blocked
     }
 
 
-def _edge_openings(ascii_lines: List[str], direction: str, allowed: Optional[set] = None) -> str:
+def _edge_openings(ascii_lines: List[str], direction: str, allowed: Optional[set] = None, surf: bool = False) -> str:
     """Walkable stretches on one edge of the map, e.g. 'x=10-11, y=0'.
 
     allowed, when given, keeps only those positions along the edge (see
-    connection_open_span).
+    connection_open_span). surf: water counts as open (edge_blocked).
     """
     if not ascii_lines:
         return ""
@@ -766,9 +790,10 @@ def _edge_openings(ascii_lines: List[str], direction: str, allowed: Optional[set
     else:
         return ""
     axis = 0 if direction in ("up", "down") else 1
+    blocked = edge_blocked(surf)
     open_cells = [
         c for c in cells
-        if ascii_lines[c[1]][c[0]] not in _EDGE_BLOCKED and (allowed is None or c[axis] in allowed)
+        if ascii_lines[c[1]][c[0]] not in blocked and (allowed is None or c[axis] in allowed)
     ]
     if not open_cells:
         return ""
@@ -891,25 +916,40 @@ def _format_trainers(map_dir: str, memory_reader: Any) -> List[str]:
     ]
 
 
-def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str]) -> List[str]:
+def _party_can_surf() -> bool:
+    """server.game_tools.can_surf (the party knows SURF and has the Balance Badge), or
+    False where no server is running (its readers are installed by server/app.py)."""
+    try:
+        from server import game_tools
+    except ImportError:
+        return False
+    return game_tools.can_surf()
+
+
+def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str], surf: bool = False) -> List[str]:
     """Plain-language list of where each exit leads.
 
     The same facts are in the Map Data JSON below, but a small model reads the raw
     warp/connection objects poorly (e.g. it took Birch's lab door for the way to
     Route 101, which is an open map edge). One line per exit is cheap and unambiguous.
+
+    surf (the party can Surf): an edge over water counts as a way off, and says so.
     """
     lines = []
     for conn in json_map.get("connections", []):
         direction = conn.get("direction", "?")
-        span = connection_open_span(conn)
-        where = _edge_openings(ascii_lines, direction, span)
+        span = connection_open_span(conn, surf)
+        where = _edge_openings(ascii_lines, direction, span, surf)
+        on_foot = _edge_openings(ascii_lines, direction, connection_open_span(conn), False) if surf else where
         edge = {"up": "north", "down": "south", "left": "west", "right": "east"}.get(direction, direction)
-        if where:
+        if where and where != on_foot:
+            how = f" (walk or Surf off at {where}; go_to_exit surfs where it must)"
+        elif where:
             how = f" (walk off at {where})"
         elif span is not None and ascii_lines:
             # Seen live: Route 104's "south edge -> ROUTE 105" (all sea) drew the model
             # south when it had no way to cross.
-            how = " (no way across on foot: water or cliff all along it)"
+            how = " (no way across: cliff all along it)" if surf else " (no way across on foot: water or cliff all along it)"
         else:
             how = ""
         lines.append(f"- {edge} edge of the map{how} -> {_readable_map_name(conn.get('map', '?'))}")
@@ -1203,9 +1243,10 @@ def _format_porymap_info(
                                     # Walkable ground at a different elevation
                                     filtered_row.append('^')
                                 elif original_char == 'W':
-                                    # Unreachable water stays '#' (need Surf, not elevation)
+                                    # Unreachable water stays '#' (need Surf, not elevation),
+                                    # unless the party can Surf: then the walks cross it.
                                     player_char = grid[py][px] if 0 <= py < height and 0 <= px < width else '.'
-                                    if player_char == 'W':
+                                    if player_char == 'W' or _party_can_surf():
                                         filtered_row.append('W')
                                     else:
                                         filtered_row.append('#')
@@ -1448,9 +1489,11 @@ def _format_porymap_info(
             
             context_parts.append("\nASCII Map:")
             context_parts.append(ascii_map)
-            context_parts.append("(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = walkable (different elevation), 'N' = NPC, 'I' = item, 'O' = other object, '~' = tall grass, 'W' = water, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
+            surf = _party_can_surf()
+            water = "'W' = water (your party can Surf: navigate_to and go_to cross it)" if surf else "'W' = water"
+            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = walkable (different elevation), 'N' = NPC, 'I' = item, 'O' = other object, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
 
-            exits = _format_exits(json_map, ascii_lines)
+            exits = _format_exits(json_map, ascii_lines, surf)
             if exits:
                 context_parts.append("\nEXITS (where each way out of this map leads):")
                 context_parts.extend(exits)

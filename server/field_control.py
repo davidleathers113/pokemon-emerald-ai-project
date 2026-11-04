@@ -143,6 +143,17 @@ def read_field_snapshot(reader) -> FieldSnapshot:
     )
 
 
+# struct PlayerAvatar +0 flags (pret include/global.fieldmap.h): set when the Surf field
+# effect starts (pret src/field_effect.c SurfFieldEffect_Init), cleared when the landing
+# jump starts (src/field_player_avatar.c CreateStopSurfingTask, which also locks the
+# field controls until the jump is over).
+PLAYER_AVATAR_FLAG_SURFING = 1 << 3
+
+
+def player_surfing(reader) -> bool:
+    return bool(reader._read_u8(G_PLAYER_AVATAR) & PLAYER_AVATAR_FLAG_SURFING)
+
+
 def npc_positions(reader) -> List[Tuple[int, int]]:
     """Map tiles where a visible object event other than the player stands right now.
 
@@ -461,19 +472,21 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
     return []
 
 
-def edge_candidates(grid: List, direction: str) -> List[Tuple[int, int]]:
-    """Standable tiles on one edge of the grid (local coordinates)."""
+def edge_candidates(grid: List, direction: str, surf: bool = False) -> List[Tuple[int, int]]:
+    """Standable tiles on one edge of the grid (local coordinates); with surf (the party
+    can Surf) water too, which a surfer crosses the edge on."""
+    unwalkable = EDGE_UNWALKABLE - {"W"} if surf else EDGE_UNWALKABLE
     height = len(grid)
     if not height:
         return []
     if direction in ("up", "down"):
         y = 0 if direction == "up" else height - 1
-        return [(x, y) for x, cell in enumerate(grid[y]) if cell not in EDGE_UNWALKABLE]
+        return [(x, y) for x, cell in enumerate(grid[y]) if cell not in unwalkable]
     width = max(len(row) for row in grid)
     x = 0 if direction == "left" else width - 1
     return [
         (x, y) for y, row in enumerate(grid)
-        if x < len(row) and row[x] not in EDGE_UNWALKABLE
+        if x < len(row) and row[x] not in unwalkable
     ]
 
 

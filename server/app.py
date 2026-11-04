@@ -980,6 +980,36 @@ def _wait_for_player_to_stand() -> bool:
     return False
 
 
+# A surfer moves a tile in 8 frames, twice a walker's speed (pret field_player_avatar.c
+# PlayerNotOnBikeMoving: PlayerWalkFast, "same speed as running"), so the normal hold is
+# still down when the first tile ends and a second one starts. Seen in a test: 16 LEFT
+# presses from the middle of ROUTE 118's river carried the player 22 tiles, past the
+# target. A press that turns the player first keeps the normal hold: the turn is a fast
+# walk in place (PlayerTurnInPlace, 8 frames), and the step after it needs the key held.
+SURF_STEP_HOLD_FRAMES = 6
+
+
+def _surf_step_timing(action_data: Dict[str, Any], timing: Dict[str, int]) -> Dict[str, int]:
+    """timing, with SURF_STEP_HOLD_FRAMES for a direction press that moves a surfer on
+    in the way it already faces (no explicit hold_frames given)."""
+    if action_data.get("button") not in DIRECTION_BUTTONS or action_data.get("hold_frames") is not None:
+        return timing
+    if game_type != "emerald" or env is None or getattr(env, "memory_reader", None) is None:
+        return timing
+    from server.field_control import player_surfing
+
+    snap = _pending_before_snapshot or _field_snapshot()
+    if snap is None or snap.facing != action_data["button"]:
+        return timing
+    try:
+        with memory_lock:
+            surfing = player_surfing(env.memory_reader)
+    except Exception as e:  # unreadable: the normal hold, as before
+        logger.debug(f"surf check failed: {e}")
+        return timing
+    return {**timing, "hold": min(timing["hold"], SURF_STEP_HOLD_FRAMES)} if surfing else timing
+
+
 def _begin_action(action_data) -> None:
     global _active_action_data, _move_check, _pending_before_snapshot
     _active_action_data = action_data
@@ -1247,6 +1277,7 @@ def game_loop(manual_mode=False):
                     if current_action_data.get("release_frames") is not None:
                         timing = timing.copy()
                         timing["release"] = current_action_data["release_frames"]
+                    timing = _surf_step_timing(current_action_data, timing)
 
                 _begin_action(current_action_data)
 
@@ -4957,6 +4988,117 @@ async def _clear_obstacle(tile, source: str) -> Optional[str]:
     return move.replace("_", " ")
 
 
+# The Surf field effect: the player's pose, the Pokémon shown, the jump onto its back
+# (pret src/field_effect.c SurfFieldEffect_*), in game frames, with room to spare.
+SURF_EFFECT_FRAMES = 900
+# A presses after YES to Surf: "<MON> used SURF!", with room for the YES/NO's own box.
+SURF_PRESSES = 4
+# Surf starts and landings one navigate_to may take before it stops and reports.
+SURF_MAX_STEPS = 4
+
+
+async def _start_surf(tile, source: str) -> Optional[str]:
+    """If the walk was stopped at the shore by water Surf can start onto (game_tools.
+    surf_start_tile) and the party can Surf (game_tools.can_surf), Surf: face the water,
+    A, "The water is dyed a deep blue… Would you like to SURF?" YES, "<MON> used SURF!",
+    then wait until the player is on the water and can move. Returns what the game said
+    ("AZUMARILL used SURF!"), or None when nothing was surfed.
+
+    Seen live (twice) at ROUTE 118 (17,10): exactly these presses, by hand, after go_to
+    had said Route 119 "can't be reached on foot". pret data/scripts/surf.inc
+    EventScript_UseSurf: MSGBOX_YESNO gText_WantToUseSurf, then gText_PlayerUsedSurf
+    and FLDEFF_USE_SURF; the press into the water itself only bumps (the water is
+    elevation 1, the shore 3: COLLISION_ELEVATION_MISMATCH).
+    """
+    from server import game_tools
+    from server import menu_state as ms
+    from server.field_control import DIALOGUE_CHOICE, DIRECTION_DELTAS, dialogue_status, player_surfing
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    if not tile or _mem(player_surfing) or not game_tools.can_surf():
+        return None
+    if not game_tools.surf_start_tile(ROM_TO_PORYMAP_MAP.get(_location_name(), ""), tile):
+        return None
+    if not await _await_game(_player_can_walk, MACRO_MENU_FRAMES):
+        logger.warning(f"{source}: at the water {tuple(tile)} but the player can't act ({_field_snapshot()})")
+        return None
+    snap = _field_snapshot()
+    if snap is None:
+        return None
+    face = next((b for b, (dx, dy) in DIRECTION_DELTAS.items() if (snap.x + dx, snap.y + dy) == tuple(tile)), None)
+    if face is None:
+        return None  # the water is not next to the player
+    if snap.facing != face:
+        await _macro_press([face], source)  # the shore's edge: this only turns the player
+    # Seen in a test run: an A pressed right after the bump into the water did nothing (the
+    # game reads A only once the player stands still); nothing on screen means press again.
+    asked, texts = False, []
+    for _ in range(3):
+        await _macro_press(["A"], source)
+        asked, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+        if asked or texts or not _player_can_walk():
+            break
+    if not asked:
+        await _close_dialogue(source)
+        logger.warning(f"{source}: A at the water {tuple(tile)} asked nothing ({_quote(texts)})")
+        return None
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor == 1 and cursor.cursor == 1:
+        await _macro_press(["UP"], source)
+        cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor != 1 or cursor.cursor != 0:
+        await _macro_press(["B"], source)  # B answers NO: never leave the question up
+        await _close_dialogue(source)
+        return None
+    await _macro_press(["A"], source)  # YES
+
+    def on_water() -> bool:
+        return _mem(player_surfing) and _player_can_walk()
+
+    def needs_a() -> bool:
+        snap = _field_snapshot()
+        return snap is not None and (snap.waiting_for_button or dialogue_status(snap) == DIALOGUE_CHOICE)
+
+    # "<MON> used SURF!" waits for A (waitbuttonpress), then the field effect plays. A is
+    # pressed only once the box waits for it, or at a box still read as a CHOICE: seen in
+    # test runs, right after YES the closing YES/NO still showed (a plain-text-only read
+    # pressed nothing and the walk never started), and A presses while the line printed
+    # used up the presses allowed before the box was closed.
+    said: List[str] = []
+    for _ in range(SURF_PRESSES):
+        await _await_game(lambda: on_water() or needs_a(), MACRO_TEXT_FRAMES)
+        if on_water():
+            break
+        text = _mem(read_field_text)
+        if text and text not in said:
+            said.append(text)
+        if needs_a():
+            await _macro_press(["A"], source)
+    if not await _await_game(on_water, SURF_EFFECT_FRAMES):
+        logger.warning(f"{source}: answered YES to Surf at {tuple(tile)} but the player is not on the water")
+        return None
+    used = [t for t in said if "SURF" in t.upper() and "?" not in t]
+    return used[-1] if used else "used SURF"
+
+
+async def _await_landing(was_surfing: bool) -> Optional[Tuple[int, int]]:
+    """After a walk that started on the water: when Surf ended on it (a step onto the
+    shore, pret CanStopSurfing), wait out the landing jump, during which the field
+    controls are locked (CreateStopSurfingTask), and return the tile landed on; else None.
+
+    The locked controls end the walk's check as an interruption, so the rest of its
+    presses are skipped: the caller walks on from the shore.
+    """
+    from server.field_control import player_surfing
+
+    if not was_surfing or _mem(player_surfing):
+        return None
+    if not await _await_game(_player_can_walk, MACRO_MENU_FRAMES):
+        return None
+    snap = _field_snapshot()
+    return (snap.x, snap.y) if snap is not None else None
+
+
 @app.post("/mcp/go_to_exit")
 async def mcp_go_to_exit(request: dict):
     """MCP Tool: walk to one of the current map's exits (EXITS list) and through it."""
@@ -4966,7 +5108,7 @@ async def mcp_go_to_exit(request: dict):
         return {"success": False, "error": "go_to_exit is only implemented for Emerald"}
     try:
         from server import game_tools
-        from server.field_control import end_of_path, warp_push_directions
+        from server.field_control import end_of_path, player_surfing, warp_push_directions
 
         exit_query = str(request.get("exit") or request.get("destination") or "").strip()
         if not exit_query:
@@ -4979,12 +5121,13 @@ async def mcp_go_to_exit(request: dict):
         # go_to_exit("west") planned through that tile, was blocked there, and the next
         # call planned the same path again. The planner knows only where people stood
         # when the map loaded, so a walk stopped by a person is replanned around the
-        # tile they are on now (up to two more tries).
+        # tile they are on now (up to two more tries). Surf adds two: the start at the
+        # shore and the landing on the far one each end a walk that is then planned again.
         avoid: List[Tuple[int, int]] = []
         cleared: List[str] = []
         first_from = None
         start = _field_snapshot()
-        for _attempt in range(5):
+        for _attempt in range(7):
             # Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the
             # door, then planned again from inside METEOR FALLS and answered "No exit of
             # METEOR FALLS 1F 1R matches 'METEOR FALLS 1F 1R'". A retry only makes sense
@@ -5004,6 +5147,7 @@ async def mcp_go_to_exit(request: dict):
                 return plan
 
             before = _field_snapshot()
+            was_surfing = _mem(player_surfing)
             if first_from is None:
                 first_from = _position_text(before)
             buttons = list(plan["buttons"])
@@ -5020,6 +5164,16 @@ async def mcp_go_to_exit(request: dict):
             used = await _clear_obstacle((report or {}).get("blocked_tile"), "go_to_exit")
             if used:
                 cleared.append(f"used {used} at {tuple(report['blocked_tile'])}")
+                continue
+            # Water on the way: Surf at the shore, plan again from the water; a landing
+            # ends the walk early (_await_landing), so plan again from the shore too.
+            surfed = await _start_surf((report or {}).get("blocked_tile"), "go_to_exit")
+            if surfed:
+                cleared.append(f"surfed from {(before.x, before.y)} ({surfed})")
+                continue
+            landed = await _await_landing(was_surfing)
+            if landed is not None and not _went_through(plan, before, _field_snapshot()):
+                cleared.append(f"landed at {landed}")
                 continue
             person = (report or {}).get("blocked_by_person")
             if not person or snap is None or _went_through(plan, before, snap) or tuple(person) in avoid:
@@ -5068,6 +5222,7 @@ async def mcp_go_to_exit(request: dict):
         now = _position_text(snap, location)
         response = {"exit": plan["label"], "from": from_text, "now": now, "path_length": len(plan["buttons"])}
         on_the_way = f" On the way: {'; '.join(cleared)}." if cleared else ""
+        response["on_the_way"] = list(cleared)  # go_to's summary repeats them (_walk_along)
         if _went_through(plan, before, snap):
             response["success"] = True
             response["summary"] = f"Arrived: now at {now} (took exit: {plan['label']}).{on_the_way}"
@@ -5086,7 +5241,7 @@ async def mcp_go_to_exit(request: dict):
         # A warp within the map is not "leaving" it: say what did not happen.
         what = "Did not go through" if plan.get("arrival_here") else "Did not leave the map"
         response["error"] = f"{what} ({plan['label']}): {reason}"
-        response["summary"] = f"{response['error']} Now at {now}."
+        response["summary"] = f"{response['error']} Now at {now}.{on_the_way}"
         return response
     except Exception as e:
         logger.error(f"Error in go_to_exit: {e}", exc_info=True)
@@ -5722,7 +5877,7 @@ def _usable_field_moves() -> set:
         reader = env.memory_reader
         known = {m for p in reader.read_party_pokemon() or [] if not p.is_egg for m in p.moves}
         return {
-            move for move, badge in game_tools.FIELD_MOVE_OBSTACLES.values()
+            move for move, badge in game_tools.FIELD_MOVE_BADGES.items()
             if move in known and reader._is_event_flag_set(game_tools.FLAG_BADGE01_GET + badge - 1)
         }
 
@@ -7477,14 +7632,16 @@ async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]
 
 
 async def _walk_along(
-    next_route, arrived, goal: str, source: str, again: str, max_maps: int = HEAL_TRIP_MAX_MAPS
+    next_route, arrived, goal: str, source: str, again: str, max_maps: int = HEAL_TRIP_MAX_MAPS,
+    on_the_way: Optional[List[str]] = None,
 ) -> Tuple[List[str], Optional[str]]:
     """Walk map to map until arrived() is true, one go_to_exit per map from
     next_route(location, position) (recomputed on every map, so a detour is
     corrected). Wild battles on the way are run from; a trainer battle or a YES/NO
     stops the walk; plain text from a scene that interrupts (Birch's on ROUTE 110) is
     read through. A route step named game_tools.RIDE_EXIT rides the Cable Car.
-    Returns (maps entered, why it stopped short or None).
+    Returns (maps entered, why it stopped short or None); on_the_way, when given,
+    collects what each go_to_exit did besides walking (Surf, Rock Smash), by map.
     """
     from server import game_tools
     from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
@@ -7534,7 +7691,8 @@ async def _walk_along(
         if route == []:
             return entered, None  # arrived by the map's own measure
         if not route:
-            return entered, f"{goal} can't be reached on foot from {location}"
+            how = "on foot or by Surf" if game_tools.can_surf() else "on foot"
+            return entered, f"{goal} can't be reached {how} from {location}"
         if len(entered) >= max_maps:
             return entered, f"{goal} is still {len(route)} maps away"
         if (location, route[0][0]) in crossed:
@@ -7546,6 +7704,8 @@ async def _walk_along(
             step = await _ride_cable_car(source, route[0][1])
         else:
             step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
+        if on_the_way is not None and step.get("on_the_way"):
+            on_the_way.append(f"on {location}: {'; '.join(step['on_the_way'])}")
         # A warp within the map (game_tools.tile_route) succeeds without a new map name.
         if _location_name() != location or step.get("success"):
             crossed.add((location, route[0][0]))
@@ -7687,6 +7847,7 @@ async def mcp_go_to(request: dict = None):
         here = _field_snapshot()
         return game_tools.arrived_at(_location_name(), (here.x, here.y) if here is not None else None, target)
 
+    on_the_way: List[str] = []
     with _turbo():
         entered, why = await _walk_along(
             lambda location, position: game_tools.place_route(location, position, target),
@@ -7695,8 +7856,11 @@ async def mcp_go_to(request: dict = None):
             source,
             f'go_to("{target}") again',
             GO_TO_MAX_MAPS,
+            on_the_way,
         )
     walked = f" Walked {' → '.join(entered)}." if entered else ""
+    if on_the_way:
+        walked += f" On the way: {'; '.join(on_the_way)}."
     if why:
         return _refusal(f"Did not reach {target}: {why}.{walked}")
     return {
@@ -9337,6 +9501,7 @@ async def mcp_navigate_to(request: dict):
 
     try:
         from server import game_tools
+        from server.field_control import player_surfing
 
         x = request.get("x")
         y = request.get("y")
@@ -9416,6 +9581,7 @@ async def mcp_navigate_to(request: dict):
                 check_movement=True,
             )
             before = _field_snapshot()
+            was_surfing = _mem(player_surfing)
             queued = await take_action(action_request)
             report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
             await _settle_after_sequence(before, report)
@@ -9427,6 +9593,21 @@ async def mcp_navigate_to(request: dict):
                 again = await mcp_navigate_to({**request, "_cleared": cleared_before + 1})
                 again["summary"] = f"Used {used} at {tuple(tile)} on the way. {again.get('summary', '')}".strip()
                 return told(again)
+            # Water on the way: Surf from the shore and walk on over it; landing on the far
+            # shore cuts the walk short (_await_landing), so walk on from there.
+            surf_steps = int(request.get("_surfed", 0))
+            if surf_steps < SURF_MAX_STEPS:
+                surfed = await _start_surf(tile, "navigate_to")
+                landed = None if surfed else await _await_landing(was_surfing)
+                ox, oy = result.get("coord_offset") or (0, 0)
+                if surfed or (landed is not None and (landed[0] - ox, landed[1] - oy) != (x, y)):
+                    note = (
+                        f"Surfed onto the water at {tuple(tile)} ({surfed})." if surfed
+                        else f"Landed from the water at {landed}."
+                    )
+                    again = await mcp_navigate_to({**request, "_surfed": surf_steps + 1})
+                    again["summary"] = f"{note} {again.get('summary') or again.get('error', '')}".strip()
+                    return told(again)
 
         response = {
             "success": True,
