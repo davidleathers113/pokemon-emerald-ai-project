@@ -12,7 +12,7 @@ import os
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from utils.json_utils import serialize_for_json
 from utils.mapping.pathfinding import Pathfinder
@@ -838,6 +838,39 @@ def active_triggers(env, map_dir: str) -> List[Tuple[int, int]]:
     return out
 
 
+def story_scenes(env, map_dir: str) -> List[Tuple[str, List[Tuple[int, int]]]]:
+    """[(scene name, its tiles), ...] for the map's story scenes that will play when
+    stepped on now (caller holds the emulator lock).
+
+    A story scene is a coord_events trigger on a saved var (not VAR_TEMP_*, which floor
+    switches and gates use, and not TRIGGER_RUN_IMMEDIATELY weather) whose var equals its
+    var_value now; an unreadable var is left out, so only scenes known to fire are named.
+
+    Seen live: on METEOR FALLS 1F 1R the objective was "Witness Team Magma/Aqua
+    confrontation", and the room looked empty: Magma and Aqua stay hidden (FLAG_HIDE_*)
+    until the scene at (14,18) runs (pret MeteorFalls_1F_1R_EventScript_
+    MagmaStealsMeteoriteScene, VAR_METEOR_FALLS_STATE == 0). The model walked back out.
+    """
+    scenes: Dict[str, List[Tuple[int, int]]] = {}
+    for event in _raw_map_json(map_dir).get("coord_events") or []:
+        name = str(event.get("var", ""))
+        var_id = _var_ids().get(name)
+        if event.get("type") != "trigger" or var_id is None or name.startswith("VAR_TEMP_") or env is None:
+            continue
+        try:
+            wanted = int(str(event.get("var_value", "0")), 0)
+            value = env.memory_reader.read_game_var(var_id)
+        except Exception as e:  # unreadable: not named
+            logger.debug(f"scene var {name} unreadable: {e}")
+            continue
+        if value != wanted:
+            continue
+        script = str(event.get("script", ""))
+        short = script.rpartition("EventScript_")[2] or script
+        scenes.setdefault(short, []).append((int(event.get("x", -1)), int(event.get("y", -1))))
+    return list(scenes.items())
+
+
 @lru_cache(maxsize=1)
 def _first_visit_flags() -> dict:
     """'DEWFORD TOWN' -> FLAG_VISITED_DEWFORD_TOWN's id, and the same for FLAG_LANDMARK_*.
@@ -1267,11 +1300,18 @@ _HALVES = {"NORTH": (1, -1), "SOUTH": (1, 1), "WEST": (0, -1), "EAST": (0, 1)}
 
 
 def _is_floor_or_variant(word: str) -> bool:
-    """'1F', 'B2F', 'ALT': parts of a map name that only say which floor or copy it is."""
+    """'1F', 'B2F', '1R', 'ALT': parts of a map name that only say which floor, room or
+    copy it is.
+
+    Seen live: on METEOR FALLS 1F 1R, inside the Route 114 door, "Head west through Route
+    114 to Meteor Falls" (meteor_falls_reached) never showed as done, and the model walked
+    back out twice. The decomp numbers the rooms of a floor 1R, 2R (Meteor Falls, Magma
+    Hideout).
+    """
     if word == "ALT":
         return True
     core = word[1:] if word.startswith("B") else word
-    return len(core) >= 2 and core.endswith("F") and core[:-1].isdigit()
+    return len(core) >= 2 and core[-1] in "FR" and core[:-1].isdigit()
 
 
 # Words the objective list uses for what the game's map names call something else.
@@ -1735,6 +1775,11 @@ _PLACE_ALIASES = {
     ("POKE", "CENTER"): ["POKEMON", "CENTER"],
     ("POKECENTER",): ["POKEMON", "CENTER"],
     ("POKEMONCENTER",): ["POKEMON", "CENTER"],
+    # Seen live: "Return to Route 112 Cable Car Station" (target "Route 112 Cable Car")
+    # never showed as done inside ROUTE 112 CABLE CAR STATION. The longer form first
+    # (aliases go longest first), so the map's own name isn't given STATION twice.
+    ("CABLE", "CAR", "STATION"): ["CABLE", "CAR", "STATION"],
+    ("CABLE", "CAR"): ["CABLE", "CAR", "STATION"],
 }
 
 

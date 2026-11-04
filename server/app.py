@@ -3462,6 +3462,41 @@ def _note_way_to_story_target(guidance: Dict[str, Any]) -> None:
         story["navigation_hint"] = f"{way} {story.get('navigation_hint') or ''}".strip()
 
 
+def _note_story_scenes(guidance: Dict[str, Any]) -> None:
+    """Put the story scenes waiting on this map (game_tools.story_scenes) at the front of
+    the story objective's hint, with the tile to walk to.
+
+    Seen live: "Witness Team Magma/Aqua confrontation in Meteor Falls" on METEOR FALLS 1F
+    1R, a room with nobody in it until the scene at (14,18) runs; the model walked back
+    out to ROUTE 114.
+    """
+    story = guidance.get("story")
+    if env is None or not isinstance(story, dict):
+        return
+    from server import game_tools
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    map_dir = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
+    if not map_dir:
+        return
+    with memory_lock:
+        scenes = game_tools.story_scenes(env, map_dir)
+    if not scenes:
+        return
+    snap = _field_snapshot()
+    lines = []
+    for name, tiles in scenes:
+        if snap is not None:
+            tiles = sorted(tiles, key=lambda t: abs(t[0] - snap.x) + abs(t[1] - snap.y))
+        where = ", ".join(f"({x},{y})" for x, y in tiles)
+        x, y = tiles[0]
+        lines.append(
+            f"A story scene ({name}) starts when you step on {where} on this map: "
+            f"navigate_to({x}, {y}), then read it through."
+        )
+    story["navigation_hint"] = f"{' '.join(lines)} {story.get('navigation_hint') or ''}".strip()
+
+
 def _team_weak_line(condition: Dict[str, Any], location: str, position: Optional[Tuple[int, int]]) -> str:
     """'TEAM IS WEAK (TORCHIC 15/35 HP): heal before any trainer — <where to heal>'."""
     from server import game_tools
@@ -4095,6 +4130,10 @@ async def mcp_get_game_state():
                         except Exception as e:
                             logger.warning(f"objective route hint failed: {e}")
                         try:
+                            _note_story_scenes(categorized_guidance)
+                        except Exception as e:
+                            logger.warning(f"story scene note failed: {e}")
+                        try:
                             _note_train_walks_itself(categorized_guidance)
                         except Exception as e:
                             logger.warning(f"train note failed: {e}")
@@ -4455,6 +4494,10 @@ def _refuse_repeat_of_blocked_press(buttons: List[str]) -> Optional[Dict[str, An
     return {"success": False, "error": message, "status": "REFUSED", "summary": message, "buttons_queued": []}
 
 
+# go_to_exit: a second look for a map change before a walk is called a failure.
+LATE_MAP_CHANGE_S = 1.0
+
+
 async def _await_map_change(old_map_id, timeout_s: float):
     """Wait for the map to change and the warp fade to finish; returns the last snapshot."""
     deadline = time.monotonic() + timeout_s
@@ -4559,7 +4602,17 @@ async def mcp_go_to_exit(request: dict):
         avoid: List[Tuple[int, int]] = []
         cleared: List[str] = []
         first_from = None
+        start = _field_snapshot()
         for _attempt in range(5):
+            # Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the
+            # door, then planned again from inside METEOR FALLS and answered "No exit of
+            # METEOR FALLS 1F 1R matches 'METEOR FALLS 1F 1R'". A retry only makes sense
+            # on the map the walk started from.
+            here = _field_snapshot()
+            if _attempt and start is not None and here is not None and here.map_id != start.map_id:
+                snap = here
+                break
+
             def _plan():
                 with memory_lock:
                     return game_tools.plan_exit_route(env, exit_query, avoid=tuple(avoid))
@@ -4613,6 +4666,10 @@ async def mcp_go_to_exit(request: dict):
                     if snap is not None and snap.map_id != before.map_id:
                         break
 
+        if snap is None or snap.map_id == before.map_id:
+            # The map can change after the wait above gave up (a slow fade); look again
+            # before calling the walk a failure.
+            snap = await _await_map_change(before.map_id, LATE_MAP_CHANGE_S)
         location = _location_name()
         now = _position_text(snap, location)
         response = {"exit": plan["label"], "from": from_text, "now": now, "path_length": len(plan["buttons"])}

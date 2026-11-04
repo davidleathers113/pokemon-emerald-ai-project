@@ -206,7 +206,8 @@ def test_go_to_from_south_route111_goes_round_the_desert():
     side joins both ROUTE 113 (top) and ROUTE 112, and "west" took the nearest, 112; and
     the desert between counted as walkable, though without Go-Goggles its sandstorm
     pushes the player back (pret Route111_EventScript_ViciousSandstormTrigger). The way
-    on foot is round by Fiery Path. test_route111_south_to_113.state is that live save."""
+    on foot is round by Fiery Path. test_route111_south_to_113.state is a live save from
+    that bounce, at ROUTE 112 (39,46), the far side of the 111/112 edge."""
     s = server()
     s.load(HERE / "test_route111_south_to_113.state", wild_encounters=False)
     r = s.call("mcp_go_to", {"place": "Route 113", "reasoning": "test"})

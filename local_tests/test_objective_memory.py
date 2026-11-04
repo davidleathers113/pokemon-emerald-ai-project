@@ -399,6 +399,68 @@ def test_navigate_objective_for_the_current_map_says_so():
     assert guidance["battling_group"][1]["completion_condition"] == "gym_puzzle_solved"
 
 
+METEOR_FALLS = Path(__file__).resolve().parent / "test_meteor_falls_before_scene.state"
+VAR_METEOR_FALLS_STATE = 0x40BF  # include/constants/vars.h
+
+
+def test_meteor_falls_rooms_count_as_meteor_falls():
+    """Seen live: on METEOR FALLS 1F 1R (27,18), inside the Route 114 door, chimney_084
+    (meteor_falls_reached) never showed as done and the model walked back out twice;
+    go_to("Meteor Falls") said it "can't be reached on foot from METEOR FALLS 1F 1R". The
+    decomp's room suffix (1R, 2R) wasn't read as part of a floor."""
+    s = server()
+    s.load(METEOR_FALLS, wild_encounters=False)
+    assert s.srv._location_name() == "METEOR FALLS 1F 1R", s.srv._location_name()
+    guidance = {"story": {"id": "chimney_084", "action_type": "navigate", "target_location": "Meteor Falls",
+                          "completion_condition": "meteor_falls_reached"}}
+    s.srv._note_conditions_met_in_memory(guidance)
+    told = guidance["story"]["completion_condition"]
+    print("   ", told)
+    assert told.startswith("meteor_falls_reached: ALREADY TRUE (you are on METEOR FALLS 1F 1R"), told
+    r = s.call("mcp_go_to", {"place": "Meteor Falls", "reasoning": "test"})
+    assert r["success"] is True and r["status"] == "ARRIVED", r
+
+
+def test_a_story_scene_waiting_on_this_map_is_named_with_its_tile():
+    """Seen live: "Witness Team Magma/Aqua confrontation in Meteor Falls" in a room that
+    looks empty: Magma and Aqua stay hidden until the scene at (14,18) runs (pret
+    MagmaStealsMeteoriteScene, a trigger on VAR_METEOR_FALLS_STATE == 0). Once the var has
+    moved on the scene is spent and not named."""
+    s = server()
+    s.load(METEOR_FALLS, wild_encounters=False)
+    reader = s.srv.env.memory_reader
+    with s.srv.memory_lock:
+        assert reader.read_game_var(VAR_METEOR_FALLS_STATE) == 0
+    guidance = {"story": {"id": "chimney_085", "action_type": "dialogue", "target_location": "Meteor Falls",
+                          "navigation_hint": "Inside cave, Team Magma threatens Prof. Cozmo."}}
+    s.srv._note_story_scenes(guidance)
+    hint = guidance["story"]["navigation_hint"]
+    print("   ", hint)
+    assert hint.startswith("A story scene (MagmaStealsMeteoriteScene) starts when you step on (14,18)"), hint
+    assert "navigate_to(14, 18)" in hint and hint.endswith("Inside cave, Team Magma threatens Prof. Cozmo."), hint
+    # The call the hint names plays the scene (find_path walks onto a trigger that is the goal).
+    s.call("mcp_navigate_to", {"x": 14, "y": 18, "variance": "none", "reason": "test"})
+    deadline = time.time() + 180  # the scene reads through in ~90 s (8 auto-advance calls)
+    while time.time() < deadline:
+        with s.srv.memory_lock:
+            if reader.read_game_var(VAR_METEOR_FALLS_STATE) != 0:
+                break
+        s.call("mcp_auto_advance_dialogue", {})
+    with s.srv.memory_lock:
+        state = reader.read_game_var(VAR_METEOR_FALLS_STATE)
+    print("    VAR_METEOR_FALLS_STATE after the walk:", state)
+    assert state != 0, state
+    spent = {"story": {"id": "chimney_085", "navigation_hint": "x"}}
+    s.srv._note_story_scenes(spent)
+    assert spent["story"]["navigation_hint"] == "x", spent
+    # Seen live 13:50-13:52 UTC: left at (13,18) by the scene, every walk to the ROUTE 114
+    # door said "no walkable path": the bridge (19-21,18), elevation 15 between elevation
+    # 4 floor, counted as a wall (BRIDGE_ELEVATION). RIGHT x10 by hand crossed it.
+    r = s.call("mcp_go_to_exit", {"exit": "ROUTE 114", "reasoning": "test"})
+    print("    back out:", r.get("summary") or r.get("error"))
+    assert s.srv._location_name() == "ROUTE 114", (s.srv._location_name(), r)
+
+
 def test_game_vars_read_from_saveblock1():
     """SaveBlock1.vars sits at +0x139C (pret include/global.h). Each fixture's vars agree
     with its story: Torchic was the starter, the POKéDEX moves Birch's lab from 3 to 5,

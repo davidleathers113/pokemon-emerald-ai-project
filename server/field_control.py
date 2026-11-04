@@ -423,6 +423,12 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
     wanted = normalize_name(query)
     if not wanted:
         return []
+    # An EXITS line copied whole ("door/warp at (6, 12) -> ROUTE 112", "west edge ->
+    # ROUTE 113"). Seen live in ROUTE 112 CABLE CAR STATION: that exact line answered "No
+    # exit … matches", and the model sent it again and again.
+    labelled = [e for e in exits if normalize_name(e.get("label", "")) == wanted]
+    if labelled:
+        return labelled
     text = query.strip()
     open_at = text.rfind("(")
     if open_at > 0 and text.endswith(")"):

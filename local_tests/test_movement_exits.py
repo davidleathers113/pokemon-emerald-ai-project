@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_movement_feedback import HOUSE, ROUTE101, server
 
 
-BATTLE = Path(__file__).resolve().parent / "test_battle_wurmple.state"  # Petalburg Woods, move menu vs Lyle's Wurmple
+HERE = Path(__file__).resolve().parent
+BATTLE = HERE / "test_battle_wurmple.state"  # Petalburg Woods, move menu vs Lyle's Wurmple
 
 
 def _location(s):
@@ -51,6 +52,37 @@ def test_go_to_exit_north_edge_from_route101_reaches_oldale():
     assert r["success"] is True, r
     assert _location(s) == "OLDALE TOWN", _location(s)
     assert "OLDALE TOWN" in r["summary"], r
+
+
+def test_go_to_exit_that_arrives_late_is_not_a_failure():
+    """Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the door,
+    then answered "No exit of METEOR FALLS 1F 1R matches 'METEOR FALLS 1F 1R'": the map
+    change had not shown by the time the walk was judged, so it planned again from the
+    new map. Here the first wait for the map change is made to report the old map (a slow
+    fade); the walk still counts as arrived."""
+    import asyncio
+    import dataclasses
+
+    s = server()
+    s.load(ROUTE101, wild_encounters=False)
+    real = s.srv._await_map_change
+    calls = []
+
+    async def slow_fade(old_map_id, timeout_s):
+        calls.append(timeout_s)
+        snap = await real(old_map_id, timeout_s)
+        if len(calls) == 1 and snap is not None:
+            return dataclasses.replace(snap, map_id=old_map_id)
+        return snap
+
+    s.srv._await_map_change = slow_fade
+    try:
+        r = asyncio.run(s.srv.mcp_go_to_exit({"exit": "north", "reasoning": "test"}))
+    finally:
+        s.srv._await_map_change = real
+    print("   ", r.get("summary"))
+    assert _location(s) == "OLDALE TOWN", _location(s)
+    assert r["success"] is True and "Arrived" in r["summary"], r
 
 
 def test_go_to_exit_by_destination_name():
@@ -103,6 +135,31 @@ def test_go_to_exit_up_the_stairs():
     print("   ", r)
     assert r["success"] is True, r
     assert _location(s) == "LITTLEROOT TOWN BRENDANS HOUSE 2F", _location(s)
+
+
+def test_every_exits_line_names_its_own_exit():
+    """Seen live in ROUTE 112 CABLE CAR STATION: go_to_exit("door/warp at (6, 12) -> ROUTE
+    112"), the EXITS line copied whole, answered "No exit … matches" (two doors lead to
+    ROUTE 112). Every line the list prints names exactly its own exit: METEOR FALLS 1F 1R
+    has two warps to B1F 1R; ROUTE 112 (test_route111_south_to_113.state is saved at
+    (39,46) there) two doors into the CABLE CAR STATION."""
+    from server import game_tools
+    from server.field_control import match_exits
+
+    s = server()
+    for state in ("test_meteor_falls_before_scene.state", "test_route111_south_to_113.state"):
+        s.load(HERE / state, wild_encounters=False)
+        with s.srv.memory_lock:
+            _, offset, source = game_tools.load_pathfinding_state(s.srv.env)
+        exits = game_tools.list_map_exits(source["json_map"], source.get("porymap_map_name"), offset)
+        print("   ", _location(s), [e["label"] for e in exits])
+        assert len(exits) > 2, exits
+        for e in exits:
+            assert match_exits(exits, e["label"]) == [e], e["label"]
+    # Two warps lead to FIERY PATH from here; the copied line walks to the one it names.
+    r = s.call("mcp_go_to_exit", {"exit": "door/warp at (11, 36) -> FIERY PATH", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert _location(s) == "FIERY PATH" and "(11, 36)" in r["summary"], (_location(s), r)
 
 
 def test_go_to_exit_unknown_name_lists_the_exits():
@@ -472,6 +529,16 @@ def test_loose_target_names_match_their_map():
     assert arrived_at("RUSTURF TUNNEL ALT", None, "Rusturf Tunnel")
     assert arrived_at("DEWFORD TOWN GYM", None, "Dewford Gym")
     assert arrived_at("GRANITE CAVE 1F", None, "Granite Cave")
+    # Seen live: on METEOR FALLS 1F 1R, meteor_falls_reached never showed as done.
+    assert arrived_at("METEOR FALLS 1F 1R", None, "Meteor Falls")
+    assert arrived_at("METEOR FALLS B1F 2R", None, "Meteor Falls")
+    assert arrived_at("MAGMA HIDEOUT 3F 2R", None, "Magma Hideout")
+    assert not arrived_at("ROUTE 114", None, "Meteor Falls")
+    # Seen live: "Return to Route 112 Cable Car Station" (target "Route 112 Cable Car").
+    assert arrived_at("ROUTE 112 CABLE CAR STATION", None, "Route 112 Cable Car")
+    assert arrived_at("ROUTE 112 CABLE CAR STATION", None, "Route 112 Cable Car Station")
+    assert not arrived_at("ROUTE 112", None, "Route 112 Cable Car")
+    assert not arrived_at("MT CHIMNEY CABLE CAR STATION", None, "Route 112 Cable Car")
     assert not arrived_at("RUSTBORO CITY GYM", None, "Rustboro City")
     assert not arrived_at("ROUTE 104 MR BRINEYS HOUSE", None, "Route 104")
     # Seen live: "Visit Devon Corporation" never counted inside DEVON CORP 3F.

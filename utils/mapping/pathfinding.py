@@ -39,6 +39,12 @@ GRASS_TILE_COST_MULTIPLIER = 8.0
 # A rock or tree the party can clear (ROCK SMASH, CUT): walkable for the planner, but each
 # costs a stop, a question and an animation, so open ground is preferred when there is any.
 CLEARABLE_TILE_COST = 10.0
+# Map elevation 15 (bridges): pret IsElevationMismatchAt never reports a mismatch on it,
+# and ObjectEventUpdateElevation keeps the walker's elevation while stepping on or off
+# it, so a bridge joins the floor it was entered from to the same floor beyond. Seen
+# live: METEOR FALLS 1F 1R's bridge (19-21,18) between elevation-4 floor counted as a
+# wall; the player could neither reach the scene at (14,18) nor walk back to the door.
+BRIDGE_ELEVATION = 15
 
 
 @dataclass
@@ -51,6 +57,7 @@ class Node:
     h_cost: float = 0  # Heuristic cost to goal
     f_cost: float = 0  # Total cost (g + h)
     parent: Optional["Node"] = None
+    carried: Optional[int] = None  # the walker's elevation (kept across BRIDGE_ELEVATION tiles)
 
     def __post_init__(self):
         self.f_cost = self.g_cost + self.h_cost
@@ -875,7 +882,13 @@ class Pathfinder:
 
         return warps
 
-    def _can_move_to(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int], map_data: Dict) -> bool:
+    def _can_move_to(
+        self,
+        from_pos: Tuple[int, int],
+        to_pos: Tuple[int, int],
+        map_data: Dict,
+        carried_elevation: Optional[int] = None,
+    ) -> bool:
         """
         Check if movement from from_pos to to_pos is valid.
 
@@ -888,6 +901,8 @@ class Pathfinder:
             from_pos: Source position (x, y)
             to_pos: Destination position (x, y)
             map_data: Map data dictionary with grid and optionally raw_tiles
+            carried_elevation: the walker's elevation when from_pos is a BRIDGE_ELEVATION
+                tile (it keeps the one it had before stepping on); None if unknown
 
         Returns:
             True if movement is valid, False otherwise
@@ -942,6 +957,13 @@ class Pathfinder:
                 if from_tile and to_tile and len(from_tile) >= 4 and len(to_tile) >= 4:
                     from_elevation = from_tile[3] if len(from_tile) > 3 else 0
                     to_elevation = to_tile[3] if len(to_tile) > 3 else 0
+                    if from_symbol != "&" and dest_symbol != "&":
+                        if to_elevation == BRIDGE_ELEVATION:
+                            to_elevation = from_elevation  # never a mismatch
+                        elif from_elevation == BRIDGE_ELEVATION:
+                            # Stepping off: the walker's own elevation decides.
+                            known = carried_elevation not in (None, BRIDGE_ELEVATION)
+                            from_elevation = carried_elevation if known else to_elevation
 
                     # Calculate elevation difference
                     elev_diff = abs(from_elevation - to_elevation)
@@ -1231,14 +1253,32 @@ class Pathfinder:
             - List of (x, y) positions from start to goal if path found
             - Tuple of (None, best_node) if no complete path found (for partial paths)
         """
-        start_node = Node(start[0], start[1], 0, self._heuristic(start, goal))
+        raw_tiles = map_data.get("raw_tiles") or []
+
+        def elevation(pos):
+            x, y = pos
+            tile = raw_tiles[y][x] if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]) else None
+            return tile[3] if tile and len(tile) > 3 else None
+
+        def carried_after(carried, pos):
+            """The walker's elevation on pos: a bridge keeps the one it came with."""
+            here = elevation(pos)
+            return carried if here == BRIDGE_ELEVATION else here
+
+        def key(pos, carried):
+            # On a bridge, the same tile walked on from different floors leads on
+            # differently, so it is a different search state.
+            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None)
+
+        start_carried = carried_after(None, start)
+        start_node = Node(start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried)
         goal_node = Node(goal[0], goal[1])
         clearable = {tuple(t) for t in map_data.get("clearable") or []}
 
         open_list = []
         heapq.heappush(open_list, start_node)
         closed_set = set()
-        node_map = {start: start_node}
+        node_map = {key(start, start_carried): start_node}
 
         # Track the best node (closest to goal) in case we can't reach it
         best_node = start_node
@@ -1257,7 +1297,7 @@ class Pathfinder:
             if current.g_cost > max_distance * max(1.0, self.grass_cost):
                 continue
 
-            closed_set.add((current.x, current.y))
+            closed_set.add(key((current.x, current.y), current.carried))
 
             # Update best node if this one is closer to goal
             if current.h_cost < best_node.h_cost:
@@ -1270,11 +1310,12 @@ class Pathfinder:
             # This helps find optimal paths faster
             neighbors_with_cost = []
             for neighbor_pos in neighbors:
-                if neighbor_pos in closed_set:
+                carried = carried_after(current.carried, neighbor_pos)
+                if key(neighbor_pos, carried) in closed_set:
                     continue
 
                 # Check if this move is valid (handles ledge directions)
-                if not self._can_move_to((current.x, current.y), neighbor_pos, map_data):
+                if not self._can_move_to((current.x, current.y), neighbor_pos, map_data, current.carried):
                     continue
 
                 # Calculate movement cost - add penalty for grass tiles to avoid wild encounters
@@ -1295,20 +1336,21 @@ class Pathfinder:
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)
-                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost))
+                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost, carried))
 
             # Sort by h_cost (distance to goal) so we explore promising directions first
             # This helps find optimal paths when multiple neighbors have same f_cost
             neighbors_with_cost.sort(key=lambda x: x[2])  # Sort by h_cost
 
-            for neighbor_pos, g_cost, h_cost in neighbors_with_cost:
-                if neighbor_pos not in node_map:
-                    neighbor = Node(neighbor_pos[0], neighbor_pos[1], g_cost, h_cost)
+            for neighbor_pos, g_cost, h_cost, carried in neighbors_with_cost:
+                state = key(neighbor_pos, carried)
+                if state not in node_map:
+                    neighbor = Node(neighbor_pos[0], neighbor_pos[1], g_cost, h_cost, carried=carried)
                     neighbor.parent = current
-                    node_map[neighbor_pos] = neighbor
+                    node_map[state] = neighbor
                     heapq.heappush(open_list, neighbor)
                 else:
-                    neighbor = node_map[neighbor_pos]
+                    neighbor = node_map[state]
                     if g_cost < neighbor.g_cost:
                         neighbor.g_cost = g_cost
                         neighbor.f_cost = g_cost + neighbor.h_cost

@@ -1398,6 +1398,23 @@ prompt. That came to 1.1 tiles walked per minute.
   → ROUTE 112 → ROUTE 111 north and is stopped by trainer WILTON's battle; the old code
   reproduces the live fifteen-map bounce. A forced looping plan stops after one round.
 
+## Meteor Falls: rooms, scenes, bridges and copied exit lines (2026-11-04, WEAKNESSES R26-R29)
+- Seen live 13:40-14:01 UTC: the AI walked in and out of METEOR FALLS 1F 1R without
+  completing "reach Meteor Falls"; never found the Magma/Aqua scene at (14,18); after it
+  was boxed in at (13,18); and in ROUTE 112 CABLE CAR STATION go_to_exit with the EXITS
+  line copied whole failed again and again.
+- R26 `_is_floor_or_variant` reads the room suffix (1R, 2R); CABLE CAR names the station.
+- R27 `story_scenes` / `_note_story_scenes`: scenes waiting on this map (a trigger on a
+  saved var that equals its value now) lead the story objective's hint with their tile.
+- R28 `BRIDGE_ELEVATION`: elevation-15 tiles join the floor they are entered from to the
+  same floor beyond; A* carries the walker's elevation across them.
+- R29 `match_exits` takes an EXITS line verbatim; go_to_exit stops retrying once off the
+  starting map and looks twice for a late map change.
+- *Verified:* on the live save test_meteor_falls_before_scene.state the objective reads
+  ALREADY TRUE; the hint's navigate_to(14, 18) plays the scene (VAR_METEOR_FALLS_STATE
+  0 → 1, ~90 s of text) and go_to_exit("ROUTE 114") walks back over the bridge; with the
+  old pathfinder the walk stopped at (22,18). Each new test fails on the old code.
+
 ## Tools and tests (local-only)
 - `local_tools/checkpoint_from_sav.py`: turn any `.sav` into a verified checkpoint.
 - `local_tools/story_progress.py`: read story flags and variables from a checkpoint.
