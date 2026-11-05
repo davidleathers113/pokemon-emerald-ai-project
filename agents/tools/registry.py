@@ -804,23 +804,25 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         },
     },
     # David (2026-11-04), "Potions + Jagged Pass": heal from the bag where a Pokémon
-    # Center is a long walk away.
+    # Center is a long walk away. Seen live in MAGMA HIDEOUT: use_item("ESCAPE ROPE")
+    # needed a Pokémon, so field items that take none are allowed without one.
     {
         "name": "use_item",
         "scaffolds": GUIDE_SCAFFOLDS,
         "description": (
-            "Outside battle: use a medicine from the bag (Potion, Super Potion, Antidote, "
-            "Revive...) on a party Pokemon, in one call. Leave item empty to use the "
-            "cheapest one that heals it."
+            "Outside battle: use an item from the bag, in one call. Medicine (Potion, Super "
+            "Potion, Antidote, Revive...) goes on a party Pokemon: leave item empty to use the "
+            "cheapest one that heals it. ESCAPE ROPE (caves and dungeons only) and REPEL / "
+            "SUPER REPEL / MAX REPEL take no Pokemon."
         ),
         "parameters": {
             "type_": "OBJECT",
             "properties": {
-                "item": {"type_": "STRING", "description": "Optional: the item's name, e.g. 'SUPER POTION'."},
-                "pokemon": {"type_": "STRING", "description": "Party Pokemon name or slot 1-6, e.g. 'AZUMARILL'."},
-                "reasoning": {"type_": "STRING", "description": "One short sentence: why heal it."},
+                "item": {"type_": "STRING", "description": "The item's name, e.g. 'SUPER POTION' or 'ESCAPE ROPE'. Optional for medicine."},
+                "pokemon": {"type_": "STRING", "description": "For medicine: party Pokemon name or slot 1-6, e.g. 'AZUMARILL'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why use it."},
             },
-            "required": ["pokemon", "reasoning"],
+            "required": ["reasoning"],
         },
     },
     # David (2026-11-04): swap party members at a Pokémon Center PC (live: deposit

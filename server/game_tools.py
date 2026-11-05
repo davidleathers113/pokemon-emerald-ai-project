@@ -335,6 +335,27 @@ def load_pathfinding_state(env) -> tuple:
                                 ]
                         except Exception as e:  # the map-file tiles stay blocked, as before
                             logger.debug(f"moved people unavailable: {e}")
+                        # Strength boulders where they stand now, apart from the people:
+                        # walls, or pushed by the walk when the party can use STRENGTH
+                        # (pathfinding _push_target; the walk pushes, server _push_boulder).
+                        try:
+                            from server.field_control import loaded_boulders
+
+                            here = boulder_tiles(porymap_map_name, loaded_boulders(env.memory_reader))
+                        except Exception as e:  # unreadable: the map-file tiles
+                            logger.debug(f"live boulders unavailable: {e}")
+                            here = boulder_tiles(porymap_map_name, {})
+                        ox, oy = coord_offset or (0, 0)
+                        boulders = [(bx - ox, by - oy) for bx, by in sorted(here)]
+                        porymap = state["map"]["porymap"]
+                        porymap["boulders"] = boulders
+                        porymap["strength"] = can_push_boulders()
+                        porymap["objects"] = [o for o in porymap["objects"] if o.get("graphics_id") != PUSHABLE_BOULDER]
+                        if porymap.get("runtime_objects"):
+                            porymap["runtime_objects"] = [
+                                o for o in porymap["runtime_objects"]
+                                if (o.get("current_x"), o.get("current_y")) not in here  # live tiles, as listed
+                            ]
                         state["map"]["porymap"]["dimensions"] = json_map.get("dimensions", {})
                         state["map"]["porymap"]["warps"] = json_map.get("warps", [])
                         # The tiles that really warp (map.json warp_events): the builder
@@ -471,6 +492,41 @@ def rotating_gate_blocks(reader, porymap_map_name: str, button: str, tile) -> bo
     return orientations is not None and puzzle.step(orientations, button, tuple(tile)) is None
 
 
+def planned_end(start: Tuple[int, int], buttons: List[str], pushes: List[dict]) -> Tuple[int, int]:
+    """Where a planned walk ends: a boulder push's press leaves the player where they are."""
+    from server.field_control import end_of_path
+
+    skip = {p["index"] for p in pushes}
+    return end_of_path(start, [b for i, b in enumerate(buttons) if i not in skip])
+
+
+def push_plan(start: Tuple[int, int], buttons: List[str], pushes: List[dict]) -> dict:
+    """For a plan with boulder pushes (pathfinder.last_pushes): "buttons" cut short at the
+    first push, "push" (the boulder's tile, where it goes, the press and the tile the
+    player pushes from) and "pushes" (how many the whole plan makes); {} without pushes.
+
+    The walk stops before the push and the server pushes (server _push_boulder): the push
+    locks the field controls for its animation, which a walk's movement check reports as an
+    interruption, and the press moves no one. The server plans again after each push from
+    where the boulders really are."""
+    from server.field_control import end_of_path
+
+    if not pushes:
+        return {}
+    first = pushes[0]
+    walk = list(buttons[: first["index"]])
+    return {
+        "buttons": walk,
+        "push": {
+            "boulder": tuple(first["boulder"]),
+            "to": tuple(first["to"]),
+            "button": first["button"],
+            "stand": end_of_path(start, walk),
+        },
+        "pushes": len(pushes),
+    }
+
+
 def navigate_to_direct(
     env,
     x,
@@ -556,6 +612,7 @@ def navigate_to_direct(
         buttons = pathfinder.find_path(
             start, goal, state, variance=variance_level, consider_npcs=consider_npcs, blocked_coords=blocked_coords
         )
+        pushes = list(pathfinder.last_pushes)
 
         if not buttons and goal_was_blocked and start != goal:
             grid = map_data["grid"]
@@ -612,10 +669,8 @@ def navigate_to_direct(
 
         logger.info(f"🗺️ {nav_reason_text} - Buttons calculated: {len(buttons)}")
 
-        from server.field_control import end_of_path
-
         # Same coordinate frame as the requested target (map-local on override maps).
-        local_end = end_of_path(start, buttons)
+        local_end = planned_end(start, buttons, pushes)
         path_end = local_end
 
         result = {
@@ -628,6 +683,7 @@ def navigate_to_direct(
             "reason": nav_reason,
             "variance": variance_level or "none",
         }
+        result.update(push_plan(start, buttons, pushes))
         if map_data.get("rotating_gates") is not None:
             # The gates as the plan leaves them: the walk checks the game agrees.
             result["gates_after"] = list(pathfinder.last_gate_orientations or ())
@@ -646,6 +702,11 @@ def navigate_to_direct(
                     f"No complete path to ({x}, {y}); walking to ({path_end[0]}, {path_end[1]}), "
                     "the closest point the pathfinder could reach"
                 )
+                if map_data.get("boulders") and not map_data.get("strength"):
+                    result["note"] += (
+                        "; boulders ('R') may be in the way, and pushing them needs a party Pokémon that "
+                        "knows STRENGTH and the Heat Badge"
+                    )
 
         return result
     except Exception as e:
@@ -1066,8 +1127,9 @@ def first_visit_flag(target: str) -> Optional[int]:
 
 # Obstacles the party can clear on the walk: graphics -> (field move, badge number that
 # allows it outside battle). pret: Cut needs the Stone Badge (FLAG_BADGE01_GET), Rock
-# Smash the Dynamo Badge (FLAG_BADGE03_GET). Strength boulders are left out: pushing one
-# needs room behind it, which a route can't promise.
+# Smash the Dynamo Badge (FLAG_BADGE03_GET). Strength boulders are not cleared but pushed,
+# and a push needs room behind the boulder, so they are planned tile by tile
+# (pathfinding _push_target, boulder_tiles below), not here.
 FLAG_BADGE01_GET = 0x867  # include/constants/flags.h SYSTEM_FLAGS + 0x7
 FIELD_MOVE_OBSTACLES = {
     "OBJ_EVENT_GFX_CUTTABLE_TREE": ("CUT", 1),
@@ -1084,8 +1146,17 @@ SURF = "SURF"
 # badge 3, which is wrong for Emerald). The party menu only lists it for a Pokémon that
 # knows the move (SetPartyMonFieldSelectionActions), and never for an egg.
 FLY = "FLY"
+# Strength (outside battle) needs the Heat Badge: pret data/scripts/field_move_scripts.inc
+# EventScript_StrengthBoulder, goto_if_unset FLAG_BADGE04_GET, then checkpartymove
+# MOVE_STRENGTH; YES to "Would you like to use STRENGTH?" sets FLAG_SYS_USE_STRENGTH, and
+# from then on a step into a boulder pushes it (src/field_player_avatar.c TryPushBoulder)
+# until the next map load clears the flag (src/event_data.c ClearTempFieldEventData).
+STRENGTH = "STRENGTH"
+PUSHABLE_BOULDER = "OBJ_EVENT_GFX_PUSHABLE_BOULDER"
 # Every field move the walks use, by the badge number that allows it outside battle.
-FIELD_MOVE_BADGES = {**{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5, FLY: 6}
+FIELD_MOVE_BADGES = {
+    **{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5, FLY: 6, STRENGTH: 4,
+}
 # () -> set of field moves usable now (known by a party Pokémon, badge set), installed by
 # the server. None: no obstacle is clearable and no water crossable.
 field_moves_reader = None
@@ -1131,6 +1202,50 @@ def can_surf() -> bool:
     """A party Pokémon (not an egg) knows SURF and the Balance Badge is set: the game
     offers "Would you like to SURF?" facing water from the shore."""
     return SURF in _usable_field_moves()
+
+
+def can_push_boulders() -> bool:
+    """A party Pokémon (not an egg) knows STRENGTH and the Heat Badge is set: A at a
+    boulder offers "Would you like to use STRENGTH?" and the walks push boulders."""
+    return STRENGTH in _usable_field_moves()
+
+
+# () -> (map dir the player is on, {local id: tile} of its boulders loaded now
+# (field_control.loaded_boulders)), installed by the server. None: every boulder stands on
+# its map-file tile.
+boulders_reader = None
+
+
+def boulder_spawns(map_dir: str) -> dict:
+    """{local id: map-file tile} of the map's Strength boulders. pret gives each object
+    event the local id of its place in map.json's object_events, counting from 1."""
+    return {
+        i + 1: (int(obj.get("x", -1)), int(obj.get("y", -1)))
+        for i, obj in enumerate(_raw_map_json(map_dir).get("object_events") or [])
+        if obj.get("graphics_id") == PUSHABLE_BOULDER
+    }
+
+
+def boulder_places(map_dir: str, loaded: Optional[dict] = None) -> dict:
+    """{map-file tile: tile it stands on now} for the map's boulders: a loaded boulder's
+    live tile, any other's map-file tile (field_control.loaded_boulders says why). loaded:
+    {local id: tile} for the map the player is on; None asks boulders_reader, which
+    answers only for that map."""
+    spawns = boulder_spawns(map_dir)
+    if not spawns:
+        return {}
+    if loaded is None and boulders_reader is not None:
+        try:
+            here, live = boulders_reader()
+            loaded = live if here == map_dir else None
+        except Exception as e:  # unreadable: the map-file tiles, as after a map load
+            logger.debug(f"boulders unreadable: {e}")
+    return {tile: (loaded or {}).get(local_id, tile) for local_id, tile in spawns.items()}
+
+
+def boulder_tiles(map_dir: str, loaded: Optional[dict] = None) -> frozenset:
+    """The tiles the map's boulders stand on now (boulder_places)."""
+    return frozenset(boulder_places(map_dir, loaded).values())
 
 
 def surf_start_tile(map_dir: str, tile) -> bool:
@@ -1262,11 +1377,19 @@ def _shut_gates(map_dir: str) -> set:
 def _obstacle_tiles(map_dir: str) -> frozenset:
     """Tiles holding an obstacle object that is still there (its hide flag not set), less
     the ones the party can clear now (clearable_obstacles: routes go through those), and
-    the turn_back_gates the bag does not open."""
+    the turn_back_gates the bag does not open.
+
+    Strength boulders block where they stand now (boulder_tiles), and not at all when the
+    party can push them: which pushes open a way is the tile planner's search
+    (pathfinding _push_target), too fine for these areas. Seen live in MAGMA HIDEOUT 1F:
+    heal_at_pokecenter found no way out ("no nurse is on this map"). The boulders counted
+    as walls on their map-file tiles, pushed aside or not, with STRENGTH in the party."""
     blocked = _shut_gates(map_dir)
     usable = _usable_field_moves()
+    if STRENGTH not in usable:
+        blocked |= boulder_tiles(map_dir)
     for obj in _raw_map_json(map_dir).get("object_events") or []:
-        if obj.get("graphics_id") not in _OBSTACLE_GRAPHICS:
+        if obj.get("graphics_id") not in _OBSTACLE_GRAPHICS or obj.get("graphics_id") == PUSHABLE_BOULDER:
             continue
         if FIELD_MOVE_OBSTACLES.get(obj.get("graphics_id"), (None, 0))[0] in usable:
             continue
@@ -2439,6 +2562,13 @@ def map_allows_fly(map_dir: str) -> bool:
     return _raw_map_json(map_dir).get("map_type") in FLY_MAP_TYPES
 
 
+def map_allows_escaping(map_dir: str) -> bool:
+    """The map header's allowEscaping (map.json allow_escaping): pret src/item_use.c
+    CanUseDigOrEscapeRopeOnCurMap lets an Escape Rope (or Dig) work only there, in caves
+    and dungeons."""
+    return bool(_raw_map_json(map_dir).get("allow_escaping"))
+
+
 def fly_plan(
     location_name: str, position: Optional[Tuple[int, int]], target: str, destinations: List[FlyDestination]
 ) -> Optional[Tuple[FlyDestination, List[Tuple[str, str]]]]:
@@ -2506,7 +2636,6 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
         DIRECTION_DELTAS,
         EDGE_BUTTON,
         edge_candidates,
-        end_of_path,
         match_exits,
     )
 
@@ -2535,6 +2664,8 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
 
     blocked = [(int(x) - ox, int(y) - oy) for x, y in avoid] or None
     surf = bool(state.get("map", {}).get("porymap", {}).get("surf"))
+    # The boulder pushes of each route found (push_plan), by its end tile.
+    pushes_to: dict = {}
 
     def route_to(tile):
         if tile == start:
@@ -2542,7 +2673,9 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
         buttons = pathfinder.find_path(
             start, tile, state, consider_npcs=True, allow_partial=False, blocked_coords=blocked
         )
-        if buttons and end_of_path(start, buttons) == tile:
+        pushes = list(pathfinder.last_pushes)
+        if buttons and planned_end(start, buttons, pushes) == tile:
+            pushes_to[tile] = pushes
             return buttons
         return None
 
@@ -2622,6 +2755,9 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                    else ". A ledge (one-way), water (needs Surf) or a person may be in the way.")
             ),
         }
+    # A route that pushes boulders is walked to its first push only (push_plan): the
+    # caller pushes, then plans again. Its edge press is kept for the last plan.
+    best.update(push_plan(start, best["buttons"], pushes_to.get(tuple(best["target"])) or []))
     best.update({
         "success": True,
         "grid": grid,

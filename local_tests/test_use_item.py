@@ -9,6 +9,10 @@ test_mt_chimney_busy_grunt.state (live): BRELOOM 37, COMBUSKEN 29, SABLEYE 26, A
 used: medicine put in the ITEMS pocket (test_party_rule._put_in_bag), a party member's HP
 or status.
 
+Field items that take no Pokémon (Escape Rope, the Repels): test_magma_hideout_1f.state
+(MAGMA HIDEOUT 1F (5,21), an ESCAPE ROPE in the bag; see test_strength.py), and the
+Chimney save (allowEscaping FALSE) with the item put in the bag.
+
   docker run --rm --entrypoint /opt/venv/bin/python -v ~/continual-harness:/app -w /app \
       emerald-harness:local local_tests/test_use_item.py
 """
@@ -102,6 +106,91 @@ def test_use_item_cures_a_status_and_refuses_what_would_do_nothing():
     assert r["success"] is False and "needs nothing" in r["error"], r
     r = s.call("mcp_use_item", {"item": "MAX REVIVE", "pokemon": "BRELOOM", "reasoning": "test"})
     assert r["success"] is False and "There is no MAX REVIVE" in r["error"], r
+
+
+HIDEOUT = Path(__file__).resolve().parent / "test_magma_hideout_1f.state"
+SUPER_REPEL, MAX_REPEL, ESCAPE_ROPE, REPEL = 83, 84, 85, 86  # pret include/constants/items.h
+VAR_REPEL_STEP_COUNT = 0x4021  # pret include/constants/vars.h
+SAVE_BLOCK1_ESCAPE_WARP = 0x24  # pret include/global.h struct SaveBlock1 escapeWarp (s8 mapGroup, s8 mapNum)
+
+
+def _repel_steps(s):
+    with s.srv.memory_lock:
+        return s.srv.env.memory_reader.read_game_var(VAR_REPEL_STEP_COUNT)
+
+
+def _map_id(s):
+    return s.snapshot().map_id
+
+
+def test_escape_rope_climbs_out_of_a_dungeon_to_its_escape_warp():
+    """Seen live in MAGMA HIDEOUT: use_item("ESCAPE ROPE") answered "pokemon is required".
+    pret ItemUseOutOfBattle_EscapeRope: the bag closes, "<PLAYER> used the ESCAPE ROPE.",
+    and the player warps to gSaveBlock1Ptr->escapeWarp (the last outdoor spot)."""
+    s = server()
+    s.load(HIDEOUT, wild_encounters=False)
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        sb1 = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR)
+        escape = (reader._read_u8(sb1 + SAVE_BLOCK1_ESCAPE_WARP), reader._read_u8(sb1 + SAVE_BLOCK1_ESCAPE_WARP + 1))
+    before = _counts(s)
+    assert before.get(ESCAPE_ROPE) == 1, before
+    r = s.call("mcp_use_item", {"item": "ESCAPE ROPE", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"], r
+    assert _map_id(s) == escape, (_map_id(s), escape)
+    with s.srv.memory_lock:
+        place = s.srv.env.memory_reader.read_location()
+    assert place == "JAGGED PASS" and "JAGGED PASS" in r["summary"], (place, r)
+    assert _counts(s).get(ESCAPE_ROPE, 0) == 0
+    assert s.srv._player_can_walk()
+
+
+def test_escape_rope_is_refused_where_the_map_does_not_allow_escaping():
+    """MT CHIMNEY's header has allowEscaping FALSE (map.json allow_escaping), so pret
+    CanUseDigOrEscapeRopeOnCurMap refuses it: say so, and spend nothing."""
+    s = server()
+    s.load(CHIMNEY, wild_encounters=False)
+    _put_in_bag(s, ESCAPE_ROPE, 2)  # the save holds one already
+    where, before = _map_id(s), _counts(s)[ESCAPE_ROPE]
+    r = s.call("mcp_use_item", {"item": "ESCAPE ROPE", "reasoning": "test"})
+    print("   ", r.get("error") or r)
+    assert r["success"] is False and "caves and dungeons" in r["error"], r
+    assert _counts(s)[ESCAPE_ROPE] == before and _map_id(s) == where
+    assert s.srv._player_can_walk()
+
+
+def test_repels_start_and_are_refused_while_one_still_works():
+    """pret ItemUseOutOfBattle_Repel: with VAR_REPEL_STEP_COUNT at 0 the Repel sets it to
+    its hold effect param (REPEL 100, SUPER REPEL 200, MAX REPEL 250); while it is not 0
+    "But the effects of a REPEL lingered from earlier." and nothing is spent."""
+    s = server()
+    for item_id, name, steps in ((REPEL, "REPEL", 100), (SUPER_REPEL, "SUPER REPEL", 200), (MAX_REPEL, "MAX REPEL", 250)):
+        s.load(CHIMNEY)  # wild encounters on: the harness's own Repel is not set
+        assert _repel_steps(s) == 0
+        _put_in_bag(s, item_id, 2)  # the save holds a REPEL already
+        before = _counts(s)[item_id]
+        r = s.call("mcp_use_item", {"item": name, "reasoning": "test"})
+        print("   ", r.get("summary") or r)
+        assert r["success"] and name in r["summary"], r
+        assert _repel_steps(s) == steps, (name, _repel_steps(s))
+        assert _counts(s)[item_id] == before - 1
+        assert s.srv._player_can_walk()
+        r = s.call("mcp_use_item", {"item": name, "reasoning": "test"})
+        print("   ", r.get("error") or r)
+        assert r["success"] is False and "still" in r["error"], r
+        assert _counts(s)[item_id] == before - 1 and _repel_steps(s) == steps
+        assert s.srv._player_can_walk()
+
+
+def test_medicine_still_needs_a_pokemon():
+    s = server()
+    s.load(CHIMNEY, wild_encounters=False)
+    _put_in_bag(s, POTION, 1)
+    r = s.call("mcp_use_item", {"item": "POTION", "reasoning": "test"})
+    assert r["success"] is False and "pokemon is required" in r["error"], r
+    r = s.call("mcp_use_item", {"reasoning": "test"})
+    assert r["success"] is False and "pokemon is required" in r["error"], r
 
 
 def _run_all():

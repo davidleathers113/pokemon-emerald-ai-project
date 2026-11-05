@@ -76,6 +76,29 @@ WATER_ELEVATION = 1
 # animation, so a way on land of about as many steps is taken instead.
 SURF_START_COST = CLEARABLE_TILE_COST
 
+# Strength boulders (OBJ_EVENT_GFX_PUSHABLE_BOULDER). Seen live (2026-11-04, MAGMA HIDEOUT
+# 1F): boulders at (5,22), (7,22) and (6,23) cut (5,21) off from the exit at (10,34), and
+# no walk planned a way past them. With FLAG_SYS_USE_STRENGTH set, a step into
+# a boulder pushes it one tile and the player stays put (pret src/field_player_avatar.c
+# TryPushBoulder, StartStrengthAnim), so the search state holds the boulders' tiles.
+# Planner cost of one push: a stop, the push animation (with the field controls locked)
+# and, the first time, Strength's question; open ground of a few steps is preferred.
+BOULDER_PUSH_COST = 4.0
+# Pushes one planned walk may make, and nodes a search with boulders may open: each push
+# makes the same tile another search state, so the search is kept bounded. The live puzzle
+# needs 2 pushes and a few hundred nodes.
+BOULDER_MAX_PUSHES = 8
+BOULDER_SEARCH_MAX_NODES = 60000
+# Grid symbols a boulder may be pushed onto: floor and tall grass. pret TryPushBoulder wants
+# GetCollisionAtCoords == COLLISION_NONE and no MetatileBehavior_IsNonAnimDoor; doors,
+# stairs and other warps ('D'/'S'), ledges, water and walls are refused here, the doors and
+# warps beyond what the game refuses (a boulder on a warp would cover the way out).
+BOULDER_FLOOR = frozenset({".", "~"})
+# pret IsMetatileDirectionallyImpassable reads these behaviors (MB_IMPASSABLE_*) and
+# MetatileBehavior_IsNonAnimDoor these (MB_NON_ANIMATED_DOOR, MB_WATER_DOOR,
+# MB_DEEP_SOUTH_WARP): either stops a boulder.
+BOULDER_REFUSED_BEHAVIORS = ("IMPASSABLE", "NON_ANIMATED_DOOR", "WATER_DOOR", "DEEP_SOUTH_WARP")
+
 
 def tile_behavior_name(tile) -> str:
     """The MetatileBehavior name of a (tile id, behavior, collision, elevation) tile, or ''."""
@@ -120,6 +143,9 @@ class Node:
     parent: Optional["Node"] = None
     carried: Optional[int] = None  # the walker's elevation (kept across BRIDGE_ELEVATION tiles)
     gates: tuple | None = None  # rotating gates' orientations here (rotating_gates.py)
+    boulders: tuple | None = None  # Strength boulders' tiles here, sorted (None: not modelled)
+    push: tuple | None = None  # (button, boulder tile, tile it went to) when this step pushed one
+    pushes: int = 0  # pushes made on the way here
 
     def __post_init__(self):
         self.f_cost = self.g_cost + self.h_cost
@@ -171,6 +197,13 @@ class Pathfinder:
         # The rotating gates' orientations at the end of the last path found (None when
         # the map has none): the walk compares them with the game's afterwards.
         self.last_gate_orientations = None
+        # The boulder pushes of the last path found, in walking order: {"index": the
+        # push's place in the buttons, "button", "boulder": its tile, "to": where it
+        # goes}. The press does not move the player, so callers walk up to the first push
+        # and push it themselves (a push locks the field controls, which a walk's
+        # movement check would call an interruption).
+        self.last_pushes: List[Dict] = []
+        self.last_path_buttons: List[str] = []
 
     def find_path(
         self,
@@ -204,6 +237,8 @@ class Pathfinder:
         # Extract map data from game state
         map_data = self._extract_map_data(game_state)
         self.last_gate_orientations = None
+        self.last_pushes = []
+        self.last_path_buttons = []
 
         # CRITICAL: Require porymap data - no fallback allowed
         if not map_data:
@@ -213,7 +248,9 @@ class Pathfinder:
         # Among rotating gates a part-way walk toward the closest tile by distance turns
         # gates on the way for nothing (the way may lie in the other direction), and the
         # variance alternatives are planned without the gates: only whole planned walks.
-        if map_data.get("rotating_gates") is not None:
+        # The same with boulders the walk may push: a push can't be taken back.
+        boulders = {tuple(b) for b in map_data.get("boulders") or []}
+        if map_data.get("rotating_gates") is not None or (boulders and map_data.get("strength")):
             allow_partial = False
             variance = None
 
@@ -320,6 +357,12 @@ class Pathfinder:
                         blocked.discard(adj_pos)
                         if was_blocked:
                             logger.info(f"🌳 Unblocked cuttable tree at {adj_pos} (adjacent to player at {start})")
+
+        # Boulders the party can't push (no STRENGTH usable) are walls wherever they stand
+        # now, whether or not people are being walked round; pushable ones are _astar's
+        # search state instead.
+        if boulders and not map_data.get("strength"):
+            blocked |= boulders - {start}
 
         # Ensure start is never blocked
         blocked.discard(start)
@@ -445,7 +488,8 @@ class Pathfinder:
         else:
             path = result
 
-        base_buttons = self._path_to_buttons(path)
+        # A push repeats the player's tile in the path, so its press comes from the nodes.
+        base_buttons = list(self.last_path_buttons) if self.last_pushes else self._path_to_buttons(path)
 
         if variance:
             variance_steps = VARIANCE_TO_STEPS.get(variance)
@@ -500,6 +544,10 @@ class Pathfinder:
                     # (game_tools.load_pathfinding_state): steps push and turn them.
                     "rotating_gates": porymap.get("rotating_gates"),
                     "gate_orientations": porymap.get("gate_orientations"),
+                    # Strength boulders' tiles now and whether the party can push them
+                    # (game_tools.load_pathfinding_state): pushes join the search.
+                    "boulders": porymap.get("boulders") or [],
+                    "strength": bool(porymap.get("strength")),
                 }
 
                 # Include raw tiles with elevation if available
@@ -1447,25 +1495,36 @@ class Pathfinder:
             button = "RIGHT" if dx > 0 else "LEFT" if dx < 0 else "DOWN" if dy > 0 else "UP"
             return puzzle.step(gates, button, to)
 
-        def key(pos, carried, gates=None):
+        # Strength boulders the party can push: their tiles are part of the search state
+        # (the same tile with a boulder moved is another state), and a step into one is a
+        # push when the tile behind it takes the boulder (_push_target).
+        start_boulders = None
+        if map_data.get("strength") and map_data.get("boulders"):
+            start_boulders = tuple(sorted({tuple(b) for b in map_data["boulders"]} - {start}))
+
+        def key(pos, carried, gates=None, boulders=None):
             # On a bridge, the same tile walked on from different floors leads on
             # differently, so it is a different search state.
-            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None, gates)
+            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None, gates, boulders)
 
         start_carried = carried_after(None, start)
         start_node = Node(
-            start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried, gates=start_gates
+            start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried, gates=start_gates,
+            boulders=start_boulders,
         )
         goal_node = Node(goal[0], goal[1])
         clearable = {tuple(t) for t in map_data.get("clearable") or []}
+        self.last_pushes = []
+        self.last_path_buttons = []
 
         open_list = []
         heapq.heappush(open_list, start_node)
         closed_set = set()
-        node_map = {key(start, start_carried, start_gates): start_node}
+        node_map = {key(start, start_carried, start_gates, start_boulders): start_node}
 
         # Track the best node (closest to goal) in case we can't reach it
         best_node = start_node
+        opened = 0
 
         while open_list:
             current = heapq.heappop(open_list)
@@ -1474,7 +1533,15 @@ class Pathfinder:
             if (current.x, current.y) == goal:
                 # How the walk leaves the gates, for the caller to check after walking.
                 self.last_gate_orientations = current.gates
+                if start_boulders is not None:
+                    self.last_path_buttons, self.last_pushes = self._node_buttons(current)
                 return self._reconstruct_path(current)
+
+            if start_boulders is not None:
+                opened += 1
+                if opened > BOULDER_SEARCH_MAX_NODES:
+                    logger.warning(f"Pathfinding: boulder search from {start} to {goal} gave up after {opened - 1} nodes")
+                    break
 
             # Check if we've searched too far
             # max_distance is a step budget, but g_cost counts a grass step as grass_cost.
@@ -1483,7 +1550,7 @@ class Pathfinder:
             if current.g_cost > max_distance * max(1.0, self.grass_cost):
                 continue
 
-            closed_set.add(key((current.x, current.y), current.carried, current.gates))
+            closed_set.add(key((current.x, current.y), current.carried, current.gates, current.boulders))
 
             # Update best node if this one is closer to goal
             if current.h_cost < best_node.h_cost:
@@ -1495,7 +1562,28 @@ class Pathfinder:
             # Prefer moving toward goal (lower h_cost) when f_cost is equal
             # This helps find optimal paths faster
             neighbors_with_cost = []
+            here = (current.x, current.y)
             for neighbor_pos in neighbors:
+                if current.boulders is not None and neighbor_pos in current.boulders:
+                    # A step into a boulder pushes it (pret TryPushBoulder) when the walk to
+                    # it would be a legal step; the player stays where they are.
+                    delta = (neighbor_pos[0] - current.x, neighbor_pos[1] - current.y)
+                    if current.pushes >= BOULDER_MAX_PUSHES or not self._can_move_to(
+                        here, neighbor_pos, map_data, current.carried
+                    ):
+                        continue
+                    to = self._push_target(neighbor_pos, delta, current.boulders, blocked, map_data)
+                    if to is None:
+                        continue
+                    moved = tuple(sorted((set(current.boulders) - {neighbor_pos}) | {to}))
+                    if key(here, current.carried, current.gates, moved) in closed_set:
+                        continue
+                    button = self._path_to_buttons([here, neighbor_pos])[0]
+                    neighbors_with_cost.append(
+                        (here, current.g_cost + BOULDER_PUSH_COST, current.h_cost, current.carried, current.gates,
+                         moved, (button, neighbor_pos, to))
+                    )
+                    continue
                 carried = carried_after(current.carried, neighbor_pos)
                 # Check if this move is valid (handles ledge directions)
                 if not self._can_move_to((current.x, current.y), neighbor_pos, map_data, current.carried):
@@ -1503,7 +1591,7 @@ class Pathfinder:
                 gates = gates_after(current.gates, (current.x, current.y), neighbor_pos)
                 if puzzle is not None and gates is None:
                     continue  # a gate's arm is in the way and can't turn
-                if key(neighbor_pos, carried, gates) in closed_set:
+                if key(neighbor_pos, carried, gates, current.boulders) in closed_set:
                     continue
 
                 # Calculate movement cost - add penalty for grass tiles to avoid wild encounters
@@ -1526,16 +1614,20 @@ class Pathfinder:
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)
-                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost, carried, gates))
+                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost, carried, gates, current.boulders, None))
 
             # Sort by h_cost (distance to goal) so we explore promising directions first
             # This helps find optimal paths when multiple neighbors have same f_cost
             neighbors_with_cost.sort(key=lambda x: x[2])  # Sort by h_cost
 
-            for neighbor_pos, g_cost, h_cost, carried, gates in neighbors_with_cost:
-                state = key(neighbor_pos, carried, gates)
+            for neighbor_pos, g_cost, h_cost, carried, gates, boulders, push in neighbors_with_cost:
+                state = key(neighbor_pos, carried, gates, boulders)
+                pushes = current.pushes + (1 if push else 0)
                 if state not in node_map:
-                    neighbor = Node(neighbor_pos[0], neighbor_pos[1], g_cost, h_cost, carried=carried, gates=gates)
+                    neighbor = Node(
+                        neighbor_pos[0], neighbor_pos[1], g_cost, h_cost, carried=carried, gates=gates,
+                        boulders=boulders, push=push, pushes=pushes,
+                    )
                     neighbor.parent = current
                     node_map[state] = neighbor
                     heapq.heappush(open_list, neighbor)
@@ -1545,6 +1637,7 @@ class Pathfinder:
                         neighbor.g_cost = g_cost
                         neighbor.f_cost = g_cost + neighbor.h_cost
                         neighbor.parent = current
+                        neighbor.push, neighbor.pushes = push, pushes
 
         # No path found - return the best node we explored (for partial paths)
         return (None, best_node)
@@ -1597,6 +1690,87 @@ class Pathfinder:
             current = current.parent
         path.reverse()
         return path
+
+    def _node_buttons(self, node: Node) -> Tuple[List[str], List[Dict]]:
+        """(buttons, pushes) of the walk ending at node: a push's press comes from the
+        node (the player's tile does not change), every other press from the step."""
+        chain = []
+        while node is not None:
+            chain.append(node)
+            node = node.parent
+        chain.reverse()
+        buttons: List[str] = []
+        pushes: List[Dict] = []
+        for before, after in zip(chain, chain[1:]):
+            if after.push is not None:
+                button, boulder, to = after.push
+                pushes.append({"index": len(buttons), "button": button, "boulder": boulder, "to": to})
+                buttons.append(button)
+            else:
+                buttons.extend(self._path_to_buttons([(before.x, before.y), (after.x, after.y)]))
+        return buttons, pushes
+
+    def _push_target(
+        self,
+        boulder: Tuple[int, int],
+        delta: Tuple[int, int],
+        boulders,
+        blocked: Set[Tuple[int, int]],
+        map_data: Dict,
+    ) -> Optional[Tuple[int, int]]:
+        """Where a push in direction delta moves the boulder on `boulder`, or None when the
+        game would not move it (or this planner won't).
+
+        pret src/field_player_avatar.c TryPushBoulder: the tile behind must give
+        GetCollisionAtCoords(boulder, ...) == COLLISION_NONE (src/event_object_movement.c:
+        no collision bits, on the map, not MB_IMPASSABLE_* that way, no elevation mismatch
+        with the boulder, no object there) and must not be MetatileBehavior_IsNonAnimDoor.
+        Beyond that, warps, ledges and water are refused (BOULDER_FLOOR): a missing push
+        is better than one that buries an exit."""
+        tx, ty = boulder[0] + delta[0], boulder[1] + delta[1]
+        target = (tx, ty)
+        grid = map_data.get("grid") or []
+        if target in boulders or target in blocked or not (0 <= ty < len(grid) and 0 <= tx < len(grid[ty])):
+            return None
+        if grid[ty][tx] not in BOULDER_FLOOR:
+            return None
+        if target in {tuple(p) for p in map_data.get("raw_warps") or []}:
+            return None
+        if target in self._object_tiles(map_data):
+            return None  # pret DoesObjectCollideWithObjectAt: a person stands there
+        raw_tiles = map_data.get("raw_tiles") or []
+
+        def tile(pos):
+            x, y = pos
+            return raw_tiles[y][x] if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]) else None
+
+        there = tile(target)
+        if there is not None:
+            if len(there) > 2 and there[2]:
+                return None  # MapGridGetCollisionAt
+            name = tile_behavior_name(there)
+            if any(word in name for word in BOULDER_REFUSED_BEHAVIORS):
+                return None
+            # pret IsElevationMismatchAt: elevations 0 and 15 match anything.
+            here = tile(boulder)
+            mine = here[3] if here is not None and len(here) > 3 else 0
+            theirs = there[3] if len(there) > 3 else 0
+            if mine not in (0, BRIDGE_ELEVATION) and theirs not in (0, BRIDGE_ELEVATION) and mine != theirs:
+                return None
+        return target
+
+    def _object_tiles(self, map_data: Dict) -> Set[Tuple[int, int]]:
+        """Tiles people stand on: their live tiles and their map-file tiles (the live list
+        covers only those loaded near the camera)."""
+        tiles = set()
+        for obj in map_data.get("runtime_objects") or []:
+            x, y = obj.get("current_x", obj.get("x")), obj.get("current_y", obj.get("y"))
+            if x is not None and y is not None:
+                tiles.add((x, y))
+        for obj in map_data.get("objects") or []:
+            if obj.get("x") is not None and obj.get("y") is not None:
+                tiles.add((obj["x"], obj["y"]))
+        return tiles
 
     def _find_nearest_reachable(
         self,

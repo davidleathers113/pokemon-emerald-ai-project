@@ -5229,6 +5229,127 @@ async def _await_landing(was_surfing: bool) -> Optional[Tuple[int, int]]:
     return (snap.x, snap.y) if snap is not None else None
 
 
+# A presses after YES to Strength: "<MON> used STRENGTH!" and its second page, with room
+# for the YES/NO's own box (pret data/scripts/field_move_scripts.inc Text_MonUsedStrength).
+STRENGTH_PRESSES = 5
+# The Strength field effect after YES (the Pokémon shown, FLDEFF_USE_STRENGTH), in frames.
+STRENGTH_EFFECT_FRAMES = 600
+# One push: the boulder's slow walk (GetWalkSlowMovementAction, 32 frames) with the field
+# controls locked (pret PushBoulder_*), with room to spare.
+BOULDER_PUSH_FRAMES = 180
+# Presses toward a boulder before a push is called a failure: one may only turn the player.
+BOULDER_PUSH_TRIES = 3
+# Pushes one navigate_to or go_to_exit may make before it stops and reports.
+STRENGTH_MAX_PUSHES = 8
+FLAG_SYS_USE_STRENGTH = 0x889  # pret include/constants/flags.h (SYSTEM_FLAGS + 0x29)
+
+
+def _strength_on() -> bool:
+    return bool(_mem(lambda r: r._is_event_flag_set(FLAG_SYS_USE_STRENGTH)))
+
+
+def _boulder_tiles_now() -> set:
+    from server.field_control import loaded_boulders
+
+    return set(_mem(loaded_boulders).values())
+
+
+async def _use_strength(boulder, button: str, source: str) -> Tuple[Optional[str], Optional[str]]:
+    """Facing the boulder on `boulder`: A, "It's a big boulder, but a POKéMON may be able to
+    push it aside. Would you like to use STRENGTH?" YES, then "<MON> used STRENGTH!" until
+    FLAG_SYS_USE_STRENGTH is set and the player can walk. Returns (what the game said,
+    None) or (None, why not).
+
+    pret data/scripts/field_move_scripts.inc EventScript_StrengthBoulder: lockall, the Heat
+    Badge and checkpartymove MOVE_STRENGTH, MSGBOX_YESNO, FLDEFF_USE_STRENGTH, then
+    EventScript_ActivateStrength's setflag and msgbox. Seen live in MAGMA HIDEOUT 1F: these
+    exact presses by hand. A is pressed only once a box waits for it (as _start_surf does).
+    """
+    from server import menu_state as ms
+
+    snap = _field_snapshot()
+    if snap is not None and snap.facing != button:
+        await _macro_press([button], source)  # the boulder is in the way: this only turns
+    asked, texts = False, []
+    for _ in range(3):
+        await _macro_press(["A"], source)
+        asked, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+        if asked or texts or not _player_can_walk():
+            break
+    if not asked:
+        await _close_dialogue(source)
+        return None, f"A at the boulder {tuple(boulder)} asked nothing ({_quote(texts) or 'nothing was said'})"
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor == 1 and cursor.cursor == 1:
+        await _macro_press(["UP"], source)
+        cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor != 1 or cursor.cursor != 0:
+        await _macro_press(["B"], source)  # B answers NO: never leave the question up
+        await _close_dialogue(source)
+        return None, f"the STRENGTH question's YES/NO cursor is not on YES (cursor {cursor.cursor})"
+    await _macro_press(["A"], source)  # YES
+
+    def ready() -> bool:
+        return _strength_on() and _player_can_walk()
+
+    said: List[str] = []
+    for _ in range(STRENGTH_PRESSES):
+        await _await_game(lambda: ready() or _box_waits_for_a(), STRENGTH_EFFECT_FRAMES)
+        if ready():
+            break
+        text = _mem(read_field_text)
+        if text and text not in said:
+            said.append(text)
+        if _box_waits_for_a():
+            await _macro_press(["A"], source)
+    if not await _await_game(ready, MACRO_TEXT_FRAMES):
+        return None, f"answered YES to STRENGTH at {tuple(boulder)} but it is not in use{_screen_note()}"
+    used = [t for t in said if "STRENGTH" in t.upper() and "?" not in t]
+    return (used[0].split("\n")[0] if used else "used STRENGTH"), None
+
+
+async def _push_boulder(boulder, button: str, source: str) -> Tuple[bool, str]:
+    """Push the Strength boulder on `boulder` (map tile, beside the player) one tile with
+    `button`, using STRENGTH first when it is not in use yet (_use_strength). The push is
+    checked in RAM: the boulder's object stands on the next tile and the player can walk.
+    Returns (moved, what happened, for the summary).
+
+    pret src/field_player_avatar.c TryPushBoulder / StartStrengthAnim: with
+    FLAG_SYS_USE_STRENGTH set, a step into a boulder whose next tile is free moves the
+    boulder and not the player.
+    """
+    from server.field_control import DIRECTION_DELTAS
+
+    dx, dy = DIRECTION_DELTAS[button]
+    to = (boulder[0] + dx, boulder[1] + dy)
+    if not await _await_game(_player_can_walk, MACRO_MENU_FRAMES):
+        return False, f"the boulder at {tuple(boulder)} was not pushed: the player can't act{_screen_note()}"
+    snap = _field_snapshot()
+    if snap is None or (snap.x + dx, snap.y + dy) != tuple(boulder):
+        where = f"({snap.x},{snap.y})" if snap is not None else "an unknown tile"
+        return False, f"the boulder at {tuple(boulder)} was not pushed: the walk ended at {where}, not beside it"
+    if tuple(boulder) not in _boulder_tiles_now():
+        return False, f"there is no boulder at {tuple(boulder)} to push"
+    used = None
+    if not _strength_on():
+        used, why = await _use_strength(boulder, button, source)
+        if why:
+            return False, f"the boulder at {tuple(boulder)} was not pushed: {why}"
+
+    def pushed() -> bool:
+        tiles = _boulder_tiles_now()
+        return tuple(boulder) not in tiles and to in tiles and _player_can_walk()
+
+    for _ in range(BOULDER_PUSH_TRIES):
+        await _macro_press([button], source)
+        if await _await_game(pushed, BOULDER_PUSH_FRAMES):
+            break
+    first = f"{used}; " if used else ""
+    if not pushed():
+        return False, f"{first}the boulder at {tuple(boulder)} did not move (pushed {button} toward {to})"
+    return True, f"{first}pushed the boulder at {tuple(boulder)} {button} to {to}"
+
+
 @app.post("/mcp/go_to_exit")
 async def mcp_go_to_exit(request: dict):
     """MCP Tool: walk to one of the current map's exits (EXITS list) and through it."""
@@ -5254,12 +5375,14 @@ async def mcp_go_to_exit(request: dict):
         # when the map loaded, so a walk stopped by a person is replanned around the
         # tile they are on now (up to two more tries). Surf adds two: the start at the
         # shore and the landing on the far one each end a walk that is then planned again.
+        # Each Strength boulder push ends a walk too (game_tools.push_plan).
         avoid: List[Tuple[int, int]] = []
         cleared: List[str] = []
         first_from = None
         start = _field_snapshot()
         snap = start
-        for _attempt in range(7):
+        pushes, push_trouble = 0, None
+        for _attempt in range(7 + STRENGTH_MAX_PUSHES):
             # Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the
             # door, then planned again from inside METEOR FALLS and answered "No exit of
             # METEOR FALLS 1F 1R matches 'METEOR FALLS 1F 1R'". A retry only makes sense
@@ -5283,7 +5406,8 @@ async def mcp_go_to_exit(request: dict):
             if first_from is None:
                 first_from = _position_text(before)
             buttons = list(plan["buttons"])
-            if plan["kind"] == "edge":
+            boulder_push = plan.get("push")
+            if plan["kind"] == "edge" and not boulder_push:
                 buttons.append(plan["final_button"])
             report = None
             if buttons:
@@ -5301,6 +5425,24 @@ async def mcp_go_to_exit(request: dict):
                 cleared.append(_call_text(call).rstrip("."))
                 if not call["open"]:
                     continue
+            # A Strength boulder on the way (game_tools.push_plan): the walk ended beside
+            # it; push it, then plan again from where the boulders stand now.
+            walk_clean = report is None or (report.get("done") and not report.get("blocked") and not report.get("interrupted"))
+            if boulder_push and walk_clean:
+                if pushes >= STRENGTH_MAX_PUSHES:
+                    push_trouble = f"the way needs more than {STRENGTH_MAX_PUSHES} boulder pushes; call go_to_exit again"
+                    snap = _field_snapshot()
+                    break
+                px, py = plan.get("coord_offset") or (0, 0)
+                tile = (boulder_push["boulder"][0] + px, boulder_push["boulder"][1] + py)
+                moved, said = await _push_boulder(tile, boulder_push["button"], "go_to_exit")
+                if not moved:
+                    push_trouble = said
+                    snap = _field_snapshot()
+                    break
+                cleared.append(said)
+                pushes += 1
+                continue
             snap = await _await_exit(plan, before, WARP_FRAMES if plan["kind"] == "warp" else EDGE_FRAMES)
             # A rock or tree on the way that the party can clear: clear it, plan again.
             used = await _clear_obstacle((report or {}).get("blocked_tile"), "go_to_exit")
@@ -5370,7 +5512,9 @@ async def mcp_go_to_exit(request: dict):
             response["summary"] = f"Arrived: now at {now} (took exit: {plan['label']}).{on_the_way}"
             return response
         response["success"] = False
-        if walk_stopped:
+        if push_trouble:
+            reason = push_trouble
+        elif walk_stopped:
             reason = report.get("blocked") or report.get("interrupted")
         elif door_trouble:
             reason = door_trouble
@@ -6118,12 +6262,23 @@ def _held_item_names() -> set:
     return {game_tools._squash_name(item["name"]) for pocket in inventory.values() for item in pocket}
 
 
+def _boulders_here() -> Tuple[str, Dict[int, Tuple[int, int]]]:
+    """(map dir the player is on, its Strength boulders loaded now) for the route areas
+    (server.game_tools.boulders_reader): boulders pushed aside leave the way open."""
+    from server.field_control import loaded_boulders
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    with memory_lock:
+        return ROM_TO_PORYMAP_MAP.get(env.memory_reader.read_location(), ""), loaded_boulders(env.memory_reader)
+
+
 def _install_route_flag_reader() -> None:
     from server import game_tools
 
     game_tools.flag_reader = _route_flag_reader
     game_tools.field_moves_reader = _usable_field_moves
     game_tools.items_reader = _held_item_names
+    game_tools.boulders_reader = _boulders_here
 
 
 _install_route_flag_reader()
@@ -7935,8 +8090,12 @@ async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]
     from server import game_tools
     from server import menu_state as ms
 
+    # pokemon_center_route answers [] both inside a Center and when none can be reached;
+    # arrived() (a nurse in sight) covers the first, so [] here means none in reach. Seen
+    # live in MAGMA HIDEOUT 1F: _walk_along took [] for "arrived", and heal_at_pokecenter
+    # said "no nurse is on this map" instead of why the way out was not found.
     return await _walk_along(
-        lambda location, position: game_tools.pokemon_center_route(location, position),
+        lambda location, position: game_tools.pokemon_center_route(location, position) or None,
         lambda: bool(_mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE)),
         "the nearest Pokémon Center",
         source,
@@ -8575,21 +8734,31 @@ async def mcp_heal_at_pokecenter(request: dict = None):
         if refused:
             return refused
         trip = []
+        roped = ""
         if not _mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE):
+            # In a cave or dungeon an Escape Rope is the quick way out (pret
+            # ItemUseOutOfBattle_EscapeRope: allowEscaping maps only), then the walk. Seen
+            # live in MAGMA HIDEOUT 1F: the walk alone found no way out.
+            from server import game_tools
+            from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+            here = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
+            if game_tools.map_allows_escaping(here) and _bag_counts().get(ESCAPE_ROPE, 0) > 0:
+                with _turbo():
+                    error, used = await _use_escape_rope(source)
+                roped = f"{used} " if not error else f"Tried an ESCAPE ROPE first, but: {error} "
             trip, why = await _walk_to_pokemon_center(source)
             if why:
                 walked = f" Walked {' → '.join(trip)} first." if trip else ""
                 # None in reach at all (game_tools.no_pokemon_center_note): seen live, the
                 # model then tried go_to to a Center over water and ledges, away from its
                 # objective. Say to go on instead.
-                from server import game_tools
-
                 on = ""
                 snap = _field_snapshot()
                 tile = (snap.x, snap.y) if snap is not None else None
                 if not trip and not game_tools.pokemon_center_route(_location_name(), tile):
                     on = " Don't turn back for one: keep going, and heal at the next Pokémon Center on your way."
-                return _refusal(f"Did not heal: {why}.{walked}{on}")
+                return _refusal(f"Did not heal: {roped}{why}.{walked}{on}")
 
         before = _party_lines()
         spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_NURSE, "nurse", source)
@@ -8624,6 +8793,7 @@ async def mcp_heal_at_pokecenter(request: dict = None):
             summary = "NOT healed (game memory shows HP or status not restored). " + summary
         if trip:
             summary = f"Walked {' → '.join(trip)}. " + summary
+        summary = roped + summary
         if closed:
             summary += f" You can walk again at {_position_text(_field_snapshot())}."
         else:
@@ -9674,23 +9844,21 @@ def _hp_status_text(mon) -> str:
     return f"{mon.current_hp}/{mon.max_hp} HP{status}"
 
 
-async def _use_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
-    """START → BAG → ITEMS → the item → USE → party slot `index`, through its text and
-    out of the menus. None when the item was used, else why not.
+async def _leave_menus(message: str, source: str) -> str:
+    """message, after backing out of every menu (and saying so when that failed)."""
+    closed = await _close_field_menus(source)
+    return message + ("" if closed else " Could not close every menu: look at the screen.")
 
-    The same screens teach_move walks (Task_ItemContext_* for USE, then the party
-    chooser); a medicine that would do nothing says "It won't have any effect." and
-    leaves the chooser open, which is reported, not retried.
-    """
+
+async def _choose_use_in_bag(item_id: int, source: str) -> Optional[str]:
+    """START → BAG → ITEMS → the item → A → USE (the first entry of its menu) → A. None
+    once USE is pressed, else why not (with the menus closed again)."""
     from server import menu_state as ms
 
     pocket = ms.ITEMS_POCKET
-    before = _party_mon(index)
-    before_count = _bag_counts().get(item_id, 0)
 
     async def leave(message: str) -> str:
-        closed = await _close_field_menus(source)
-        return message + ("" if closed else " Could not close every menu: look at the screen.")
+        return await _leave_menus(message, source)
 
     await _macro_press(["START"], source)
     if not await _await_game(lambda: _mem(ms.start_menu_open), MACRO_MENU_FRAMES):
@@ -9716,7 +9884,30 @@ async def _use_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
         return await leave(f"Pressed A on the {_item_name(item_id)} but its USE menu did not open.")
     if _mem(lambda r: r._read_u16(ms.G_SPECIAL_VAR_ITEM_ID)) != item_id or _mem(ms.read_menu_cursor).cursor != 0:
         return await leave(f"The bag's menu is not USE on the {_item_name(item_id)}.")
-    await _macro_press(["A"], source)  # USE: medicine opens the party chooser
+    await _macro_press(["A"], source)  # USE
+    return None
+
+
+async def _use_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
+    """START → BAG → ITEMS → the item → USE → party slot `index`, through its text and
+    out of the menus. None when the item was used, else why not.
+
+    The same screens teach_move walks (Task_ItemContext_* for USE, then the party
+    chooser); a medicine that would do nothing says "It won't have any effect." and
+    leaves the chooser open, which is reported, not retried.
+    """
+    from server import menu_state as ms
+
+    before = _party_mon(index)
+    before_count = _bag_counts().get(item_id, 0)
+
+    async def leave(message: str) -> str:
+        return await _leave_menus(message, source)
+
+    error = await _choose_use_in_bag(item_id, source)
+    if error:
+        return error
+    # USE on a medicine opens the party chooser.
     if not await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES * 2):
         return await leave(f"Chose USE on the {_item_name(item_id)} but the party screen did not open.")
     if not await _step_cursor(ms.party_menu_slot, index, source):
@@ -9789,9 +9980,129 @@ async def _heal_with_medicine(indexes: List[int], source: str) -> Tuple[List[str
     return lines, used, None
 
 
+# Field items used from the bag on no Pokémon (pret include/constants/items.h). Seen live
+# in MAGMA HIDEOUT: use_item("ESCAPE ROPE") answered "pokemon is required".
+ESCAPE_ROPE = 85
+FIELD_ITEMS = (ESCAPE_ROPE, 86, 83, 84)  # ESCAPE ROPE, REPEL, SUPER REPEL, MAX REPEL
+VAR_REPEL_STEP_COUNT = 0x4021  # pret include/constants/vars.h
+# struct SaveBlock1 escapeWarp (pret include/global.h, after pos, location,
+# continueGameWarp, dynamicWarp and lastHealLocation): s8 mapGroup, s8 mapNum. pret
+# src/overworld.c SetEscapeWarp keeps it at the last outdoor spot before a dungeon.
+SAVE_BLOCK1_ESCAPE_WARP = 0x24
+# From USE on the Escape Rope to walking at the escape warp: the bag's fade, "<PLAYER>
+# used the ESCAPE ROPE.", the spin out (pret StartEscapeRopeFieldEffect), the warp and the
+# fade in.
+ESCAPE_ROPE_FRAMES = 1200
+# A presses allowed through a field item's message.
+FIELD_ITEM_TEXT_PRESSES = 6
+
+
+def _field_item(name: str) -> Optional[int]:
+    """The FIELD_ITEMS id `name` names, else None."""
+    from server import menu_state as ms
+
+    key = ms.name_key(name)
+    return next((i for i in FIELD_ITEMS if key and ms.name_key(_item_name(i)) == key), None)
+
+
+def _escape_warp(reader) -> Tuple[int, int]:
+    sb1 = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR)
+    return reader._read_u8(sb1 + SAVE_BLOCK1_ESCAPE_WARP), reader._read_u8(sb1 + SAVE_BLOCK1_ESCAPE_WARP + 1)
+
+
+async def _use_escape_rope(source: str) -> Tuple[Optional[str], str]:
+    """Use an ESCAPE ROPE from the bag: USE, then "<PLAYER> used the ESCAPE ROPE." and the
+    warp out, checked in RAM (the map is the escape warp's and the player can walk).
+    Returns (why not, "") or (None, the summary).
+
+    pret src/item_use.c ItemUseOutOfBattle_EscapeRope: only where
+    CanUseDigOrEscapeRopeOnCurMap (the map header's allowEscaping), else Dad's advice and
+    nothing used; refused here before the bag is opened. Then ItemUseOnFieldCB_EscapeRope:
+    the bag closes, the item is spent and the player warps to gSaveBlock1Ptr->escapeWarp.
+    """
+    from server import game_tools
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    location = _location_name()
+    if not game_tools.map_allows_escaping(ROM_TO_PORYMAP_MAP.get(location, "")):
+        return (
+            f"An ESCAPE ROPE only works in caves and dungeons, and {location} is not one (its map does not "
+            "allow escaping); nothing was used."
+        ), ""
+    start = _field_snapshot()
+    escape = _mem(_escape_warp)
+    error = await _choose_use_in_bag(ESCAPE_ROPE, source)
+    if error:
+        return error, ""
+
+    def out() -> bool:
+        snap = _field_snapshot()
+        return snap is not None and start is not None and snap.map_id != start.map_id and snap.field_free
+
+    for _ in range(FIELD_ITEM_TEXT_PRESSES):
+        await _await_game(lambda: out() or _box_waits_for_a(), MACRO_TEXT_FRAMES)
+        if out():
+            break
+        if _box_waits_for_a():
+            await _macro_press(["A"], source)
+    if not await _await_game(out, ESCAPE_ROPE_FRAMES):
+        return f"Chose USE on the ESCAPE ROPE but the player did not leave {location}.", ""
+    snap = _field_snapshot()
+    if snap is None or snap.map_id != escape:
+        expected = game_tools._map_name(*escape)
+        return f"The ESCAPE ROPE took the player to {_position_text(snap)}, not to {expected} (its escape warp).", ""
+    return None, f"Used the ESCAPE ROPE: back at {_position_text(snap)}; {_left_text([ESCAPE_ROPE])}."
+
+
+async def _use_repel(item_id: int, source: str) -> Tuple[Optional[str], str]:
+    """Use a REPEL, SUPER REPEL or MAX REPEL from the bag: USE, "<PLAYER> used the REPEL."
+    closed with A, the bag closed, then checked in RAM (VAR_REPEL_STEP_COUNT set, one
+    fewer in the bag). Returns (why not, "") or (None, the summary).
+
+    pret src/item_use.c ItemUseOutOfBattle_Repel: while VAR_REPEL_STEP_COUNT is not 0 it
+    only says "But the effects of a REPEL lingered from earlier." and spends nothing
+    (refused here before the bag is opened); else Task_UseRepel sets the var to the item's
+    hold effect param (REPEL 100, SUPER REPEL 200, MAX REPEL 250 steps) and spends one.
+    """
+    name = _item_name(item_id)
+
+    def steps() -> int:
+        return int(_mem(lambda r: r.read_game_var(VAR_REPEL_STEP_COUNT)) or 0)
+
+    if steps():
+        return (
+            f"A repel is still working ({steps()} steps left): the game would only say its effects linger, "
+            f"so the {name} was not used."
+        ), ""
+    before = _bag_counts().get(item_id, 0)
+    error = await _choose_use_in_bag(item_id, source)
+    if error:
+        return error, ""
+    await _await_game(lambda: steps() > 0, MACRO_TEXT_FRAMES)
+    for _ in range(FIELD_ITEM_TEXT_PRESSES):
+        if await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES):
+            break
+        await _macro_press(["A"], source)  # "<PLAYER> used the REPEL." back to the bag list
+    closed = await _close_field_menus(source)
+    shut = "" if closed else " Could not close every menu: look at the screen."
+    if not steps() or _bag_counts().get(item_id, 0) >= before:
+        return f"Chose USE on the {name} but no repel started.{shut}", ""
+    return None, (
+        f"Used a {name}: wild Pokémon below your lead's level stay away for {steps()} steps; "
+        f"{_left_text([item_id])}.{shut}"
+    )
+
+
+async def _use_field_item(item_id: int, source: str) -> Tuple[Optional[str], str]:
+    if item_id == ESCAPE_ROPE:
+        return await _use_escape_rope(source)
+    return await _use_repel(item_id, source)
+
+
 @app.post("/mcp/use_item")
 async def mcp_use_item(request: dict = None):
-    """MCP Tool: outside battle, use a medicine from the bag on a party Pokémon.
+    """MCP Tool: outside battle, use an item from the bag: a medicine on a party Pokémon,
+    or a field item that takes none (ESCAPE ROPE, the repels: _use_field_item).
 
     emerald-new (2026-11-04), David's "Potions + Jagged Pass": "Stopped: the team is weak
     (AZUMARILL 32/82 HP)", and the heal walk went below Jagged Pass's one-way ledges, a
@@ -9806,6 +10117,18 @@ async def mcp_use_item(request: dict = None):
     source = "use_item"
     request = request or {}
     wanted_item, wanted_mon = str(request.get("item") or "").strip(), request.get("pokemon")
+    field_item = _field_item(wanted_item)
+    if field_item is not None:
+        refused = _field_refusal(source)
+        if refused:
+            return refused
+        if _bag_counts().get(field_item, 0) <= 0:
+            return _refusal(f"There is no {_item_name(field_item)} in the ITEMS pocket.")
+        with _turbo():
+            error, summary = await _use_field_item(field_item, source)
+        if error:
+            return _refusal(f"{error}{_screen_note()}")
+        return {"success": True, "status": "USED", "summary": summary}
     if wanted_mon is None or str(wanted_mon).strip() == "":
         return _refusal('pokemon is required, e.g. use_item("SUPER POTION", "AZUMARILL"), or no item for the cheapest that helps.')
     refused = _field_refusal(source)
@@ -10908,6 +11231,28 @@ async def mcp_navigate_to(request: dict):
                     again = await mcp_navigate_to({**request, "_surfed": surf_steps + 1})
                     again["summary"] = f"{note} {again.get('summary') or again.get('error', '')}".strip()
                     return told(again)
+
+        # A Strength boulder on the way (game_tools.push_plan): the walk ended beside it;
+        # push it, then plan again from where the boulders stand now. A walk stopped
+        # short of the push (a person, a battle) is reported as it is, below.
+        boulder_push = result.get("push")
+        walk_clean = report is None or (report.get("done") and not report.get("blocked") and not report.get("interrupted"))
+        snap = _field_snapshot()
+        ox, oy = result.get("coord_offset") or (0, 0)
+        if boulder_push and walk_clean and snap is not None and (snap.x - ox, snap.y - oy) == tuple(boulder_push["stand"]):
+            pushed_before = int(request.get("_pushed", 0))
+            if pushed_before >= STRENGTH_MAX_PUSHES:
+                return told(_refusal(
+                    f"Did not reach ({x},{y}): the way needs more than {STRENGTH_MAX_PUSHES} boulder pushes; "
+                    f"navigate_to({x}, {y}) again goes on."
+                ))
+            tile = (boulder_push["boulder"][0] + ox, boulder_push["boulder"][1] + oy)
+            moved, said = await _push_boulder(tile, boulder_push["button"], "navigate_to")
+            if not moved:
+                return told(_refusal(f"Did not reach ({x},{y}): {said}. Now at {_position_text(_field_snapshot())}."))
+            again = await mcp_navigate_to({**request, "_pushed": pushed_before + 1})
+            again["summary"] = f"{said[0].upper()}{said[1:]}. {again.get('summary') or again.get('error', '')}".strip()
+            return told(again)
 
         response = {
             "success": True,

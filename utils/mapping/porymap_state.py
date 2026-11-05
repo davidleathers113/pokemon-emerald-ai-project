@@ -500,8 +500,13 @@ def _is_npc_object_event(obj: Dict[str, Any]) -> bool:
     return False
 
 
+BOULDER_GRAPHICS = "OBJ_EVENT_GFX_PUSHABLE_BOULDER"
+
+
 def _object_ascii_marker(obj: Dict[str, Any]) -> str:
     """Choose ASCII marker for reconciled object events."""
+    if obj.get("graphics_id") == BOULDER_GRAPHICS:
+        return "R"  # a Strength boulder, not a person to talk to
     if _is_item_object_event(obj):
         return "I"
     if _is_npc_object_event(obj):
@@ -925,6 +930,37 @@ def _party_can_surf() -> bool:
     except ImportError:
         return False
     return game_tools.can_surf()
+
+
+def _party_can_push_boulders() -> bool:
+    """server.game_tools.can_push_boulders (STRENGTH known, the Heat Badge), or False where
+    no server is running."""
+    try:
+        from server import game_tools
+    except ImportError:
+        return False
+    return game_tools.can_push_boulders()
+
+
+def _boulder_places(map_dir: Optional[str], memory_reader: Any) -> Dict[Tuple[int, int], Tuple[int, int]]:
+    """{map-file tile: tile it stands on now} for the map's Strength boulders
+    (server.game_tools.boulder_places, read live from gObjectEvents). Before, MAGMA
+    HIDEOUT 1F's boulders were drawn as people ('N') on their map-file tiles, pushed or
+    not (local_tests/test_strength.py). {} without boulders or without a server."""
+    try:
+        from server import game_tools
+        from server.field_control import loaded_boulders
+    except ImportError:
+        return {}
+    if not map_dir:
+        return {}
+    loaded = None
+    if memory_reader is not None:
+        try:
+            loaded = loaded_boulders(memory_reader)
+        except Exception as e:  # unreadable: the map-file tiles
+            logger.debug(f"live boulders unreadable: {e}")
+    return game_tools.boulder_places(map_dir, loaded if loaded is not None else {})
 
 
 def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str], surf: bool = False) -> List[str]:
@@ -1450,6 +1486,15 @@ def _format_porymap_info(
         context_parts.append(f"Location: {json_map.get('name', porymap_map_name)}")
         context_parts.append(f"Dimensions: {json_map['dimensions']['width']}x{json_map['dimensions']['height']}")
         
+        # Strength boulders: on the tile they stand on now, not their map-file tile.
+        places = _boulder_places(porymap_map_name, memory_reader)
+        if places and json_map.get("objects"):
+            json_map["objects"] = [
+                {**obj, "x": places[(obj.get("x"), obj.get("y"))][0], "y": places[(obj.get("x"), obj.get("y"))][1]}
+                if obj.get("graphics_id") == BOULDER_GRAPHICS and (obj.get("x"), obj.get("y")) in places else obj
+                for obj in json_map["objects"]
+            ]
+
         # Add ASCII map with reconciled NPCs ('N') and player ('P') marked.
         if json_map.get('ascii'):
             ascii_map = json_map['ascii']
@@ -1458,7 +1503,7 @@ def _format_porymap_info(
             # Stamp visible objects as markers for the LLM-facing map.
             # Uses reconciled/flag-filtered objects, so hidden/static-only
             # objects are not rendered. Item balls are shown as 'I';
-            # character/object events are shown as 'N'.
+            # character/object events are shown as 'N'; Strength boulders as 'R'.
             for obj in json_map.get("objects", []):
                 ox = obj.get("x")
                 oy = obj.get("y")
@@ -1492,7 +1537,11 @@ def _format_porymap_info(
             context_parts.append(ascii_map)
             surf = _party_can_surf()
             water = "'W' = water (your party can Surf: navigate_to and go_to cross it)" if surf else "'W' = water"
-            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = walkable (different elevation), 'N' = NPC, 'I' = item, 'O' = other object, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
+            boulder = (
+                "'R' = boulder (your party can use STRENGTH: navigate_to and go_to push it)"
+                if _party_can_push_boulders() else "'R' = boulder (STRENGTH pushes it)"
+            )
+            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = walkable (different elevation), 'N' = NPC, 'I' = item, 'O' = other object, {boulder}, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
 
             exits = _format_exits(json_map, ascii_lines, surf)
             if exits:

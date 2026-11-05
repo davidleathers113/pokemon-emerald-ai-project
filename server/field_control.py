@@ -208,6 +208,35 @@ def moved_people(reader) -> list[tuple[tuple[int, int], tuple[int, int]]]:
     return moved
 
 
+OBJ_EVENT_GFX_PUSHABLE_BOULDER = 87  # pret include/constants/event_objects.h
+
+
+def loaded_boulders(reader) -> dict[int, tuple[int, int]]:
+    """{local id: tile} of this map's Strength boulders loaded now (struct ObjectEvent +0x05
+    graphicsId, +0x08 localId, +0x10 currentCoords).
+
+    A pushed boulder's new tile lives only in its loaded object: pret never copies it to
+    the map's object templates (no OverrideTemplateCoordsForObjectEvent on a push), so a
+    boulder dropped out of view (RemoveObjectEventsOutsideView) or a map load
+    (FLAG_SYS_USE_STRENGTH is cleared too, ClearTempFieldEventData) puts it back on its
+    map-file tile. Boulders not listed here stand there (game_tools.boulder_tiles)."""
+    map_group, map_num = reader._read_current_map()
+    found = {}
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        flags = reader._read_u8(base) | (reader._read_u8(base + 1) << 8)
+        if not flags & 0x1 or flags & (1 << 13):  # inactive or invisible
+            continue
+        if reader._read_u8(base + 5) != OBJ_EVENT_GFX_PUSHABLE_BOULDER:
+            continue
+        if (reader._read_u8(base + 0x0A), reader._read_u8(base + 0x09)) != (map_group, map_num):
+            continue
+        found[reader._read_u8(base + 8)] = (
+            reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET
+        )
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Movement verdicts
 # ---------------------------------------------------------------------------

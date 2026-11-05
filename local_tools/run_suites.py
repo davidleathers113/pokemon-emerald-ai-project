@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parent.parent
 IMAGE = "emerald-harness:local"
 # Longest first (minutes, measured serially), so the pool doesn't end on one long suite.
 DOCKER_SUITES = [
-    "train_macro", "macros", "warp_routes", "rotating_gates", "movement_exits", "objective_memory", "battle_flow",
+    "train_macro", "macros", "strength", "warp_routes", "rotating_gates", "movement_exits", "objective_memory", "battle_flow",
     "battle_view",
     "use_item", "party_rule", "dialogue_agent", "dialogue_auto_advance", "phase4_agent",
     "movement_feedback", "surf", "prompt_cache", "play_endpoints", "phase4_backend", "phase23_health",
@@ -39,6 +39,27 @@ NODE_SUITES = ["play_panels"]
 TIMEOUT_S = 40 * 60
 
 
+def rom_mount() -> list:
+    """Mount the main checkout's ROM folder when this tree has no ROM.
+
+    The ROM is never committed, so a git worktree (used for builds while the live game
+    runs from the main checkout) has none: every emulator suite then failed with "No such
+    file or directory: '/app/Emerald-GBAdvance/rom.gba'". The main checkout is the parent
+    of git's common dir.
+    """
+    if (REPO / "Emerald-GBAdvance" / "rom.gba").exists():
+        return []
+    try:
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                cwd=REPO, capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    roms = Path(common).parent / "Emerald-GBAdvance"
+    if not (roms / "rom.gba").exists():
+        return []
+    return ["-v", f"{roms}:/app/Emerald-GBAdvance:ro"]
+
+
 def command(suite: str) -> list:
     if suite in NODE_SUITES:
         return ["node", str(REPO / "local_tests" / f"test_{suite}.js")]
@@ -46,7 +67,7 @@ def command(suite: str) -> list:
         return [sys.executable, str(REPO / "local_tests" / f"test_{suite}.py")]
     return [
         "docker", "run", "--rm", "--entrypoint", "/opt/venv/bin/python",
-        "-v", f"{REPO}:/app", "-w", "/app", IMAGE, f"local_tests/test_{suite}.py",
+        "-v", f"{REPO}:/app", *rom_mount(), "-w", "/app", IMAGE, f"local_tests/test_{suite}.py",
     ]
 
 
