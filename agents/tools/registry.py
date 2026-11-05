@@ -881,7 +881,8 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "Stops at until_level, when the team is weak, at a question (new move, "
             "evolution), a trainer, or after max_minutes, and reports every battle and the "
             "wild levels here. With catch, it also stops when that wild species appears (at "
-            "catch_min_level or higher) so you can catch it."
+            "catch_min_level or higher) so you can catch it. With method='fish', stand facing "
+            "water instead: it casts your best rod and battles what bites."
         ),
         "parameters": {
             "type_": "OBJECT",
@@ -908,9 +909,51 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
                         "Center (default false). Never Revive, Max Revive, Full Restore or Max Potion."
                     ),
                 },
+                "method": {
+                    "type_": "STRING",
+                    "description": (
+                        "'grass' (default): walk in the tall grass. 'fish': cast the best rod (SUPER > GOOD > "
+                        "OLD) while you stand facing water."
+                    ),
+                },
                 "reasoning": {"type_": "STRING", "description": "One short sentence: why train now."},
             },
             "required": ["trainee", "reasoning"],
+        },
+    },
+    # Asked for (2026-11-05): trainer rematches through Match Call as training. Trainer
+    # battles pay 1.5x EXP; rematch_loop runs the whole loop server-side.
+    {
+        "name": "rematch_loop",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Train on trainer rematches on one map, in one call: goes there, battles every "
+            "registered trainer who wants a rematch (REMATCH READY in the state) the way train "
+            "does (your lowest-level Pokemon leads and a teammate that wins fights for it), "
+            "then walks the rematch step counter up and leaves and re-enters the map so more "
+            "become ready, and repeats. Trainer battles pay 1.5x EXP. Heals a weak team at a "
+            "Pokemon Center. Stops at a question (new move, evolution), when the trainee "
+            "faints, on a loss, or after max_minutes, and reports each fight with the EXP gained."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "map": {"type_": "STRING", "description": "The map whose trainers to battle again, e.g. 'ROUTE 120'."},
+                "max_minutes": {"type_": "NUMBER", "description": "Time limit, default 6, at most 15."},
+                "trainee": {
+                    "type_": "STRING",
+                    "description": "The party Pokemon to level up (default 'LOWEST': always your lowest-level one).",
+                },
+                "heal_with_items": {
+                    "type_": "BOOLEAN",
+                    "description": (
+                        "Heal a weak team with the bag's Potions when they are enough, instead of at a Pokemon "
+                        "Center (default false). Never Revive, Max Revive, Full Restore or Max Potion."
+                    ),
+                },
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why rematch now."},
+            },
+            "required": ["map", "reasoning"],
         },
     },
     # -- get_walkthrough: expert scaffolds only --

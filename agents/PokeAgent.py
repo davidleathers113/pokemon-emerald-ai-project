@@ -174,6 +174,7 @@ def truncate_middle(text: Any, max_chars: int) -> Any:
 MACRO_TOOLS = (
     "heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to",
     "teach_move", "set_lead", "give_item", "use_item", "deposit_pokemon", "withdraw_pokemon", "fly_to",
+    "rematch_loop",
 )
 # Battle calls decided for one match-up (who is out on each side): they carry the
 # get_game_state battle_key the model saw. Seen live: switch_pokemon("BRELOOM"), chosen
@@ -194,6 +195,11 @@ TRAIN_FINISH_S = 90 + PRESSING_TOOL_TIMEOUT_S
 # heal_at_pokecenter walks up to ~10 maps (server HEAL_TRIP_MAX_MAPS, each a go_to_exit)
 # before it talks to the nurse.
 HEAL_TRIP_TIMEOUT_S = 600
+# rematch_loop (server REMATCH_DEFAULT_MINUTES, capped at REMATCH_MAX_MINUTES) first walks
+# to its map (a go_to, up to HEAL_TRIP_TIMEOUT_S), and its last heal trip or battle can
+# run past max_minutes like train's.
+REMATCH_DEFAULT_MINUTES = 6.0
+REMATCH_MAX_MINUTES = 15.0
 
 
 def tool_timeout_s(tool_name: str, arguments: Dict[str, Any]) -> float:
@@ -207,6 +213,13 @@ def tool_timeout_s(tool_name: str, arguments: Dict[str, Any]) -> float:
             minutes = TRAIN_DEFAULT_MINUTES
         minutes = min(minutes, TRAIN_MAX_MINUTES) if minutes > 0 else TRAIN_DEFAULT_MINUTES
         return minutes * 60 + TRAIN_FINISH_S
+    if tool_name == "rematch_loop":
+        try:
+            minutes = float(arguments.get("max_minutes") or REMATCH_DEFAULT_MINUTES)
+        except (TypeError, ValueError):
+            minutes = REMATCH_DEFAULT_MINUTES
+        minutes = min(minutes, REMATCH_MAX_MINUTES) if minutes > 0 else REMATCH_DEFAULT_MINUTES
+        return minutes * 60 + TRAIN_FINISH_S + HEAL_TRIP_TIMEOUT_S
     if tool_name in PRESSING_TOOLS:
         return PRESSING_TOOL_TIMEOUT_S
     # Initial MCP calls may need to load data from disk (memory, porymap data, etc.).

@@ -215,6 +215,30 @@ def _turbo():
         _turbo_macros -= 1
 
 
+# train(method="fish") sets this while it casts: the game loop presses A itself on the
+# frame after "Oh! A bite!" (_fishing_reel). The window is reelTimeouts[rod] frames (pret
+# Fishing_WaitForA: 30 for the SUPER ROD), half a second at normal speed and a few
+# hundredths at turbo: a macro polling RAM and queueing a press would miss it.
+_reel_fish = False
+
+
+def _fishing_reel(actions_pressed: List[str]) -> List[str]:
+    """The game loop's buttons for the next frame, with A added while train is fishing and
+    the cast waits for A (menu_state.fishing_wants_a: the bite, or a text at its pause).
+    Never while the dots print: an A then loses the cast (Fishing_ShowDots)."""
+    if not _reel_fish or env is None or "A" in actions_pressed:
+        return actions_pressed
+    from server import menu_state as ms
+
+    try:
+        with memory_lock:
+            wants = ms.fishing_wants_a(env.memory_reader)
+    except Exception as e:  # a missed bite must never stop the game loop
+        logger.debug(f"fishing step unreadable: {e}")
+        return actions_pressed
+    return list(actions_pressed) + ["A"] if wants else actions_pressed
+
+
 # Battle messages as the game loop saw them, one entry per message: (frame number, text).
 # The play-out used to sample the message window from the event loop every 30 ms; at
 # turbo speed a message that doesn't wait for A ("Go! TORCHIC!") prints and is replaced
@@ -1386,6 +1410,7 @@ def game_loop(manual_mode=False):
                 # No action to process
                 actions_pressed = []
 
+        actions_pressed = _fishing_reel(actions_pressed)
         # Step environment
         step_environment(actions_pressed)
 
@@ -7843,6 +7868,7 @@ def _train_note_faints(record: Dict[str, Any], hp_seen: Dict[int, int], party: L
 async def _train_battle(
     trainee_pid: int, wanted_partner_pid: Optional[int], deadline: float,
     catch: Optional[Tuple[str, int]] = None, rotation: Optional[List[int]] = None,
+    trainer_ok: bool = False, max_turns: int = TRAIN_MAX_TURNS,
 ) -> Tuple[Dict[str, Any], Optional[Tuple[str, str]]]:
     """Fight the wild battle in progress for the trainee: switch it out for the partner on
     its first turn (switch_pokemon), then the best move each turn (use_move, which plays
@@ -7851,6 +7877,8 @@ async def _train_battle(
     or None. With catch=(species, min level), a wild one of those at that level stops it
     before the first move, with the catch plan (_catch_plan). `rotation`: the partners of
     this call's battles so far, in order; the one that fights here is added to it.
+    trainer_ok: a trainer battle is fought the same way (rematch_loop) instead of handed
+    back; max_turns then covers the trainer's whole team.
     """
     from server import menu_state as ms
 
@@ -7865,7 +7893,7 @@ async def _train_battle(
     hp_seen = {pid: mon.current_hp for pid, mon in before.items()}
     partner_pid = None
     stop: Optional[Tuple[str, str]] = None
-    if view is not None and view["is_trainer"]:
+    if view is not None and view["is_trainer"] and not trainer_ok:
         stop = (
             "trainer_battle",
             f"a trainer battle started ({', '.join(foes)}): train only fights wild Pokémon. "
@@ -7875,8 +7903,8 @@ async def _train_battle(
         if time.monotonic() > deadline:
             stop = ("time", "the time ran out in the middle of a battle: finish it with use_move.")
             break
-        if record["turns"] >= TRAIN_MAX_TURNS:
-            stop = ("unexpected", f"the battle went on for {TRAIN_MAX_TURNS} turns: finish it yourself.")
+        if record["turns"] >= max_turns:
+            stop = ("unexpected", f"the battle went on for {max_turns} turns: finish it yourself.")
             break
         view = _read_battle_view()
         if view is not None and view["menu"] == "busy":
@@ -7891,14 +7919,17 @@ async def _train_battle(
                 _battle_report(played),
             )
             break
-        if catch is not None and record["turns"] == 0 and not record["switched"] and view is not None:
+        if record["turns"] == 0 and not record["switched"] and view is not None:
             # First decision of the battle: gBattleMons now holds this battle's Pokémon.
+            # Seen in a test (rematch_loop vs ROBERT): read at the intro, the record named
+            # the wild MARILL of the battle before as his Pokémon.
+            record["opponents"] = [f"{m['name'].upper()} Lv{m['level']}" for m in view.get("opponents") or []]
+        if catch is not None and record["turns"] == 0 and not record["switched"] and view is not None:
             found = next(
                 (f for f in view.get("opponents") or [] if str(f.get("name", "")).upper() == catch[0] and f.get("level", 0) >= catch[1]),
                 None,
             )
             if found is not None:
-                record["opponents"] = [f"{m['name'].upper()} Lv{m['level']}" for m in view.get("opponents") or []]
                 stop = ("catch_target", f"a wild {catch[0]} Lv{found['level']} appeared. " + _catch_plan(view, found))
                 break
         party = _train_party()
@@ -8180,9 +8211,39 @@ async def _train_heal_trip(origin: str) -> Tuple[bool, str]:
     return True, f"healed at {center} and came back to {origin}"
 
 
-def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, why: str) -> str:
-    """'4 wild battles (WHISMUR Lv6, …): SHROOMISH Lv7→9 (+120 EXP shared), COMBUSKEN 45→31/51. Stopped: …'"""
+async def _train_lead(trainee_pid: int, trainee_name: str, lowest: bool, notes: List[str]) -> None:
+    """The trainee leads while it trains. Seen live (2026-11-04, train("AZUMARILL") on
+    Jagged Pass, the party rule's lowest-level NUMEL leading): each battle switched
+    AZUMARILL in, the foe hit it for free on the switch (82→65→50→32 HP over three
+    battles, the "team is weak" stop), and the lead that started took a third of the
+    EXP. Not when it holds the Exp. Share: then it earns from the bench. With LOWEST
+    the party rule itself (maintain_party) does it, the Exp. Share included. What was
+    changed goes into `notes`."""
+    from server import menu_state as ms
+
+    if lowest:
+        kept = await maintain_party({"training": True})
+        if kept.get("changed"):
+            notes.append(kept["summary"].rstrip("."))
+        return
+    party = _train_party()
+    at = next((i for i, (pid, _) in enumerate(party) if pid == trainee_pid), None)
+    if at not in (None, 0) and party[at][1].held_item != ms.ITEM_EXP_SHARE:
+        led = await mcp_set_lead({"pokemon": str(at + 1), "reasoning": f"train: {trainee_name} fights first"})
+        if led.get("success"):
+            notes.append(f"made {trainee_name} the lead so it starts each battle")
+        else:
+            logger.info(f"🏋️ train: set_lead {trainee_name} failed: {led.get('error') or led.get('summary')}")
+
+
+def _train_summary(
+    battles: List[Dict[str, Any]], steps: int, elapsed: float, why: str, casts: Optional[int] = None
+) -> str:
+    """'4 wild battles (WHISMUR Lv6, …): SHROOMISH Lv7→9 (+120 EXP shared), COMBUSKEN 45→31/51. Stopped: …'
+    `casts`: train fished (method="fish") and cast the rod this many times."""
     if not battles:
+        if casts is not None:
+            return f"No wild battle in {elapsed:.0f} s ({casts} casts, nothing hooked). Stopped: {why}"
         return f"No wild battle in {elapsed:.0f} s ({steps} steps in the grass). Stopped: {why}"
     names = [b["opponents"][0] if b["opponents"] else "?" for b in battles]
     shown = ", ".join(names[:6]) + (", …" if len(names) > 6 else "")
@@ -8223,6 +8284,176 @@ def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, wh
     if faints:
         text += ". Fainted: " + "; ".join(faints)
     return f"{text}. Stopped: {why}"
+
+
+# train(method=...): "grass" walks the encounter tiles, "fish" casts the best rod.
+TRAIN_METHODS = ("grass", "fish")
+# train(method="fish"): casts in a row with nothing hooked before train hands back. Each
+# round bites half the time (pret Fishing_CheckForBite: Random() & 1) and the SUPER ROD
+# wants up to six rounds in a row (Fishing_GetRodOut: 1 + Random() % 6), so a long run
+# of empty casts means something else is wrong.
+TRAIN_MAX_QUIET_CASTS = 40
+# From USE on the rod to the end of a cast: the bag's fade, the rod out (60 frames), up
+# to ten dots of 20 frames a round for up to six rounds, the bite and its text.
+FISHING_CAST_FRAMES = 3600
+# Frames for the cast to begin after USE (the bag fades out first), or for the bag to
+# answer with Dad's advice instead (pret ItemUseOutOfBattle_Rod when CanFish fails).
+FISHING_START_FRAMES = 600
+# What the player can fish into (pret MetatileBehavior_IsSurfableFishableWater).
+FISHABLE_BEHAVIORS = frozenset({
+    "POND_WATER", "OCEAN_WATER", "INTERIOR_DEEP_WATER", "DEEP_WATER", "SOOTOPOLIS_DEEP_WATER",
+    "EASTWARD_CURRENT", "WESTWARD_CURRENT", "NORTHWARD_CURRENT", "SOUTHWARD_CURRENT",
+})
+# pret ELEVATION_DEFAULT: IsPlayerFacingSurfableFishableWater wants the player on foot at
+# it, facing water one elevation down (COLLISION_ELEVATION_MISMATCH).
+SHORE_ELEVATION = 3
+
+
+def _front_tile(reader) -> Optional[Tuple[str, int]]:
+    """(behavior name, collision) of the tile the player faces, live from the map grid in
+    RAM (gBackupMapLayout, MAP_OFFSET tiles of border), or None when it can't be read."""
+    from server.field_control import DIRECTION_DELTAS, MAP_OFFSET, read_field_snapshot
+
+    snap = read_field_snapshot(reader)
+    if snap is None or snap.facing not in DIRECTION_DELTAS:
+        return None
+    dx, dy = DIRECTION_DELTAS[snap.facing]
+    if not reader._map_buffer_addr and not reader._find_map_buffer_addresses():
+        return None
+    tiles = reader.read_map_metatiles(snap.x + dx + MAP_OFFSET, snap.y + dy + MAP_OFFSET, 1, 1)
+    if not tiles or not tiles[0]:
+        return None
+    _, behavior, collision, _ = tiles[0][0]
+    return getattr(behavior, "name", str(behavior)), int(collision)
+
+
+def _fishing_setup() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """({"rod": item id, "rod_index": 0-2, "rod_name", "area": the WildArea it hooks here,
+    "spot": (map id, x, y, facing, surfing)}, None), or (None, why train can't fish here).
+
+    The best rod in the bag's KEY ITEMS (SUPER > GOOD > OLD: the gItems secondaryId
+    StartFishing gets), the map's fishing slots for it (the ROM's gWildMonHeaders
+    fishingMonsInfo, pret ChooseWildMonIndex_Fishing), and the player facing water the
+    way pret CanFish checks it: on foot, at ELEVATION_DEFAULT facing fishable water; on
+    the water, fishable water with no collision ahead."""
+    from server import game_tools
+    from server import menu_state as ms
+    from server.field_control import player_elevation, player_surfing, read_field_snapshot
+    from utils.mapping.porymap_state import decomp_map_at
+
+    with memory_lock:
+        reader = env.memory_reader
+        rods = [
+            (index, item_id)
+            for item_id in ms.bag_pocket_item_ids(reader, ms.KEY_ITEMS_POCKET)
+            if (index := ms.rod_index(reader, item_id)) is not None
+        ]
+        game_tools.wild_table(reader)
+        found = decomp_map_at(*reader._read_current_map())
+        snap = read_field_snapshot(reader)
+        surfing = player_surfing(reader)
+        elevation = player_elevation(reader)
+        front = _front_tile(reader)
+    if not rods:
+        return None, (
+            "train(method=\"fish\") needs a fishing rod (OLD ROD, GOOD ROD or SUPER ROD) in the bag's KEY ITEMS, "
+            "and there is none."
+        )
+    rod_index, rod = max(rods)
+    rod_name = _item_name(rod)
+    location = _location_name()
+    area = game_tools.fishing_wild(found[0], rod_index) if found is not None else None
+    if area is None:
+        return None, f"Nothing can be fished on {location} (its wild table has no fishing Pokémon)."
+    where = _position_text(snap) if snap is not None else location
+    behavior, collision = front if front is not None else ("unreadable", -1)
+    facing_water = behavior in FISHABLE_BEHAVIORS and (
+        collision == 0 if surfing else elevation == SHORE_ELEVATION
+    )
+    if snap is None or not facing_water:
+        facing = snap.facing if snap is not None else "?"
+        return None, (
+            f"Not facing water: the player at {where} faces {facing} onto {behavior.replace('_', ' ').lower()}. "
+            "Stand at the shore facing the water (or on the water while surfing), then call "
+            "train(method=\"fish\") again."
+        )
+    return {
+        "rod": rod,
+        "rod_index": rod_index,
+        "rod_name": rod_name,
+        "area": area,
+        "spot": (snap.map_id, snap.x, snap.y, snap.facing, surfing),
+    }, None
+
+
+async def _fish_cast(rod: int, source: str) -> Tuple[str, str]:
+    """One cast: USE on the rod from the bag, then the game loop reels in at "Oh! A bite!"
+    (_reel_fish). Returns ("battle", "") once a wild battle has begun, ("no_bite" or
+    "got_away", "") when the cast ended on the map, or ("error", why)."""
+    global _reel_fish
+    from server import menu_state as ms
+
+    def fishing() -> bool:
+        return _mem(ms.fishing_step) is not None
+
+    def in_battle() -> bool:
+        return bool(_mem(lambda r: r.is_in_battle()))
+
+    _reel_fish = True
+    try:
+        error = await _choose_use_in_bag(rod, source, ms.KEY_ITEMS_POCKET)
+        if error:
+            return "error", error
+        if not await _await_game(lambda: fishing() or in_battle(), FISHING_START_FRAMES):
+            # Dad's advice in the bag ("There's a time and place for everything…"): the
+            # game's own CanFish said no.
+            said = _quote([_mem(read_field_text)])
+            closed = await _close_field_menus(source)
+            return "error", (
+                f"USE on the {_item_name(rod)} started no cast{f' (the game said {said})' if said else ''}."
+                + ("" if closed else " Could not close every menu: look at the screen.")
+            )
+        steps_seen = set()
+
+        def cast_over() -> bool:
+            step = _mem(ms.fishing_step)
+            if step is not None:
+                steps_seen.add(step)
+            return in_battle() or (step is None and _player_can_walk())
+
+        if not await _await_game(cast_over, FISHING_CAST_FRAMES):
+            return "error", f"the cast did not end in time{_screen_note()}"
+    finally:
+        _reel_fish = False
+    if in_battle():
+        return "battle", ""
+    return ("got_away" if ms.FISHING_STEP_GOT_AWAY in steps_seen else "no_bite"), ""
+
+
+async def _back_to_fishing_spot(spot: Tuple[Any, int, int, str, bool]) -> Optional[str]:
+    """After a heal trip: walk back to the tile train fished from and face the water.
+    None when there, else why not. A spot on the water (surfing) is not walked back to."""
+    from server import game_tools
+
+    map_id, x, y, facing, surfing = spot
+    if surfing:
+        return f"train fished from the water at ({x},{y}): Surf back there and call train(method=\"fish\") again."
+    with memory_lock:
+        _, offset, _ = game_tools.load_pathfinding_state(env)
+    ox, oy = offset or (0, 0)
+    snap = _field_snapshot()
+    if snap is None or snap.map_id != map_id:
+        return f"not back on the map train fished on ({_position_text(snap)})"
+    if (snap.x, snap.y) != (x, y):
+        walk = await mcp_navigate_to({
+            "x": x - ox, "y": y - oy, "variance": "none", "reason": "train: back to the fishing spot", "consider_npcs": True,
+        })
+        snap = _field_snapshot()
+        if snap is None or (snap.x, snap.y) != (x, y):
+            return f"did not get back to the fishing spot ({x},{y}): {walk.get('summary') or walk.get('error')}"
+    if snap.facing != facing:
+        await _macro_press([facing], "train")  # the water's elevation stops the step: this only turns
+    return None
 
 
 @app.post("/mcp/train")
@@ -8304,6 +8535,10 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     # The bag's Potions only when asked (never its TRAIN_RARE_MEDICINE): otherwise a weak
     # team heals at a Pokémon Center.
     heal_with_items = _request_flag(request.get("heal_with_items"))
+    method = str(request.get("method") or TRAIN_METHODS[0]).strip().lower()
+    if method not in TRAIN_METHODS:
+        return _refusal(f"method must be one of {', '.join(TRAIN_METHODS)}, not {request.get('method')!r}.")
+    fishing: Optional[Dict[str, Any]] = None
 
     party = _train_party()
     listing = ", ".join(f"{i + 1}. {_mon_text(mon)}" for i, (_, mon) in enumerate(party))
@@ -8338,15 +8573,20 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
 
     in_battle = _mem(lambda r: r.is_in_battle())
     spots = None
+
+    def _spots():
+        with memory_lock:
+            return game_tools.wild_encounter_spots(env)
+
     if not in_battle:
         refused = _field_refusal(source)
         if refused:
             return refused
-
-        def _spots():
-            with memory_lock:
-                return game_tools.wild_encounter_spots(env)
-
+    if not in_battle and method == "fish":
+        fishing, why = _fishing_setup()
+        if fishing is None:
+            return _refusal(why, stopped_because="no_fishing")
+    elif not in_battle:
         spots = await run_in_threadpool(_spots)
         if not spots["pairs"]:
             snap = _field_snapshot()
@@ -8392,9 +8632,14 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
         trips += 1
         heal_notes.append(note)
         party = _train_party()
-        spots = await run_in_threadpool(_spots)
-        if not spots["pairs"]:
-            return _refusal(f"{note}, but no tall grass can be walked to from here now.", stopped_because="no_grass")
+        if fishing is not None:
+            missed = await _back_to_fishing_spot(fishing["spot"])
+            if missed:
+                return _refusal(f"{note}, but {missed}", stopped_because="no_fishing")
+        else:
+            spots = await run_in_threadpool(_spots)
+            if not spots["pairs"]:
+                return _refusal(f"{note}, but no tall grass can be walked to from here now.", stopped_because="no_grass")
         partner_index = _train_partner(party, trainee_pid, partner_pid)
         weak = _train_weakness(partner_index, trainee_pid, partner_pid)
     if weak:
@@ -8409,29 +8654,8 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             stopped_because="no_partner",
         )
 
-    async def lead_with_trainee() -> None:
-        """The trainee leads while it trains. Seen live (2026-11-04, train("AZUMARILL") on
-        Jagged Pass, the party rule's lowest-level NUMEL leading): each battle switched
-        AZUMARILL in, the foe hit it for free on the switch (82→65→50→32 HP over three
-        battles, the "team is weak" stop), and the lead that started took a third of the
-        EXP. Not when it holds the Exp. Share: then it earns from the bench. With LOWEST
-        the party rule itself (maintain_party) does it, the Exp. Share included."""
-        if lowest:
-            kept = await maintain_party({"training": True})
-            if kept.get("changed"):
-                heal_notes.append(kept["summary"].rstrip("."))
-            return
-        party = _train_party()
-        at = next((i for i, (pid, _) in enumerate(party) if pid == trainee_pid), None)
-        if at not in (None, 0) and party[at][1].held_item != ms.ITEM_EXP_SHARE:
-            led = await mcp_set_lead({"pokemon": str(at + 1), "reasoning": f"train: {trainee_name} fights first"})
-            if led.get("success"):
-                heal_notes.append(f"made {trainee_name} the lead so it starts each battle")
-            else:
-                logger.info(f"🏋️ train: set_lead {trainee_name} failed: {led.get('error') or led.get('summary')}")
-
     if not in_battle:
-        await lead_with_trainee()
+        await _train_lead(trainee_pid, trainee_name, lowest, heal_notes)
     new_trainee = False  # LOWEST: another Pokémon became the lowest; it leads before the next battle
     logger.info(f"🏋️ train {trainee_name} until_level={until_level} max_minutes={minutes:g} partner={partner_pid}")
     started = time.monotonic()
@@ -8441,6 +8665,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     stop: Optional[Tuple[str, str]] = None
     steps = stuck = pair_index = 0
     quiet_steps = texts_read = 0
+    casts = quiet_casts = 0
     last_walk = ""
     while stop is None:
         if _mem(lambda r: r.is_in_battle()):
@@ -8455,7 +8680,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                 trainee_pid, partner_pid, deadline + TRAIN_FINISH_BATTLE_S, catch, rotation
             )
             battles.append(record)
-            quiet_steps = 0
+            quiet_steps = quiet_casts = 0
             if lowest:
                 party = _train_party()
                 pick = _party_rule_target([mon for _, mon in party])
@@ -8483,6 +8708,9 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                     trips += 1
                     heal_notes.append(note)
                     stop, spots, pair_index, stuck = None, None, 0, 0  # find the grass again
+                    missed = await _back_to_fishing_spot(fishing["spot"]) if fishing is not None else None
+                    if missed:
+                        stop = ("no_fishing", f"{note}, but {missed}")
                 else:
                     stop = ("team_weak", f"{stop[1]} {note}")
             continue
@@ -8513,7 +8741,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             break
         if new_trainee:
             new_trainee = False
-            await lead_with_trainee()
+            await _train_lead(trainee_pid, trainee_name, lowest, heal_notes)
             continue  # the menus moved nothing on the map, but read it again
         # Only once nothing is starting: seen in a test, the last step before the deadline
         # began an encounter whose intro wasn't yet "in battle", and train handed back
@@ -8521,15 +8749,26 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
         if time.monotonic() > deadline:
             stop = ("time", f"the {minutes:g}-minute limit is up (call train again to keep going).")
             break
+        if method == "fish":
+            if fishing is None:  # called in a battle: the rod and the water are checked now
+                fishing, why = _fishing_setup()
+                if fishing is None:
+                    stop = ("no_fishing", why)
+                    break
+            result, why = await _fish_cast(fishing["rod"], source)
+            casts += 1
+            if result == "error":
+                stop = ("unexpected", why)
+            elif result != "battle":
+                # "Not even a nibble…" or "It got away…": cast again.
+                quiet_casts += 1
+                if quiet_casts >= TRAIN_MAX_QUIET_CASTS:
+                    stop = ("no_encounters", f"nothing was hooked in {quiet_casts} casts here.")
+            continue
         if spots is None or spots.get("map_id", snap.map_id) != snap.map_id:
             if spots is not None:
                 stop = ("unexpected", f"the player ended up on another map ({_position_text(snap)}).")
                 break
-
-            def _spots():
-                with memory_lock:
-                    return game_tools.wild_encounter_spots(env)
-
             spots = await run_in_threadpool(_spots)
             if not spots["pairs"]:
                 stop = ("no_grass", f"no tall grass here ({_location_name()}) to keep training in.")
@@ -8577,7 +8816,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
 
     code, why = stop
     elapsed = time.monotonic() - started
-    summary = _train_summary(battles, steps, elapsed, why)
+    summary = _train_summary(battles, steps, elapsed, why, casts if method == "fish" else None)
     if lowest:
         # Several Pokémon may have been trained: each one's level change, by the party.
         grew = [
@@ -8588,6 +8827,8 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     if spots is not None and spots.get("land") is not None:
         # The map's levels (gWildMonHeaders), to judge the place against the trainee's.
         summary += f" Wild Pokémon here: {spots['land'].levels}."
+    if fishing is not None:
+        summary += f" {casts} casts with the {fishing['rod_name']}; it hooks {fishing['area'].levels} here."
     if heal_notes:
         summary = f"On the way: {'; '.join(heal_notes)}. {summary}"
     logger.info(f"🏋️ train: {summary}")
@@ -8598,6 +8839,509 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
         "battles": battles,
         "stopped_because": code,
         "steps": steps,
+        **({"casts": casts} if method == "fish" else {}),
+        "elapsed_s": round(elapsed, 1),
+    }
+
+
+# -- rematch_loop: Match Call rematches -------------------------------------
+#
+# Asked for (2026-11-05): train through trainer rematches. Trainer battles pay 1.5x EXP
+# (pret Cmd_getexp: every BATTLE_TYPE_TRAINER battle, rematch or not), and the live team
+# (6 badges) had 24 registered trainers, 10 of them waiting for a rematch, with nothing
+# in the state saying so. server/rematch.py reads who is registered and ready, and where.
+
+REMATCH_DEFAULT_MINUTES = 6.0
+REMATCH_MAX_MINUTES = 15.0
+# A trainer brings up to six Pokémon (pret struct Trainer partySize): their battle may
+# run TRAIN_MAX_TURNS turns for each before rematch_loop hands it back.
+REMATCH_MAX_TURNS = 6 * TRAIN_MAX_TURNS
+# Map loads in a row with the counter at 255 and nobody on the map ready before the loop
+# hands back. Each rolls 31% per registered trainer there (pret UpdateRandomTrainerRematches):
+# with one trainer, 20 misses in a row happen 0.06% of the time (0.69^20).
+REMATCH_MAX_REENTRIES = 20
+# Pokémon Center trips one call may make (train makes one: TRAIN_MAX_HEALS); each
+# follows a fight that left the team weak, and a loop of several fights needs more.
+REMATCH_MAX_HEALS = 3
+# Ways out of the map tried, nearest first, before re-entering it is given up.
+REMATCH_EXIT_TRIES = 4
+
+
+def _rematch_map(target: str) -> Optional[Tuple[str, str]]:
+    """(map dir, name) of the map a rematch_loop argument names: "ROUTE 120", "Route120"
+    and "route 120" all name Route120."""
+    from server import game_tools
+    from server import menu_state as ms
+
+    key = ms.name_key(target)
+    for name, map_dir in game_tools._map_dirs_by_name().items():
+        if key in (ms.name_key(name), ms.name_key(map_dir)):
+            return map_dir, name
+    return None
+
+
+def _map_dir_here() -> str:
+    from utils.mapping.porymap_state import decomp_map_at
+
+    found = _mem(lambda r: decomp_map_at(*r._read_current_map()))
+    return found[0] if found is not None else ""
+
+
+def _party_exp() -> Dict[int, Tuple[str, int, int]]:
+    """{personality: (species, level, EXP)} of the party now."""
+    return {pid: (mon.species_name.upper(), mon.level, mon.experience or 0) for pid, mon in _train_party()}
+
+
+def _exp_text(before: Dict[int, Tuple[str, int, int]], after: Dict[int, Tuple[str, int, int]]) -> str:
+    """'BLAZIKEN +812 EXP, MANECTRIC Lv47→48 (+1530 EXP)': who gained what."""
+    parts = []
+    for pid, (name, level, exp) in after.items():
+        if pid not in before:
+            continue
+        _, level0, exp0 = before[pid]
+        if exp != exp0 or level != level0:
+            grew = f" Lv{level0}→{level}" if level != level0 else ""
+            parts.append(f"{name}{grew} (+{exp - exp0} EXP)")
+    return ", ".join(parts) or "no EXP"
+
+
+async def _rematch_fight(
+    trainee_pid: int, partner_pid: Optional[int], deadline: float, rotation: List[int]
+) -> Tuple[Dict[str, Any], Optional[Tuple[str, str]]]:
+    """The battle in progress, fought the way train fights (_train_battle, trainer_ok),
+    with who it was against, the rematch team's tier, and the EXP each Pokémon gained."""
+    from server import rematch
+
+    view = _read_battle_view() or {}
+    is_trainer = bool(view.get("is_trainer"))
+    trainer_id, name = _mem(rematch.battle_opponent) if is_trainer else (0, "")
+    entry = _mem(rematch.entry_for_trainer, trainer_id) if is_trainer else None
+    before = _party_exp()
+    record, stop = await _train_battle(
+        trainee_pid, partner_pid, deadline, rotation=rotation, trainer_ok=True, max_turns=REMATCH_MAX_TURNS
+    )
+    after = _party_exp()
+    tier = entry.trainer_ids.index(trainer_id) if entry is not None else None
+    record.update({
+        "trainer": name if is_trainer else f"wild {record['opponents'][0] if record['opponents'] else '?'}",
+        "trainer_id": trainer_id,
+        "rematch_tier": tier,
+        "exp": _exp_text(before, after),
+        "party_exp_gained": sum(after[p][2] - before[p][2] for p in after if p in before),
+    })
+    return record, stop
+
+
+def _fight_text(record: Dict[str, Any]) -> str:
+    """'ROBERT (rematch 1): won; BLAZIKEN +812 EXP; fainted: …'"""
+    tier = record.get("rematch_tier")
+    who = record["trainer"] + (f" (rematch {tier})" if tier else " (first battle)" if tier == 0 else "")
+    text = f"{who}: {record.get('outcome', '?')}; {record.get('exp', 'no EXP')}"
+    if record.get("fainted"):
+        text += "; fainted: " + ", ".join(record["fainted"])
+    return text
+
+
+async def _rematch_heal(
+    trainee_pid: int, heal_with_items: bool, origin: str, trip_ok: bool
+) -> Tuple[Optional[str], List[str], bool]:
+    """When the team is weak (train's _train_weakness, with the partner train would pick):
+    the bag's medicine if heal_with_items and it is enough (_train_bag_heals_enough; never
+    TRAIN_RARE_MEDICINE), else a Pokémon Center trip and back to `origin` (_train_heal_trip)
+    when trip_ok. Returns (why the team is still weak, or None; notes; whether a trip was made)."""
+    notes: List[str] = []
+
+    def weakness() -> Tuple[Optional[int], List[str]]:
+        party = _train_party()
+        partner = _train_partner(party, trainee_pid, None)
+        return partner, _train_weakness(partner, trainee_pid)
+
+    partner, weak = weakness()
+    if not weak:
+        return None, notes, False
+    if heal_with_items and _train_bag_heals_enough(partner, trainee_pid, None):
+        note = await _train_heal_from_bag()
+        if note:
+            notes.append(note)
+        partner, weak = weakness()
+        if not weak:
+            return None, notes, False
+    if not trip_ok:
+        return f"the team is weak ({', '.join(weak)}) and {REMATCH_MAX_HEALS} heal trips were made already. {_heal_way()}", notes, False
+    ok, note = await _train_heal_trip(origin)
+    notes.append(note)
+    if not ok:
+        return f"the team is weak ({', '.join(weak)}); {note}", notes, True
+    partner, weak = weakness()
+    return (f"the team is still weak after healing ({', '.join(weak)})" if weak else None), notes, True
+
+
+async def _rematch_pace(need: int, source: str, deadline: float) -> Tuple[int, Optional[str]]:
+    """Step back and forth between two plain tiles (game_tools.pacing_spots: no wild
+    Pokémon there) until `need` steps are walked: every step on foot counts the rematch
+    step counter up (pret IncrementRematchStepCounter). Returns (steps walked, why it
+    could not walk), with no why when done, at the deadline (time.monotonic()), or when a
+    battle or text stopped it (the caller deals with those). Seen in a test: 213 steps
+    walked past a 1-minute limit before the deadline was checked here."""
+    from server import game_tools
+    from server.field_control import DIRECTION_DELTAS
+
+    def _spots():
+        with memory_lock:
+            return game_tools.pacing_spots(env)
+
+    def interrupted() -> bool:
+        snap = _field_snapshot()
+        return snap is None or not snap.field_free or bool(_mem(lambda r: r.is_in_battle()))
+
+    spots = await run_in_threadpool(_spots)
+    if not spots["pairs"]:
+        return 0, f"no two plain tiles side by side to walk on near {_position_text(_field_snapshot())}"
+    ox, oy = spots["coord_offset"] or (0, 0)
+    steps = 0
+    last = ""
+    for a, b in spots["pairs"]:
+        snap = _field_snapshot()
+        here = (snap.x - ox, snap.y - oy)
+        if here not in (a, b):
+            walk = await mcp_navigate_to({
+                "x": a[0], "y": a[1], "variance": "none", "reason": f"{source}: a spot to walk the step counter up",
+                "consider_npcs": True,
+            })
+            if interrupted():
+                return steps, None
+            snap = _field_snapshot()
+            here = (snap.x - ox, snap.y - oy)
+            if here not in (a, b):
+                last = walk.get("summary") or walk.get("error") or ""
+                continue
+        stuck = 0
+        while steps < need and stuck < TRAIN_MAX_STUCK:
+            if time.monotonic() > deadline:
+                return steps, None
+            target = b if here == a else a
+            button = next(k for k, (dx, dy) in DIRECTION_DELTAS.items() if (here[0] + dx, here[1] + dy) == target)
+            queued = await take_action(ActionRequest(buttons=[button], source=source, check_movement=True))
+            await _await_sequence(queued.get("sequence_id"), _sequence_frames(1))
+            if interrupted():
+                return steps, None
+            after = _field_snapshot()
+            if (after.x - ox, after.y - oy) == target:
+                steps, here, stuck = steps + 1, target, 0
+            else:
+                stuck += 1  # someone stepped onto it: give them a moment
+                await _await_game(lambda: False, 30)
+        if steps >= need:
+            return steps, None
+    return steps, "could not walk the step counter up: every spot was blocked" + (f" ({last})" if last else "")
+
+
+async def _rematch_reenter(map_dir: str, map_name: str, state, blocked: set) -> Optional[str]:
+    """Leave the map by its nearest way out and come back: each map load rolls the
+    rematches of that map's registered trainers once the counter is at 255 (pret
+    TryUpdateRandomTrainerRematches, from LoadMapFromCameraTransition and
+    mli0_load_map). A way out to a map with registered trainers who aren't ready comes
+    last: their roll there would use the counter up (it goes back to 0 when one of them
+    becomes ready). `blocked`: go_to_exit arguments that failed earlier in this call,
+    skipped (and added to). None once back, or when a battle or text stopped the walk
+    (the caller deals with it and walks back); else why not."""
+    from server import game_tools
+
+    snap = _field_snapshot()
+    areas = await run_in_threadpool(game_tools._route_areas, map_dir)
+    mine = game_tools._areas_at(map_dir, snap.x, snap.y, areas)
+    exits = await run_in_threadpool(game_tools._walk_exits, map_dir)
+    options = [(arg, dest) for area, arg, dest, _, _ in exits if area in mine]
+    if not options:
+        return f"no way off {map_name} from {_position_text(snap)} to come back through"
+    waiting = {t.entry.map_dir for t in state.trainers if t.registered and t.entry.rolls and not t.ready and not t.forbidden}
+    ranked = sorted(
+        dict.fromkeys(options),
+        key=lambda o: (o[1] in waiting, game_tools._exit_distance(map_dir, (snap.x, snap.y), o[0]), o[0]),
+    )
+
+    def stopped() -> bool:
+        return bool(_mem(lambda r: r.is_in_battle())) or not _player_can_walk()
+
+    # The map file doesn't know every blocker: seen in a test, ROUTE 120's nearest way out
+    # (the SCORCHED SLAB door) is past the tile an invisible KECLEON stands on, and
+    # go_to_exit stopped at it. The next way out is tried then.
+    tried = []
+    for arg, _ in [o for o in ranked if o[0] not in blocked][:REMATCH_EXIT_TRIES]:
+        out = await mcp_go_to_exit({"exit": arg, "reasoning": f"rematch_loop: leave {map_name} to roll the rematches"})
+        if stopped():
+            return None
+        if _map_dir_here() != map_dir:
+            break
+        blocked.add(arg)  # not tried again this call
+        tried.append(f"go_to_exit(\"{arg}\"): {out.get('error') or out.get('summary')}")
+    else:
+        return f"could not leave {map_name} to come back: " + "; ".join(tried)
+    back = await mcp_go_to({"place": map_name, "reasoning": f"rematch_loop: back onto {map_name}"})
+    if stopped():
+        return None
+    if not back.get("success"):
+        return f"did not come back onto {map_name}: {back.get('error') or back.get('summary')}"
+    return None
+
+
+@app.post("/mcp/rematch_loop")
+async def mcp_rematch_loop(request: dict = None):
+    """MCP Tool: train on Match Call rematches on one map until max_minutes.
+
+    On the map (go_to there first) it fights each registered trainer who wants a rematch
+    (server/rematch.py, read from RAM) by talking to them (talk_to), the way train fights
+    (_train_battle with trainer_ok: the lowest-level Pokémon leads by the party rule and
+    switches out on turn 1 for a teammate that wins, the Exp. Share on the weakest).
+    With nobody ready, it walks the step counter up to 255 on plain tiles of that map
+    (game_tools.pacing_spots), then leaves the map and comes back: that map load rolls
+    31% for each registered trainer there (pret UpdateRandomTrainerRematches). Rematch
+    teams rise with each win and the last one repeats (GetRematchTrainerIdFromTable). A
+    weak team heals at a Pokémon Center with train's rules (the bag only with
+    heal_with_items, never TRAIN_RARE_MEDICINE). It stops on a question (a new move, an
+    evolution), on the trainee fainting, on a lost battle, and at max_minutes, and
+    reports each loop: steps walked, map re-entries, who was fought, the result, the EXP
+    and levels gained, and faints. Double-battle rematches are left to the model.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    if game_type != "emerald":
+        return {"success": False, "error": "rematch_loop is only implemented for Emerald"}
+    global _train_running
+    _train_running = True  # the step hook (harness_step) stays out of these battles too
+    try:
+        with _turbo():
+            return await _rematch_loop(request or {})
+    except Exception as e:
+        logger.error(f"Error in rematch_loop: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+    finally:
+        _train_running = False
+
+
+async def _rematch_loop(request: Dict[str, Any]) -> Dict[str, Any]:
+    from server import menu_state as ms
+    from server import rematch
+
+    source = "rematch_loop"
+    target = str(request.get("map") or request.get("place") or "").strip()
+    if not target:
+        return _refusal('map is required: the map whose registered trainers to battle again, e.g. "ROUTE 120".')
+    found = _rematch_map(target)
+    if found is None:
+        return _refusal(f'Unknown map "{target}": name it as the state does, e.g. "ROUTE 120".')
+    map_dir, map_name = found
+    try:
+        minutes = float(request.get("max_minutes") or REMATCH_DEFAULT_MINUTES)
+    except (TypeError, ValueError):
+        return _refusal(f"max_minutes must be a number of minutes, not {request.get('max_minutes')!r}.")
+    minutes = min(minutes, REMATCH_MAX_MINUTES) if minutes > 0 else REMATCH_DEFAULT_MINUTES
+    heal_with_items = _request_flag(request.get("heal_with_items"))
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+
+    state = _mem(rematch.read_rematches)
+    if not state.has_match_call:
+        return _refusal("You have no Match Call yet (the POKéNAV's): no trainer is registered for rematches.",
+                        stopped_because="no_rematches")
+    here = [t for t in state.on_map(map_dir) if t.entry.rolls]
+    if not here:
+        maps = sorted({t.entry.map_name for t in state.trainers if t.registered and t.entry.rolls and not t.forbidden})
+        return _refusal(
+            f"No trainer on {map_name} battles again (the ROM's rematch table). Maps with registered trainers: "
+            f"{', '.join(maps) or 'none'}. {rematch.ready_line(state)}".strip(),
+            stopped_because="no_rematches",
+        )
+    fightable = [t for t in here if (t.registered or t.ready) and not t.entry.double and t.entry.spots]
+    if not fightable:
+        doubles = [t.entry.name for t in here if (t.registered or t.ready) and t.entry.double]
+        why = f"No registered trainer on {map_name} that rematch_loop can fight."
+        if doubles:
+            why += f" {', '.join(doubles)}: a double battle; talk_to them and fight it with use_move."
+        return _refusal(f"{why} {rematch.registration_hint(state, map_dir)}".strip(), stopped_because="not_registered")
+    if not state.counting and not any(t.ready for t in fightable):
+        return _refusal(
+            f"Nobody on {map_name} wants a rematch, and the step counter only counts with {rematch.MIN_BADGES} "
+            f"badges (you have {state.badges}; pret IncrementRematchStepCounter).",
+            stopped_because="no_rematches",
+        )
+
+    party = _train_party()
+    listing = ", ".join(f"{i + 1}. {_mon_text(mon)}" for i, (_, mon) in enumerate(party))
+    wanted = request.get("trainee") or TRAIN_LOWEST
+    # The party rule by default (David, 2026-11-04): the lowest-level Pokémon able to
+    # battle leads and is the one trained, picked again after every battle.
+    lowest = ms.name_key(wanted) == TRAIN_LOWEST
+    index = _party_rule_target([mon for _, mon in party]) if lowest else _train_member(party, wanted)
+    if index is None:
+        return _refusal(f"{wanted} is not in your party, or nobody can battle. Your party: {listing}.")
+    trainee_pid, trainee_name = party[index][0], party[index][1].species_name.upper()
+    levels_before = {pid: (mon.species_name.upper(), mon.level) for pid, mon in party}
+
+    notes: List[str] = []
+    if _map_dir_here() != map_dir:
+        went = await mcp_go_to({"place": map_name, "reasoning": f"{source}: to the trainers"})
+        if not went.get("success"):
+            return _refusal(f"Did not get to {map_name}: {went.get('error') or went.get('summary')}",
+                            stopped_because="unexpected")
+        notes.append(f"went to {map_name}")
+
+    started = time.monotonic()
+    deadline = started + minutes * 60
+    loops: List[Dict[str, Any]] = []
+
+    def new_loop() -> Dict[str, Any]:
+        return {"steps": 0, "reentries": 0, "fights": [], "notes": []}
+
+    current = new_loop()
+    rotation: List[int] = []
+    stop: Optional[Tuple[str, str]] = None
+    skipped: set = set()  # trainers a talk didn't start a battle with, this call
+    blocked_exits: set = set()  # ways out go_to_exit couldn't take (_rematch_reenter)
+    heals = quiet_reentries = texts_read = 0
+    new_lead = True
+    while stop is None:
+        if _mem(lambda r: r.is_in_battle()):
+            if lowest:
+                pick = _party_rule_target([mon for _, mon in _train_party()])
+                if pick is not None:
+                    party = _train_party()
+                    trainee_pid, trainee_name = party[pick][0], party[pick][1].species_name.upper()
+            record, stop = await _rematch_fight(trainee_pid, None, deadline + TRAIN_FINISH_BATTLE_S, rotation)
+            current["fights"].append(record)
+            quiet_reentries = 0
+            trainee = dict(_train_party()).get(trainee_pid)
+            if stop is None and record.get("outcome") == "lost":
+                stop = ("lost", f"lost to {record['trainer']}.")
+            elif stop is None and trainee is not None and trainee.current_hp == 0:
+                stop = ("trainee_fainted", f"{trainee_name} fainted against {record['trainer']}: heal it before more rematches.")
+            new_lead = lowest
+            continue
+        snap = _field_snapshot()
+        if snap is None:
+            stop = ("unexpected", "the player's position could not be read.")
+            break
+        if not snap.field_free:
+            # The trainer's words after the battle, a Match Call, a sign: read through, as
+            # train does. Questions and menus stop the loop.
+            from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+
+            if texts_read < TRAIN_MAX_TEXT_READS * 4 and (
+                _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY) or _mem(ms.phone_call_active)
+            ):
+                texts_read += 1
+                await _read_dialogue()
+                continue
+            if await _await_game(lambda: _mem(lambda r: r.is_in_battle()) or _player_can_walk(), MACRO_TEXT_FRAMES):
+                continue
+            stop = ("unexpected", f"something else has control of the player at {_position_text(snap)}.{_screen_note()}")
+            break
+        if time.monotonic() > deadline:
+            stop = ("time", f"the {minutes:g}-minute limit is up (call rematch_loop again to keep going).")
+            break
+        if _map_dir_here() != map_dir:
+            went = await mcp_go_to({"place": map_name, "reasoning": f"{source}: back onto {map_name}"})
+            if not went.get("success") and not _mem(lambda r: r.is_in_battle()):
+                stop = ("unexpected", f"could not get back onto {map_name}: {went.get('error') or went.get('summary')}")
+            continue
+        why, heal_notes, tripped = await _rematch_heal(trainee_pid, heal_with_items, map_name, heals < REMATCH_MAX_HEALS)
+        current["notes"].extend(heal_notes)
+        heals += int(tripped)
+        if why:
+            stop = ("team_weak", why)
+            break
+        if tripped:
+            continue  # back on the map: look again
+        if new_lead:
+            new_lead = False
+            await _train_lead(trainee_pid, trainee_name, lowest, current["notes"])
+            continue
+        state = _mem(rematch.read_rematches)
+        ready = [
+            t for t in state.on_map(map_dir)
+            if t.ready and t.entry.rolls and not t.entry.double and t.entry.spots and t.entry.index not in skipped
+        ]
+        if ready:
+            trainer = ready[0]
+            x, y = trainer.entry.spots[0]
+            talked = await mcp_talk_to({"x": x, "y": y, "reasoning": f"{source}: {trainer.entry.name} wants a rematch"})
+            # Seen in a test: talk_to read ROBERT's rematch line and answered while the
+            # battle's opening transition still ran (not yet "in battle", nor walking).
+            await _await_game(lambda: _mem(lambda r: r.is_in_battle()) or _player_can_walk(), MACRO_TEXT_FRAMES)
+            if not _mem(lambda r: r.is_in_battle()):
+                skipped.add(trainer.entry.index)
+                current["notes"].append(
+                    f"talked to {trainer.entry.name} at ({x}, {y}) but no battle started: "
+                    f"{talked.get('summary') or talked.get('error')}"
+                )
+            continue
+        if current["fights"]:
+            # Everyone ready here was fought: the next loop walks the counter up again.
+            loops.append(current)
+            current = new_loop()
+        if not state.counting:
+            stop = ("no_rematches", f"nobody on {map_name} wants a rematch now, and with {state.badges} badges the step counter does not count.")
+            break
+        if state.step_counter < rematch.STEP_COUNTER_MAX:
+            walked, why = await _rematch_pace(rematch.STEP_COUNTER_MAX - state.step_counter, source, deadline)
+            current["steps"] += walked
+            if why:
+                stop = ("unexpected", why)
+            continue
+        if quiet_reentries >= REMATCH_MAX_REENTRIES:
+            stop = ("no_rematches", f"{quiet_reentries} map re-entries with the counter at 255 and nobody on {map_name} became ready.")
+            break
+        why = await _rematch_reenter(map_dir, map_name, state, blocked_exits)
+        if why:
+            stop = ("unexpected", why)
+            break
+        if _map_dir_here() == map_dir:
+            current["reentries"] += 1
+            quiet_reentries += 1
+            after = _mem(rematch.read_rematches)
+            elsewhere = [t.entry for t in after.ready() if t.entry.map_dir != map_dir and not any(
+                s.entry.index == t.entry.index and s.ready for s in state.trainers)]
+            if elsewhere:
+                current["notes"].append(
+                    "on the way out, " + ", ".join(f"{e.name} ({e.map_name})" for e in elsewhere) + " became ready instead"
+                )
+    if current["fights"] or current["steps"] or current["reentries"] or current["notes"]:
+        loops.append(current)
+
+    code, why = stop
+    elapsed = time.monotonic() - started
+    fights = [f for loop in loops for f in loop["fights"]]
+    lines = []
+    for n, loop in enumerate(loops, 1):
+        parts = []
+        if loop["steps"]:
+            parts.append(f"walked {loop['steps']} steps")
+        if loop["reentries"]:
+            parts.append(f"re-entered {map_name} {loop['reentries']}x")
+        if loop["fights"]:
+            parts.append("fought " + "; ".join(_fight_text(f) for f in loop["fights"]))
+        parts.extend(loop["notes"])
+        lines.append(f"Loop {n}: " + ", ".join(parts))
+    summary = f"{len(fights)} battle{'s' if len(fights) != 1 else ''} in {elapsed:.0f} s on {map_name}. " + " | ".join(lines)
+    grew = [
+        f"{levels_before[pid][0]} Lv{levels_before[pid][1]}→{mon.level}"
+        for pid, mon in _train_party() if pid in levels_before and mon.level != levels_before[pid][1]
+    ]
+    summary += f". Levels: {', '.join(grew)}." if grew else ". No Pokémon levelled up."
+    summary += f" Stopped: {why}"
+    if notes:
+        summary = f"On the way: {'; '.join(notes)}. {summary}"
+    counter = _mem(rematch.read_rematches)
+    summary += f" {rematch.ready_line(counter, map_dir)}"
+    logger.info(f"🔁 rematch_loop: {summary}")
+    return {
+        "success": True,
+        "status": code.upper(),
+        "summary": summary,
+        "loops": loops,
+        "battles": fights,
+        "stopped_because": code,
         "elapsed_s": round(elapsed, 1),
     }
 
@@ -10760,12 +11504,14 @@ async def _leave_menus(message: str, source: str) -> str:
     return message + ("" if closed else " Could not close every menu: look at the screen.")
 
 
-async def _choose_use_in_bag(item_id: int, source: str) -> Optional[str]:
-    """START → BAG → ITEMS → the item → A → USE (the first entry of its menu) → A. None
-    once USE is pressed, else why not (with the menus closed again)."""
+async def _choose_use_in_bag(item_id: int, source: str, pocket: Optional[int] = None) -> Optional[str]:
+    """START → BAG → the pocket (ITEMS unless given) → the item → A → USE (the first entry
+    of its menu) → A. None once USE is pressed, else why not (with the menus closed
+    again). USE comes first in the KEY ITEMS pocket's menu too (pret src/item_menu.c
+    sContextMenuItems_KeyItemsPocket: USE, REGISTER, -, CANCEL): the fishing rods."""
     from server import menu_state as ms
 
-    pocket = ms.ITEMS_POCKET
+    pocket = ms.ITEMS_POCKET if pocket is None else pocket
 
     async def leave(message: str) -> str:
         return await _leave_menus(message, source)
@@ -10786,7 +11532,7 @@ async def _choose_use_in_bag(item_id: int, source: str) -> Optional[str]:
         await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES)
     listed = _mem(lambda r: ms.bag_pocket_item_ids(r, pocket))
     if _mem(ms.bag_pocket) != pocket or item_id not in listed:
-        return await leave(f"Could not find the {_item_name(item_id)} in the ITEMS pocket.")
+        return await leave(f"Could not find the {_item_name(item_id)} in the {ms.POCKET_NAMES[pocket]} pocket.")
     if not await _step_cursor(lambda r: ms.bag_cursor_index(r, pocket), listed.index(item_id), source):
         return await leave(f"Could not put the bag cursor on the {_item_name(item_id)}.")
     await _macro_press(["A"], source)

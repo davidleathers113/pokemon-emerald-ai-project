@@ -174,10 +174,58 @@ SHOP_MAX_QUANTITY = 0x200A
 # The quantity task's data[1] is the count shown, data[5] the item being bought.
 BUY_TASK_COUNT = 1
 BUY_TASK_ITEM = 5
-# gItems[]: 0x2C-byte struct Item, price (u16) at +0x10.
+# gItems[]: 0x2C-byte struct Item, price (u16) at +0x10, fieldUseFunc (pointer) at
+# +0x1C, secondaryId (u8) at +0x28.
 G_ITEMS = 0x085839A0
 ITEM_SIZE = 0x2C
 ITEM_PRICE = 0x10
+ITEM_FIELD_USE_FUNC = 0x1C
+ITEM_SECONDARY_ID = 0x28
+
+# ---------------------------------------------------------------------------
+# Fishing (pret src/field_player_avatar.c, src/item_use.c)
+# ---------------------------------------------------------------------------
+
+KEY_ITEMS_POCKET = 4  # POCKET_NAMES: the bag's fifth pocket
+# The rods are the items whose fieldUseFunc is ItemUseOutOfBattle_Rod; secondaryId is
+# the rod StartFishing gets (OLD_ROD 0, GOOD_ROD 1, SUPER_ROD 2). Read in the ROM: OLD,
+# GOOD and SUPER ROD (262-264) all point at 0x080FD429, with secondaryId 0, 1, 2.
+ITEM_USE_OUT_OF_BATTLE_ROD = 0x080FD428
+# Task_Fishing runs sFishingStateFuncs[tStep] (data[0]); step 7 is Fishing_WaitForA,
+# "Oh! A bite!" up and reelTimeouts[rod] frames (36 / 33 / 30) to press A in. An A any
+# earlier, while the dots print (Fishing_ShowDots, step 4), loses the cast.
+TASK_FISHING = 0x0808C8C0
+FISHING_STEP_SHOW_DOTS = 4
+FISHING_STEP_WAIT_FOR_A = 7
+FISHING_STEP_NO_BITE = 11   # Fishing_NotEvenNibble: "Not even a nibble…"
+FISHING_STEP_GOT_AWAY = 12  # Fishing_GotAway: "It got away…"
+# "A POKéMON's on the hook!", "Not even a nibble…" and "It got away…" end in
+# {PAUSE_UNTIL_PRESS} (pret src/strings.c): the cast waits for A after each. Seen in a
+# test: with only the bite answered, Fishing_StartEncounter (step 10) sat on the hook
+# text for 30 s and no battle began.
+
+
+def rod_index(reader, item_id: int) -> Optional[int]:
+    """The rod (0 OLD, 1 GOOD, 2 SUPER) an item is, from the ROM's gItems, or None."""
+    base = G_ITEMS + item_id * ITEM_SIZE
+    if not _is(reader._read_u32(base + ITEM_FIELD_USE_FUNC), ITEM_USE_OUT_OF_BATTLE_ROD):
+        return None
+    return reader._read_u8(base + ITEM_SECONDARY_ID)
+
+
+def fishing_step(reader) -> Optional[int]:
+    """Task_Fishing's tStep, or None when nobody is fishing."""
+    task = find_task(reader, TASK_FISHING)
+    return None if task is None else task_data(reader, task, 0)
+
+
+def fishing_wants_a(reader) -> bool:
+    """A cast waits for A now: the bite (Fishing_WaitForA), or one of its texts at its
+    {PAUSE_UNTIL_PRESS}. Never while the dots print, where A loses the cast."""
+    step = fishing_step(reader)
+    if step is None or step == FISHING_STEP_SHOW_DOTS:
+        return False
+    return step == FISHING_STEP_WAIT_FOR_A or text_waiting_for_button(reader)
 
 # Object event graphics (include/constants/event_objects.h).
 OBJ_EVENT_GFX_NURSE = 58

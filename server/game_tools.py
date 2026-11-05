@@ -2531,13 +2531,17 @@ def _land_encounter_behaviors() -> frozenset:
 # mapNum, pad[2]; const struct WildPokemonInfo *landMonsInfo, *waterMonsInfo,
 # *rockSmashMonsInfo, *fishingMonsInfo} (20 bytes), ended by MAP_UNDEFINED (group 0xFF).
 # struct WildPokemonInfo {u8 encounterRate, pad[3]; const struct WildPokemon *wildPokemon};
-# struct WildPokemon {u8 minLevel, maxLevel; u16 species}: 12 land slots, 5 water slots.
+# struct WildPokemon {u8 minLevel, maxLevel; u16 species}: 12 land slots, 5 water slots,
+# 10 fishing slots.
 # StandardWildEncounter rolls on land only when the map's header has landMonsInfo: the
 # old "a cave has wild Pokémon" guess knew neither that nor their levels.
 G_WILD_MON_HEADERS = 0x08552D48
 WILD_HEADER_SIZE = 20
 WILD_HEADER_COUNT_MAX = 200  # the table has 124 headers; a bound in case the end is missed
-LAND_WILD_COUNT, WATER_WILD_COUNT = 12, 5
+LAND_WILD_COUNT, WATER_WILD_COUNT, FISHING_WILD_COUNT = 12, 5, 10
+# The fishing slots each rod draws from (pret ChooseWildMonIndex_Fishing): OLD_ROD 0-1,
+# GOOD_ROD 2-4, SUPER_ROD 5-9; the rod is the item's secondaryId (menu_state.rod_index).
+FISHING_ROD_SLOTS = {0: (0, 2), 1: (2, 5), 2: (5, 10)}
 
 
 @dataclass(frozen=True)
@@ -2558,23 +2562,36 @@ class WildArea:
 class MapWild:
     land: Optional[WildArea]
     water: Optional[WildArea]
+    # (rate, ((min level, max level, species) per fishing slot)), () without fishingMonsInfo
+    fishing: Tuple = ()
 
 
 _WILD_TABLE: Optional[Dict[str, MapWild]] = None
 
 
-def _read_wild_area(reader, pointer: int, slots: int) -> Optional[WildArea]:
-    if not pointer:
-        return None
+def _read_wild_slots(reader, pointer: int, slots: int) -> Tuple[int, Tuple[Tuple[int, int, int], ...]]:
+    """(encounterRate, ((min level, max level, species) per slot)) of a WildPokemonInfo."""
     info = bytes(reader._read_bytes(pointer, 8))
     mons = bytes(reader._read_bytes(int.from_bytes(info[4:8], "little"), 4 * slots))
-    entries = [(mons[4 * i], mons[4 * i + 1], int.from_bytes(mons[4 * i + 2:4 * i + 4], "little")) for i in range(slots)]
+    entries = tuple(
+        (mons[4 * i], mons[4 * i + 1], int.from_bytes(mons[4 * i + 2:4 * i + 4], "little")) for i in range(slots)
+    )
+    return info[0], entries
+
+
+def _wild_area(rate: int, entries) -> WildArea:
     return WildArea(
-        rate=info[0],
+        rate=rate,
         min_level=min(lo for lo, _, _ in entries),
         max_level=max(hi for _, hi, _ in entries),
         species=tuple(s for _, _, s in entries),
     )
+
+
+def _read_wild_area(reader, pointer: int, slots: int) -> Optional[WildArea]:
+    if not pointer:
+        return None
+    return _wild_area(*_read_wild_slots(reader, pointer, slots))
 
 
 def wild_table(reader) -> Dict[str, MapWild]:
@@ -2599,12 +2616,26 @@ def wild_table(reader) -> Dict[str, MapWild]:
             continue
         land = int.from_bytes(header[4:8], "little")
         water = int.from_bytes(header[8:12], "little")
+        fishing = int.from_bytes(header[16:20], "little")
         table[found[0]] = MapWild(
             land=_read_wild_area(reader, land, LAND_WILD_COUNT),
             water=_read_wild_area(reader, water, WATER_WILD_COUNT),
+            fishing=_read_wild_slots(reader, fishing, FISHING_WILD_COUNT) if fishing else (),
         )
     _WILD_TABLE = table
     return table
+
+
+def fishing_wild(map_dir: str, rod: int) -> Optional[WildArea]:
+    """What a rod (0 OLD, 1 GOOD, 2 SUPER) hooks on a map, from its fishingMonsInfo; None
+    when the map has none (pret DoesCurrentMapHaveFishingMons: "Not even a nibble…" at
+    every cast). wild_table must be read first."""
+    found = _loaded_wild_table().get(map_dir)
+    if found is None or not found.fishing or rod not in FISHING_ROD_SLOTS:
+        return None
+    rate, entries = found.fishing
+    first, end = FISHING_ROD_SLOTS[rod]
+    return _wild_area(rate, entries[first:end])
 
 
 def _loaded_wild_table() -> Dict[str, MapWild]:
@@ -2709,6 +2740,26 @@ def wild_encounter_spots(env) -> dict:
     "land": WildArea or None}; "pairs" is empty when no tile here can start a battle on
     foot, and "land" is None when the map has no land Pokémon at all (gWildMonHeaders).
     """
+    return _tile_pairs(env, lambda grid, raw_tiles, land: encounter_tiles(grid, raw_tiles, land is not None))
+
+
+def pacing_spots(env) -> dict:
+    """The nearest pairs of side-by-side plain tiles on the player's map (walkable, and no
+    step there can meet a wild Pokémon), in navigate_to's frame, as wild_encounter_spots
+    returns them. rematch_loop steps between them to count the rematch step counter up
+    (pret IncrementRematchStepCounter: any step on foot) without wild battles."""
+
+    def plain(grid, raw_tiles, land) -> set:
+        walkable = {(x, y) for y, row in enumerate(grid or []) for x, cell in enumerate(row) if cell == "."}
+        return walkable - encounter_tiles(grid, raw_tiles, land is not None)
+
+    return _tile_pairs(env, plain)
+
+
+def _tile_pairs(env, pick_tiles) -> dict:
+    """wild_encounter_spots and pacing_spots: pairs of side-by-side tiles among
+    pick_tiles(grid, raw_tiles, land WildArea or None), nearest first, kept only when the
+    pathfinder reaches them."""
     from utils.mapping.porymap_state import decomp_map_at
 
     reader = env.memory_reader
@@ -2723,7 +2774,7 @@ def wild_encounter_spots(env) -> dict:
     ox, oy = coord_offset or (0, 0)
     start = (int(position.get("x", 0)) - ox, int(position.get("y", 0)) - oy)
     map_dir = found[0] if found is not None else source.get("porymap_map_name", "")
-    tiles = encounter_tiles(grid, porymap.get("raw_tiles"), land is not None)
+    tiles = pick_tiles(grid, porymap.get("raw_tiles"), land)
     occupied = frozenset(
         (int(o["current_x"]) - ox, int(o["current_y"]) - oy) for o in porymap.get("runtime_objects") or []
     ) - {start}

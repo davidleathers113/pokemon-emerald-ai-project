@@ -1143,6 +1143,28 @@ def _format_trainers(map_dir: str, memory_reader: Any) -> List[str]:
     ]
 
 
+def _format_rematches(map_dir: str, memory_reader: Any) -> List[str]:
+    """Match Call rematches (server.rematch): who wants a rematch and where, and how this
+    map's unregistered rematch trainers get registered. [] without Match Call, without a
+    server, or when RAM can't be read.
+
+    Asked for (2026-11-05): with six badges the live team had ten registered trainers
+    waiting for a rematch (trainer battles pay 1.5x EXP, pret Cmd_getexp) and nothing in
+    the state said so."""
+    if memory_reader is None:
+        return []
+    try:
+        from server import rematch
+    except ImportError:
+        return []
+    try:
+        state = rematch.read_rematches(memory_reader)
+    except Exception as e:  # a line that can't be read is left out, never guessed
+        logger.debug(f"rematches unreadable: {e}")
+        return []
+    return [line for line in (rematch.ready_line(state, map_dir), rematch.registration_hint(state, map_dir)) if line]
+
+
 def _party_can_surf() -> bool:
     """server.game_tools.can_surf (the party knows SURF and has the Balance Badge), or
     False where no server is running (its readers are installed by server/app.py)."""
@@ -1756,6 +1778,12 @@ def _format_porymap_info(
             if trainers:
                 context_parts.append("\nTRAINERS not yet beaten on this map:")
                 context_parts.extend(trainers)
+            # Its own block (the leading blank line): the step counter in it changes every
+            # step, so it stays in the state, not in the TRAINERS block's lasting map info.
+            rematches = _format_rematches(porymap_map_name, memory_reader)
+            if rematches:
+                context_parts.append("\n" + rematches[0])
+                context_parts.extend(rematches[1:])
 
         # NOTE: Warps, Objects/NPCs, and Connections lists are DEPRECATED
         # This data is already included in the Map Data (JSON) section below.
