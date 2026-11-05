@@ -260,6 +260,61 @@ def test_walks_smash_a_rock_the_party_can_clear():
     assert (snap.x, snap.y) != (19, 99), (snap, r)
 
 
+# A loaded Mac, on purpose: the game loop paced at this many frames per second whether
+# busy or idle. Four suites at once ran the emulator down to ~22 fps (its turbo target is
+# 480), and the walks' waits, written in seconds, gave up while the game still played.
+SLOW_FPS = 15.0
+
+
+class _slow_game:
+    def __init__(self, s, fps=SLOW_FPS):
+        self.srv, self.fps = s.srv, fps
+
+    def __enter__(self):
+        self.saved = (self.srv.GAME_FPS, self.srv.TURBO_FPS)
+        self.srv.GAME_FPS = self.srv.TURBO_FPS = self.fps
+
+    def __exit__(self, *exc):
+        self.srv.GAME_FPS, self.srv.TURBO_FPS = self.saved
+
+
+def test_a_rock_is_smashed_when_the_emulator_runs_slow():
+    """test_walks_smash_a_rock_the_party_can_clear failed under load: "BLOCKED moving UP at
+    (18,102) on ROUTE 111: (18,101) is occupied by someone", no ROCK SMASH. At 15 fps
+    the same: A was pressed whenever a box showed, so the presses landed while the lines
+    still printed (only hurrying them), the ten allowed ran out with "BRELOOM used ROCK
+    SMASH!" still up, and the wait after them (240 frames, but at most 10 s: 150 frames
+    at 15 fps) ended before the rock was gone. Now A waits for each box's arrow or the
+    YES/NO, and the waits count frames."""
+    from server import game_tools
+
+    s = server()
+    s.load(HERE / "test_route111_rocks.state", wild_encounters=False)
+    game_tools._field_moves_cache[0] = 0.0  # a test before may have cleared the badge
+    with _slow_game(s):
+        r = s.call("mcp_navigate_to", {"x": 19, "y": 99, "variance": "none", "reason": "north past the rocks"})
+    print("   ", r.get("summary"))
+    snap = s.snapshot()
+    assert (snap.x, snap.y) == (19, 99), (snap, r)
+    assert "Used ROCK SMASH at" in r["summary"], r
+
+
+def test_go_to_exit_through_a_door_when_the_emulator_runs_slow():
+    """test_warp_routes' go_to_exit into LAVARIDGE TOWN GYM 1F failed under load: "Did
+    not leave the map … the game took control of the player". The walk there is ~330
+    game frames and the door (open, step in, fade, load, fade in) ~90-100 more, measured
+    at 15 and 480 fps. The walk's wait was ~1.5x the walk at 80 fps in seconds and the
+    door's 4 s, then 1 s more: at 8 fps the walk's wait ran out first and the door never
+    got its frames (old code: "the walk ended without leaving the map")."""
+    s = server()
+    s.load(HERE / "test_lavaridge_after_chimney.state", wild_encounters=False)
+    with _slow_game(s, fps=8.0):
+        r = s.call("mcp_go_to_exit", {"exit": "LAVARIDGE TOWN GYM 1F", "reasoning": "test"})
+    print("   ", r.get("summary"))
+    assert r["success"] is True and "Arrived" in r["summary"], r
+    assert _location(s) == "LAVARIDGE TOWN GYM 1F", _location(s)
+
+
 def test_walks_go_down_jagged_pass_ledges_and_not_bumpy_slopes():
     """Seen live (15:47-15:49 UTC, REPEAT stall): from JAGGED PASS (14,5) every
     heal_at_pokecenter said "Cannot reach 'ROUTE 112' … no walkable path"; by hand the

@@ -29,6 +29,7 @@ from server.field_control import (
     OBJECT_EVENT_COUNT,
     OBJECT_EVENT_SIZE,
     decode_field_message,
+    read_field_message,
 )
 
 # ---------------------------------------------------------------------------
@@ -240,8 +241,68 @@ def text_waiting_for_button(reader) -> bool:
 TASK_MATCH_CALL = 0x081960E0  # ExecuteMatchCall
 
 
+def yes_no_ready(reader) -> bool:
+    """The script YES/NO takes A/B now. pret src/script_menu.c Task_HandleYesNoInput
+    ignores input for its first five frames (tRight, data[2], counts them); an A in those
+    frames is lost and the question stays up. True when no script YES/NO is running."""
+    task = find_task(reader, TASK_FIELD_YES_NO)
+    return task is None or task_data(reader, task, 2) >= 5
+
+
 def phone_call_active(reader) -> bool:
     return task_running(reader, TASK_MATCH_CALL)
+
+
+# ExecuteMatchCall's tState (data[0]) indexes sMatchCallTaskFuncs: 4 MatchCall_PrintIntro
+# prints "………………" and only then builds the caller's message into gStringVar4 (until
+# then it holds an older text); 5 MatchCall_PrintMessage prints that message and hangs up
+# on a new A or B once its printer is done and no sound effect plays
+# (!RunMatchCallTextPrinter && !IsSEPlaying() && JOY_NEW(A_BUTTON | B_BUTTON)); 6 and 7
+# slide the window out and give the player back control.
+MATCH_CALL_PRINT_MESSAGE = 5
+# sMatchCallState {u32 minutes; u16 trainerId; u8 stepCounter; u8 triggeredFromScript}
+# (pret src/match_call.c, file-static, .sym 0203cd80). A call a script places (Dad on Mr.
+# Briney's boat) has its message in gStringVar4 from the start (ShowPokenavFieldMessage).
+S_MATCH_CALL_STATE = 0x0203CD80
+# gMPlayInfo_SE1 / gMPlayInfo_SE2, struct MusicPlayerInfo: status (u32) at +4.
+G_MPLAY_INFO_SE = (0x030075F0, 0x03007630)
+MUSICPLAYER_STATUS_TRACK = 0x0000FFFF
+MUSICPLAYER_STATUS_PAUSE = 0x80000000
+
+
+def phone_call_stage(reader) -> Optional[int]:
+    """The field call's tState, or None when no call plays."""
+    task = find_task(reader, TASK_MATCH_CALL)
+    return None if task is None else task_data(reader, task, 0)
+
+
+def sound_effect_playing(reader) -> bool:
+    """pret src/sound.c IsSEPlaying."""
+    status = [reader._read_u32(base + 4) for base in G_MPLAY_INFO_SE]
+    if all(s & MUSICPLAYER_STATUS_PAUSE for s in status):
+        return False
+    return any(s & MUSICPLAYER_STATUS_TRACK for s in status)
+
+
+def phone_call_waits_for_a(reader) -> bool:
+    """An A now moves the call on: its text is on a paragraph's arrow, or its message is
+    done and A hangs up. An A at any other moment only hurries the printing along, or
+    (while a sound effect still plays) does nothing at all."""
+    stage = phone_call_stage(reader)
+    if stage is None:
+        return False
+    if text_waiting_for_button(reader):
+        return True
+    return stage == MATCH_CALL_PRINT_MESSAGE and not text_printing(reader) and not sound_effect_playing(reader)
+
+
+def phone_call_text(reader) -> str:
+    """What the caller says, once the message is built ('' before that)."""
+    stage = phone_call_stage(reader)
+    from_script = reader._read_u8(S_MATCH_CALL_STATE + 7)
+    if stage is None or (stage < MATCH_CALL_PRINT_MESSAGE and not from_script):
+        return ""
+    return read_field_message(reader)
 
 
 def text_printing(reader) -> bool:

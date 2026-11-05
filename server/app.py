@@ -256,6 +256,47 @@ def _record_battle_message() -> None:
 def _battle_messages_since(frame: int) -> List[Tuple[int, str]]:
     return [(at, text) for at, text in list(battle_message_log or ()) if at > frame and text]
 
+
+# Every wait for the game (a press sequence, a door's fade, a rock's shatter, a menu) is
+# counted in game frames, not wall-clock seconds: the emulator runs slower than its
+# target whenever the Mac is busy (Ollama answering, other emulators). Seen in tests
+# with several suites at once: down to 22 fps against the 480 fps turbo target, and
+# walks that pass alone failing ("Did not leave the map" at the LAVARIDGE TOWN GYM
+# door). With the game loop held at 8 fps the walk to that door outlasted its wait
+# (~1.5x the walk at 80 fps, in seconds), and the door's ~90-100 frames of fade got
+# 4 s. The wall clock only guards against a game loop that stopped running frames
+# (paused, or stuck in the core).
+GAME_STALL_S = 10.0
+
+
+class _FrameBudget:
+    """`frames` game frames from now, as the game loop counts them (_frames_run: one per
+    emulated frame, whatever the speed; unlike the game's own counter it never jumps on
+    a state load), or no frame at all for GAME_STALL_S."""
+
+    def __init__(self, frames: float):
+        self.frames = frames
+        self.start = self._seen = _frames_run
+        self._moved_at = time.monotonic()
+
+    @property
+    def run(self) -> int:
+        return _frames_run - self.start
+
+    def spent(self) -> bool:
+        now = _frames_run
+        if now != self._seen:
+            self._seen, self._moved_at = now, time.monotonic()
+        return now - self.start >= self.frames or time.monotonic() - self._moved_at > GAME_STALL_S
+
+
+def _wait_frames_blocking(frames: int) -> None:
+    """For code on a worker thread: sleep until `frames` game frames have run."""
+    budget = _FrameBudget(frames)
+    while not budget.spent():
+        time.sleep(0.005)
+
+
 # Video recording state
 video_writer = None
 video_recording = False
@@ -4696,22 +4737,24 @@ async def mcp_get_map_data():
         return {"success": False, "error": str(e)}
 
 
-def _sequence_timeout(n_buttons: int) -> float:
-    """Generous upper bound for n presses (hold + release + a ledge-jump settle each)."""
+def _sequence_frames(n_buttons: int) -> int:
+    """Generous game-frame budget for n presses (hold + release + a ledge-jump settle
+    each); the cap is the old 80 s at the nominal 80 fps."""
     per_press = SPEED_PRESETS["slow"]["hold"] + SPEED_PRESETS["slow"]["release"] + 48
-    return min(80.0, 5.0 + 1.5 * n_buttons * per_press / max(1, fps))
+    return int(min(80 * fps, 5 * fps + 1.5 * n_buttons * per_press))
 
 
-async def _await_sequence(seq_id: Optional[int], timeout_s: float) -> Optional[Dict[str, Any]]:
-    """Wait until the game loop has run (or dropped) every press of a sequence."""
+async def _await_sequence(seq_id: Optional[int], frames: int) -> Optional[Dict[str, Any]]:
+    """Wait until the game loop has run (or dropped) every press of a sequence, for at
+    most `frames` game frames (_FrameBudget)."""
     if seq_id is None:
         return None
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    budget = _FrameBudget(frames)
+    while not budget.spent():
         report = sequence_reports.get(seq_id)
         if report is None or report.get("done"):
             return report
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.02)
     return sequence_reports.get(seq_id)
 
 
@@ -4739,6 +4782,22 @@ def _screen_note() -> str:
     snap = _field_snapshot()
     if snap is None:
         return ""
+    if snap.phone_call:
+        # gStringVar4 holds an older text until the caller's message is built, then the
+        # whole message whatever paragraph shows (_finish_call). Seen live (ROBERT on
+        # ROUTE 121; WINONA at FORTREE CITY): A results quoting the same text read as A
+        # doing nothing, and the calls were ended with B by hand. In a test ELLIOT's call
+        # took 12 presses of A, the quote the same after each. A and B both move a call
+        # on (pret text.c TextPrinterWaitWithDownArrow and match_call.c
+        # MatchCall_PrintMessage take JOY_NEW(A_BUTTON | B_BUTTON)); A also hurries it.
+        from server import menu_state as ms
+
+        said = _mem(ms.phone_call_text)
+        quoted = f' "{said[-160:]}"' if said else ""
+        return (
+            f" A POKéNAV call is playing{quoted}: press A through it until it hangs up"
+            " (the quote stays the same while it plays: it is not stuck)."
+        )
     status = dialogue_status(snap)
     if status not in (DIALOGUE_PLAIN, DIALOGUE_CHOICE, DIALOGUE_BUSY):
         return ""
@@ -4860,24 +4919,36 @@ def _refuse_repeat_of_blocked_press(buttons: List[str]) -> Tuple[List[str], Opti
     return [], {"success": False, "error": message, "status": "REFUSED", "summary": message, "buttons_queued": []}
 
 
+# Game-frame budgets for a walk's map change (_FrameBudget). They were 4.0 s, 1.5 s, 3.0 s
+# and 1.0 s of wall clock, at the idle 60 fps these waits ran at: 240, 90, 180 and 60
+# frames when the emulator kept up, far fewer when it didn't. A door: it opens, the
+# player steps in, the screen fades out, the new map loads and fades in (pret
+# field_screen_effect.c Task_DoDoorWarp, then the fade-in of FieldCB_DefaultWarpExit).
+WARP_FRAMES = 360  # through a door, stairs or an arrow warp
+EDGE_FRAMES = 90  # over a map edge: the new map shows on the step itself
+MAP_CHANGE_GRACE_FRAMES = 180  # after the map changed, for the player to get control back
 # go_to_exit: a second look for a map change before a walk is called a failure.
-LATE_MAP_CHANGE_S = 1.0
+LATE_MAP_CHANGE_FRAMES = 60
 
 
-async def _await_map_change(old_map_id, timeout_s: float):
-    """Wait for the map to change and the warp fade to finish; returns the last snapshot."""
-    deadline = time.monotonic() + timeout_s
+async def _await_map_change(old_map_id, frames: int):
+    """Wait up to `frames` game frames for the map to change and the warp fade to
+    finish; returns the last snapshot."""
+    budget = _FrameBudget(frames)
     snap = _field_snapshot()
-    changed_at = None
-    while time.monotonic() < deadline:
-        snap = _field_snapshot()
-        if snap is not None and snap.map_id != old_map_id:
-            changed_at = changed_at or time.monotonic()
-            # Hand back control only once the player can walk again (fade-in done),
-            # or after a short grace period if something (e.g. a cutscene) holds it.
-            if snap.field_free or time.monotonic() - changed_at > 3.0:
-                return snap
-        await asyncio.sleep(0.1)
+    grace = None
+    with _turbo():
+        # Once the map has changed only the grace counts: a change late in the budget
+        # still gets its fade-in.
+        while not (grace or budget).spent():
+            snap = _field_snapshot()
+            if snap is not None and snap.map_id != old_map_id:
+                grace = grace or _FrameBudget(MAP_CHANGE_GRACE_FRAMES)
+                # Hand back control only once the player can walk again (fade-in done),
+                # or after a grace period if something (e.g. a cutscene) holds it.
+                if snap.field_free:
+                    return snap
+            await asyncio.sleep(0.02)
     return snap
 
 
@@ -4898,20 +4969,21 @@ def _went_through(plan: Dict[str, Any], before, snap) -> bool:
     return game_tools.came_through_warp(tuple(arrival), tuple(plan["warp_tile"]), (snap.x - ox, snap.y - oy))
 
 
-async def _await_exit(plan: Dict[str, Any], before, timeout_s: float):
+async def _await_exit(plan: Dict[str, Any], before, frames: int):
     """_await_map_change, and for a warp within the map: until the player stands at its
     landing tile and can walk (the map id never changes, so that wait would run out)."""
     if not plan.get("arrival_here"):
-        return await _await_map_change(before.map_id, timeout_s)
-    deadline = time.monotonic() + timeout_s
+        return await _await_map_change(before.map_id, frames)
+    budget = _FrameBudget(frames)
     snap = _field_snapshot()
-    while time.monotonic() < deadline:
-        snap = _field_snapshot()
-        if snap is not None and snap.map_id != before.map_id:
-            return await _await_map_change(before.map_id, max(0.1, deadline - time.monotonic()))
-        if snap is not None and snap.field_free and _went_through(plan, before, snap):
-            return snap
-        await asyncio.sleep(0.1)
+    with _turbo():
+        while not budget.spent():
+            snap = _field_snapshot()
+            if snap is not None and snap.map_id != before.map_id:
+                return await _await_map_change(before.map_id, max(1, frames - budget.run))
+            if snap is not None and snap.field_free and _went_through(plan, before, snap):
+                return snap
+            await asyncio.sleep(0.02)
     return snap
 
 
@@ -4957,10 +5029,11 @@ async def _settle_after_sequence(before, report: Optional[Dict[str, Any]]) -> No
     if before is None or not report or not (report.get("note") or report.get("interrupted")):
         return
     snap = _field_snapshot()
-    if snap is None or snap.in_battle or snap.message_box or snap.waiting_for_button:
+    # A POKéNAV call locks the controls with no box (its own window): not a warp.
+    if snap is None or snap.in_battle or snap.message_box or snap.waiting_for_button or snap.phone_call:
         return
     if snap.controls_locked or not snap.overworld:
-        snap = await _await_map_change(before.map_id, 3.0)
+        snap = await _await_map_change(before.map_id, WARP_FRAMES)
         if snap is not None and snap.map_id != before.map_id:
             report["note"] = "you went through a door/warp to another map"
             if report.pop("interrupted", None):
@@ -4980,9 +5053,18 @@ async def _clear_obstacle(tile, source: str) -> Optional[str]:
 
     Seen live on ROUTE 111: the rocks at (19,100) and (18,101) were cleared by hand with
     exactly these presses after every walk had refused to go near them.
+
+    A is pressed only once a box waits for it or the YES/NO is up (_box_waits_for_a),
+    never while a line still prints. Seen in a test with the game loop at 15 fps: A was
+    pressed whenever a box showed, the presses landed back to back while "This rock
+    appears to be breakable…" and "BRELOOM used ROCK SMASH!" printed (six for the
+    first line alone), the ten allowed ran out with the last box still up, and the walk
+    called the rock a person ("(18,101) is occupied by someone"). At full speed the
+    harness's own pauses between presses let each line finish first; under load
+    (four test suites at once) they don't. The same was seen with Surf (_start_surf).
     """
     from server import game_tools
-    from server.field_control import DIALOGUE_CHOICE, DIALOGUE_PLAIN, npc_at
+    from server.field_control import npc_at
     from utils.state_formatter import ROM_TO_PORYMAP_MAP
 
     if not tile:
@@ -4992,12 +5074,10 @@ async def _clear_obstacle(tile, source: str) -> Optional[str]:
         return None
     await _macro_press(["A"], source)
     for _ in range(CLEAR_OBSTACLE_PRESSES):
-        await _await_game(
-            lambda: _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE) or _player_can_walk(), MACRO_TEXT_FRAMES
-        )
+        await _await_game(lambda: _box_waits_for_a() or _player_can_walk(), MACRO_TEXT_FRAMES)
         if _player_can_walk():
             break
-        if _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE):
+        if _box_waits_for_a():
             await _macro_press(["A"], source)  # the text, and YES at "Would you like to use …?"
     # The object vanishes after the animation; give it a moment.
     await _await_game(lambda: not _mem(lambda r: npc_at(r, tile[0], tile[1])), MACRO_MENU_FRAMES)
@@ -5129,6 +5209,7 @@ async def mcp_go_to_exit(request: dict):
         return {"success": False, "error": "go_to_exit is only implemented for Emerald"}
     try:
         from server import game_tools
+        from server import menu_state as ms
         from server.field_control import end_of_path, player_surfing, warp_push_directions
 
         exit_query = str(request.get("exit") or request.get("destination") or "").strip()
@@ -5148,6 +5229,7 @@ async def mcp_go_to_exit(request: dict):
         cleared: List[str] = []
         first_from = None
         start = _field_snapshot()
+        snap = start
         for _attempt in range(7):
             # Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the
             # door, then planned again from inside METEOR FALLS and answered "No exit of
@@ -5179,8 +5261,18 @@ async def mcp_go_to_exit(request: dict):
                 queued = await take_action(
                     ActionRequest(buttons=buttons, source="go_to_exit", metadata={"exit": plan["label"]}, check_movement=True)
                 )
-                report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
-            snap = await _await_exit(plan, before, 4.0 if plan["kind"] == "warp" else 1.5)
+                report = await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(buttons)))
+            # A POKéNAV call rang on the way and stopped the walk. Seen in a test under
+            # load (test_warp_routes, into LAVARIDGE TOWN GYM 1F): "STOPPED at (8,14) on
+            # LAVARIDGE TOWN: the game took control of the player", a call on screen, and
+            # go_to_exit gave up. A registered trainer rings on a step (pret match_call.c
+            # TryStartMatchCall, by Random(), so by game timing): read it, walk on.
+            if _mem(ms.phone_call_active):
+                call = await _finish_call("go_to_exit")
+                cleared.append(_call_text(call).rstrip("."))
+                if not call["open"]:
+                    continue
+            snap = await _await_exit(plan, before, WARP_FRAMES if plan["kind"] == "warp" else EDGE_FRAMES)
             # A rock or tree on the way that the party can clear: clear it, plan again.
             used = await _clear_obstacle((report or {}).get("blocked_tile"), "go_to_exit")
             if used:
@@ -5214,7 +5306,7 @@ async def mcp_go_to_exit(request: dict):
         ):
             door_trouble = await _open_sign_door(plan, "go_to_exit")
             if door_trouble is None:
-                snap = await _await_exit(plan, before, 4.0)
+                snap = await _await_exit(plan, before, WARP_FRAMES)
 
         # Arrow warps (house mats, cave mouths) fire when the player walks off them.
         pushes_tried = []
@@ -5231,14 +5323,14 @@ async def mcp_go_to_exit(request: dict):
                 for push in warp_push_directions(grid, plan.get("raw_tiles"), local[0], local[1], last_move)[:2]:
                     pushes_tried.append(push)
                     await take_action(ActionRequest(buttons=[push], source="go_to_exit"))
-                    snap = await _await_exit(plan, before, 4.0)
+                    snap = await _await_exit(plan, before, WARP_FRAMES)
                     if _went_through(plan, before, snap):
                         break
 
         if not _went_through(plan, before, snap):
             # The map can change after the wait above gave up (a slow fade); look again
             # before calling the walk a failure.
-            snap = await _await_exit(plan, before, LATE_MAP_CHANGE_S)
+            snap = await _await_exit(plan, before, LATE_MAP_CHANGE_FRAMES)
         location = _location_name()
         now = _position_text(snap, location)
         response = {"exit": plan["label"], "from": from_text, "now": now, "path_length": len(plan["buttons"])}
@@ -5350,15 +5442,95 @@ def _not_a_trainer_note(texts: List[str]) -> str:
     return f"{head} Trainers still to battle on this map: {names}."
 
 
+# A presses one field POKéNAV call may take (_finish_call): one per paragraph's arrow and
+# one to hang up, each pressed only when it moves the call on. Dad's call on Mr. Briney's
+# boat, the longest seen, has about ten "… … …" boxes.
+CALL_MAX_PRESSES = 30
+
+
+async def _finish_call(source: str) -> Dict[str, Any]:
+    """Read a POKéNAV call in the field through to its hang-up: A only when the call
+    waits for it (menu_state.phone_call_waits_for_a). Returns {"texts", "presses",
+    "open"}; "open" is True when the call is still on screen afterwards.
+
+    Seen in a test (test_surf_shore.state, a call from LYDIA made to ring per pret
+    TryStartMatchCall): the plain-text reader's A presses, pressed whenever a box showed,
+    took 20 to end one call, more than one read allows (15), and while it played the
+    text quoted stayed the same: before the message is built, an older text left in
+    gStringVar4 ("I thought I was doing okay in my training…"), then the whole message
+    at once, whatever paragraph was on screen.
+    """
+    from server import menu_state as ms
+
+    texts: List[str] = []
+    presses = 0
+    with _turbo():
+        while presses < CALL_MAX_PRESSES and _mem(ms.phone_call_active):
+            ready = await _await_game(
+                lambda: not _mem(ms.phone_call_active) or _mem(ms.phone_call_waits_for_a), MACRO_TEXT_FRAMES
+            )
+            if not ready or not _mem(ms.phone_call_active):
+                break
+            text = _mem(ms.phone_call_text)
+            if text and text not in texts:
+                texts.append(text)
+            await _macro_press(["A"], source)
+            presses += 1
+        # After the hang-up the window slides out before the player gets control back.
+        await _await_game(lambda: not _mem(ms.phone_call_active), MACRO_MENU_FRAMES)
+    still_open = bool(_mem(ms.phone_call_active))
+    if still_open:
+        logger.warning(f"{source}: a POKéNAV call is still open after {presses} A presses (stage {_mem(ms.phone_call_stage)})")
+    return {"texts": texts, "presses": presses, "open": still_open}
+
+
+def _call_text(call: Dict[str, Any]) -> str:
+    """One line for a result: what the caller said, and whether the call is over."""
+    said = _quote(call["texts"]) or "(the caller's words could not be read)"
+    if call["open"]:
+        return (
+            f"A POKéNAV call is still open after {call['presses']} A presses ({said}): "
+            "press A until it hangs up."
+        )
+    return f"A POKéNAV call rang and was read to its end: {said}."
+
+
 @app.post("/mcp/auto_advance_dialogue")
 async def mcp_auto_advance_dialogue(request: dict = None):
-    """Harness step (not a model tool): press A through a plain text box.
+    """Harness step (not a model tool): press A through a plain text box, and through a
+    POKéNAV call to its hang-up (_finish_call).
 
     Stops at a YES/NO or any menu, when the box closes, when the game leaves the
-    overworld, or after max_presses. Returns the text it advanced through.
+    overworld, or after max_presses. Returns the text it advanced through; "call_open"
+    is True when a call is still on screen.
     """
     if env is None or game_type != "emerald":
         return {"success": False, "presses": 0, "error": "only available for Emerald"}
+    from server import menu_state as ms
+    from server.field_control import DIALOGUE_PLAIN
+
+    if not _mem(ms.phone_call_active):
+        return await _advance_dialogue(request)
+    call = await _finish_call("auto_dialogue")
+    head = _call_text(call)
+    if call["open"]:
+        # Never press blindly into a call that didn't end: say so instead.
+        return {
+            "success": True, "presses": call["presses"], "texts": call["texts"], "final_status": DIALOGUE_PLAIN,
+            "capped": True, "call_open": True, "summary": head,
+        }
+    # A script can go on after its call (Dad's call on the boat, then "Registered DAD
+    # NORMAN in the POKéNAV."): read that too.
+    after = await _advance_dialogue(request)
+    response = dict(after)
+    response["presses"] = call["presses"] + after.get("presses", 0)
+    response["texts"] = call["texts"] + [t for t in after.get("texts", []) if t not in call["texts"]]
+    response["call_open"] = False
+    response["summary"] = f"{head} Then: {after['summary']}" if after.get("presses") else head
+    return response
+
+
+async def _advance_dialogue(request: Optional[dict]) -> Dict[str, Any]:
     from server.field_control import (
         DIALOGUE_BUSY,
         DIALOGUE_CHOICE,
@@ -5391,8 +5563,8 @@ async def mcp_auto_advance_dialogue(request: dict = None):
             if first not in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
                 return battle
     if first == DIALOGUE_CHOICE:
-        # A YES/NO the model just answered can take a few frames to close.
-        await asyncio.sleep(0.3)
+        # A YES/NO the model just answered can take a few frames to close (was 0.3 s).
+        await _await_game(lambda: False, 18)
         first = status()
     # PLAIN: read it. BUSY: an event is running (e.g. healing after YES) and its next
     # box is worth waiting a few seconds for. Anything else is the model's to handle.
@@ -5416,17 +5588,29 @@ async def mcp_auto_advance_dialogue(request: dict = None):
         queued = asyncio.run_coroutine_threadsafe(
             take_action(ActionRequest(buttons=["A"], speed="fast", source="auto_dialogue")), loop
         ).result(timeout=10)
+        # No wall-clock timeout here: the wait is a frame budget that itself gives up
+        # when the game loop stops (_FrameBudget).
         asyncio.run_coroutine_threadsafe(
-            _await_sequence(queued.get("sequence_id"), 10.0), loop
-        ).result(timeout=15)
+            _await_sequence(queued.get("sequence_id"), _sequence_frames(1)), loop
+        ).result()
 
     def settle():
-        # >= 12 frames at any game speed: long enough for a YES/NO box to appear.
-        time.sleep(max(12.0 / max(1, fps), 0.15))
+        # 12 game frames, counted: long enough for a YES/NO box to appear. It was 0.15 s,
+        # which is fewer frames than that whenever the emulator runs behind.
+        _wait_frames_blocking(12)
 
     result = await run_in_threadpool(
         auto_advance_dialogue, status, read_text, press_a, settle, max_presses
     )
+    if result.final_status == DIALOGUE_CHOICE:
+        # Hand a YES/NO back only once it takes input (menu_state.yes_no_ready). Seen in
+        # test_macros once the settles counted frames: the read returned within five
+        # frames of WALLY's "will you have a battle with me?" YES/NO, the A that answered
+        # it was ignored, and the question stayed up. Under load the old wall-clock
+        # settles could leave as few frames.
+        from server import menu_state as ms
+
+        await _await_game(lambda: _mem(ms.yes_no_ready), 30)
     response = {
         "success": True,
         "presses": result.presses,
@@ -5548,7 +5732,7 @@ async def mcp_press_buttons(request: dict):
         )
         before = _field_snapshot()
         queued = await take_action(action_request)
-        report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(actual_buttons)))
+        report = await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(actual_buttons)))
         await _settle_after_sequence(before, report)
 
         logger.info(f"🎮 Queued buttons via MCP: {actual_buttons} - {reasoning}")
@@ -5640,12 +5824,6 @@ def _battle_moved_on(request: dict, tool: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def _game_frame() -> int:
-    with memory_lock:
-        reader = env.memory_reader
-        return reader._read_u32(reader.addresses.MAIN_FRAME_COUNTER)
-
-
 def _grid_presses(start: int, goal: int, occupied: Optional[List[bool]] = None) -> List[str]:
     """Fewest D-pad presses between two cells of a battle menu's 2x2 grid.
 
@@ -5664,12 +5842,11 @@ def _grid_presses(start: int, goal: int, occupied: Optional[List[bool]] = None) 
 
 async def _await_battle_menu(menus: Tuple[str, ...], frames: int) -> Optional[Dict[str, Any]]:
     """Poll the battle view until its menu is one of `menus` or `frames` game frames pass."""
-    start = _game_frame()
-    deadline = time.monotonic() + 10.0  # guard in case the game loop is paused
+    budget = _FrameBudget(frames)
     view = _read_battle_view()
     with _turbo():
         while view is not None and view["menu"] not in menus:
-            if _game_frame() - start >= frames or time.monotonic() > deadline:
+            if budget.spent():
                 break
             await asyncio.sleep(0.02)
             view = _read_battle_view()
@@ -5680,7 +5857,7 @@ async def _press_battle_buttons(buttons: List[str], move: str) -> None:
     if not buttons:
         return
     queued = await take_action(ActionRequest(buttons=buttons, source="use_move", metadata={"move": move}))
-    await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+    await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(buttons)))
 
 
 def _move_key(text: str) -> str:
@@ -5927,17 +6104,18 @@ async def _macro_press(buttons: List[str], source: str) -> None:
     if not buttons:
         return
     queued = await take_action(ActionRequest(buttons=list(buttons), source=source))
-    await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+    await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(buttons)))
 
 
 async def _await_game(check, frames: int):
-    """Poll check() until it returns something truthy or `frames` game frames pass."""
-    start = _game_frame()
-    deadline = time.monotonic() + max(10.0, frames / 20)  # guard in case the loop is paused
+    """Poll check() until it returns something truthy or `frames` game frames pass
+    (_FrameBudget: the old wall-clock cap of max(10 s, frames / 20) gave up first
+    whenever the emulator ran under 20-24 fps)."""
+    budget = _FrameBudget(frames)
     value = check()
     with _turbo():
         while not value:
-            if _game_frame() - start >= frames or time.monotonic() > deadline:
+            if budget.spent():
                 break
             await asyncio.sleep(0.02)
             value = check()
@@ -5971,6 +6149,19 @@ def _hp_text(party: List[Dict[str, Any]]) -> str:
 def _player_can_walk() -> bool:
     snap = _field_snapshot()
     return snap is not None and snap.field_free
+
+
+def _box_waits_for_a() -> bool:
+    """A on the field now does what it is meant to: a text box shows its arrow (the
+    script's waitbuttonpress, or a printer at a paragraph's end), or a YES/NO or menu is
+    up for A to answer. A while a line still prints only hurries it along."""
+    from server import menu_state as ms
+    from server.field_control import DIALOGUE_CHOICE, dialogue_status
+
+    snap = _field_snapshot()
+    if snap is None:
+        return False
+    return snap.waiting_for_button or dialogue_status(snap) == DIALOGUE_CHOICE or _mem(ms.text_waiting_for_button)
 
 
 def read_field_text(reader) -> str:
@@ -6015,8 +6206,10 @@ async def _play_out_battle_steps(
     texts: List[str] = []
     notes: List[str] = []
     presses = replaced = 0
-    start = _game_frame()
-    deadline = time.monotonic() + (max_wall_s if max_wall_s is not None else max(30.0, frames / 20))
+    budget = _FrameBudget(frames)
+    # max_wall_s is a real wall-clock limit (the agent's HTTP request times out), not a
+    # guess at the game's speed; without it only the frame budget ends the play-out.
+    deadline = time.monotonic() + max_wall_s if max_wall_s is not None else None
     seen = _frames_run
     flow = _mem(ms.read_battle_flow)
     if flow.text and flow.in_battle and flow.message_printing:
@@ -6098,7 +6291,9 @@ async def _play_out_battle_steps(
             await _macro_press(["A"], source)
             presses += 1
         if end is None and (
-            _game_frame() - start > frames or time.monotonic() > deadline or presses > MACRO_MAX_BATTLE_PRESSES
+            budget.spent()
+            or (deadline is not None and time.monotonic() > deadline)
+            or presses > MACRO_MAX_BATTLE_PRESSES
         ):
             end = "timeout"
         if end is not None:
@@ -7447,7 +7642,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
         target = b if here == a else a
         button = next(k for k, (dx, dy) in DIRECTION_DELTAS.items() if (here[0] + dx, here[1] + dy) == target)
         queued = await take_action(ActionRequest(buttons=[button], source=source, check_movement=True))
-        report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(1))
+        report = await _await_sequence(queued.get("sequence_id"), _sequence_frames(1))
         after = _field_snapshot()
         if after is not None and (after.x - ox, after.y - oy) == target:
             steps += 1
@@ -7563,11 +7758,14 @@ async def _talk_until(ready, rounds: int = 4) -> Tuple[bool, List[str]]:
     finished printing, a few frames before the YES/NO task started, so a single
     status check after it called a normal greeting a failure.
     """
+    from server import menu_state as ms
     from server.field_control import DIALOGUE_BUSY, DIALOGUE_NONE, DIALOGUE_PLAIN
 
     texts: List[str] = []
     for _ in range(rounds):
         if await _await_game(ready, 60):
+            # The caller presses next: a script YES/NO drops input for 5 frames.
+            await _await_game(lambda: _mem(ms.yes_no_ready), 30)
             return True, texts
         status = _field_status()
         if status in (DIALOGUE_PLAIN, DIALOGUE_BUSY):
@@ -7576,6 +7774,7 @@ async def _talk_until(ready, rounds: int = 4) -> Tuple[bool, List[str]]:
         elif status == DIALOGUE_NONE:
             break  # the conversation ended without the menu
     if await _await_game(ready, MACRO_MENU_FRAMES):
+        await _await_game(lambda: _mem(ms.yes_no_ready), 30)
         return True, texts
     said = _mem(read_field_text)
     if said and said not in texts:
@@ -8026,8 +8225,13 @@ async def _talk_next_to(x: int, y: int, source: str) -> Dict[str, Any]:
         for _ in range(3):
             # A POKéNAV call can ring on the walk (seen in a test: ISABEL called as the
             # player reached Wally, and the A read her call). Finish it, then talk.
-            while _mem(phone_call_active):
-                calls.extend((await _read_dialogue()).get("texts") or [])
+            if _mem(phone_call_active):
+                # _finish_call presses only while the call takes A; a call it could not
+                # end is reported, never pressed at forever (this was a while loop).
+                call = await _finish_call(source)
+                calls.extend(call["texts"])
+                if call["open"]:
+                    return _refusal(f"Did not talk to the person at ({x},{y}): {_call_text(call)}")
             if snap.facing != facing:
                 await _macro_press([facing], source)  # the person blocks the step, so this only turns
                 snap = _field_snapshot() or snap
@@ -9581,6 +9785,7 @@ async def mcp_navigate_to(request: dict):
 
     try:
         from server import game_tools
+        from server import menu_state as ms
         from server.field_control import player_surfing
 
         x = request.get("x")
@@ -9663,8 +9868,17 @@ async def mcp_navigate_to(request: dict):
             before = _field_snapshot()
             was_surfing = _mem(player_surfing)
             queued = await take_action(action_request)
-            report = await _await_sequence(queued.get("sequence_id"), _sequence_timeout(len(buttons)))
+            report = await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(buttons)))
             await _settle_after_sequence(before, report)
+            # A POKéNAV call stopped the walk (as in go_to_exit): read it, walk on.
+            calls_before = int(request.get("_calls", 0))
+            if calls_before < 2 and _mem(ms.phone_call_active):
+                call = await _finish_call("navigate_to")
+                if call["open"]:
+                    return told(_refusal(f"Did not reach ({x},{y}): {_call_text(call)}"))
+                again = await mcp_navigate_to({**request, "_calls": calls_before + 1})
+                again["summary"] = f"{_call_text(call)} {again.get('summary') or again.get('error', '')}".strip()
+                return told(again)
             # A rock or tree the party can clear stopped the walk: clear it, walk on.
             tile = (report or {}).get("blocked_tile")
             cleared_before = int(request.get("_cleared", 0))

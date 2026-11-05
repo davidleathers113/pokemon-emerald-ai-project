@@ -105,6 +105,92 @@ def test_pokenav_call_with_the_callers_icon_is_read_through():
         assert tuple(s.srv.env.memory_reader._read_current_map()) != (0, 20), "the boat should have sailed on"
 
 
+# pret src/match_call.c sMatchCallState (.sym 0203cd80): {u32 minutes; u16 trainerId;
+# u8 stepCounter; u8 triggeredFromScript}. TryStartMatchCall rings on every 10th step,
+# 10 minutes after the last call (minutes > now also passes), 3 times in 10
+# (CheckMatchCallChance), from a registered trainer (SelectMatchCallTrainer).
+MATCH_CALL_STATE = 0x0203CD80
+SURF_SHORE = Path(__file__).resolve().parent / "test_surf_shore.state"  # ROUTE 118, 19 trainers registered
+LAVARIDGE = Path(__file__).resolve().parent / "test_lavaridge_after_chimney.state"  # 15 registered
+
+
+def _ring_a_call(s, tries=60):
+    """Step left and right with the next step always a call's 10th, until a call rings."""
+    for i in range(tries):
+        with s.srv.memory_lock:
+            s.srv.env.core.memory.u32[MATCH_CALL_STATE] = 0xFFFFFFFF
+            s.srv.env.core.memory.u8[MATCH_CALL_STATE + 6] = 9
+            s.srv.env.memory_reader._invalidate_mem_cache()
+        _press(s, ["LEFT" if i % 2 else "RIGHT"])
+        if _call_on(s):
+            return
+    raise AssertionError(f"no call rang in {tries} steps")
+
+
+def _call_on(s):
+    from server.menu_state import phone_call_active
+
+    with s.srv.memory_lock:
+        return phone_call_active(s.srv.env.memory_reader)
+
+
+def test_a_match_call_is_read_to_its_hang_up_in_one_read():
+    """A registered trainer's call (made to ring per pret TryStartMatchCall). The plain
+    reader pressed A whenever a box showed: 15 presses (one read) left this call open
+    and its quote was an older text still in gStringVar4 ("I thought I was doing okay in
+    my training…"); a second read took 5 more. A is now pressed only when the call takes
+    it: one read ends it, quoting what the caller said."""
+    s = server()
+    s.load(SURF_SHORE, wild_encounters=False)
+    _ring_a_call(s)
+    r = s.call("mcp_auto_advance_dialogue", {})
+    print("   ", r)
+    assert not _call_on(s), r
+    assert r.get("call_open") is False and "read to its end" in r["summary"], r
+    assert any("This is" in t or "DAVID" in t for t in r["texts"]), r
+    assert not any("doing okay in my training" in t for t in r["texts"]), r
+    assert r["presses"] <= 10, r
+    assert s.srv._player_can_walk(), "control should be back"
+
+
+def test_a_call_that_does_not_end_is_reported_open():
+    """If A stops moving the call on, the read says the call is still open, and presses
+    nothing into it blindly; a result while it plays names it as a call."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(SURF_SHORE, wild_encounters=False)
+    _ring_a_call(s)
+    note = _press(s, ["DOWN"])["summary"]  # controls are locked: this only reads the screen
+    assert "POKéNAV call is playing" in note, note
+    real = ms.phone_call_waits_for_a
+    ms.phone_call_waits_for_a = lambda reader: False
+    try:
+        r = s.call("mcp_auto_advance_dialogue", {})
+    finally:
+        ms.phone_call_waits_for_a = real
+    print("   ", r)
+    assert r.get("call_open") is True and r["presses"] == 0, r
+    assert "still open" in r["summary"] and "press A until it hangs up" in r["summary"], r
+    assert _call_on(s)
+    r = s.call("mcp_auto_advance_dialogue", {})  # A moves it on again: the call ends
+    assert not _call_on(s) and r.get("call_open") is False, r
+
+
+def test_go_to_exit_reads_a_call_that_rings_on_the_way():
+    """Seen in a load test: go_to_exit into LAVARIDGE TOWN GYM 1F stopped at (8,14), "the
+    game took control of the player (cutscene, warp or menu)", a call on screen, and
+    gave up. A call ringing as the walk starts stops it the same way."""
+    s = server()
+    s.load(LAVARIDGE, wild_encounters=False)
+    _ring_a_call(s)
+    r = s.call("mcp_go_to_exit", {"exit": "LAVARIDGE TOWN GYM 1F", "reasoning": "test"})
+    print("   ", r.get("summary"))
+    assert r["success"] is True, r
+    assert s.srv._location_name() == "LAVARIDGE TOWN GYM 1F"
+    assert "POKéNAV call rang" in r["summary"], r
+
+
 def test_nothing_happens_without_a_text_box():
     s = server()
     s.load(ROUTE101)
