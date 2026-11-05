@@ -179,6 +179,35 @@ def npc_at(reader, x: int, y: int) -> bool:
     return (x, y) in npc_positions(reader)
 
 
+def moved_people(reader) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """(map-file tile, where they stand now) of this map's loaded people who stand off
+    their map-file tile.
+
+    pret include/global.fieldmap.h struct ObjectEvent: +0x09 mapNum, +0x0A mapGroup,
+    +0x0C initialCoords (the template's x, y + MAP_OFFSET: map.json's tile), +0x10
+    currentCoords. Seen live in FORTREE CITY GYM: JARED walked over to battle and stayed
+    at (4,16), while the map (map.json) still put him at (4,14). Walks and talk_to take
+    people from here, not from the map file.
+    """
+    player_base = _player_object_base(reader)
+    map_group, map_num = reader._read_current_map()
+    moved = []
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        if base == player_base:
+            continue
+        flags = reader._read_u8(base) | (reader._read_u8(base + 1) << 8)
+        if not flags & 0x1 or flags & (1 << 13):  # inactive or invisible
+            continue
+        if (reader._read_u8(base + 0x0A), reader._read_u8(base + 0x09)) != (map_group, map_num):
+            continue  # a neighbouring map's person: not in this map's file
+        spawn = (reader._read_s16(base + 0x0C) - MAP_OFFSET, reader._read_s16(base + 0x0E) - MAP_OFFSET)
+        now = (reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET)
+        if spawn != now:
+            moved.append((spawn, now))
+    return moved
+
+
 # ---------------------------------------------------------------------------
 # Movement verdicts
 # ---------------------------------------------------------------------------

@@ -319,6 +319,21 @@ def load_pathfinding_state(env) -> tuple:
                             ]
                         except Exception as e:  # positions are a refinement; the static list remains
                             logger.debug(f"live object positions unavailable: {e}")
+                        # Someone loaded and standing off their map-file tile (a trainer who
+                        # walked over to battle stays where they stopped) is in the live list
+                        # above: their map-file tile is free (field_control.moved_people).
+                        try:
+                            from server.field_control import moved_people
+
+                            ox, oy = coord_offset or (0, 0)
+                            left = {(sx - ox, sy - oy) for (sx, sy), _ in moved_people(env.memory_reader)}
+                            if left:
+                                state["map"]["porymap"]["objects"] = [
+                                    o for o in state["map"]["porymap"]["objects"]
+                                    if (o.get("x"), o.get("y")) not in left
+                                ]
+                        except Exception as e:  # the map-file tiles stay blocked, as before
+                            logger.debug(f"moved people unavailable: {e}")
                         state["map"]["porymap"]["dimensions"] = json_map.get("dimensions", {})
                         state["map"]["porymap"]["warps"] = json_map.get("warps", [])
                         # The tiles that really warp (map.json warp_events): the builder
@@ -347,6 +362,13 @@ def load_pathfinding_state(env) -> tuple:
                         # For selected dynamic maps (e.g. Mauville Gym), replace static
                         # porymap tiles with the current live map buffer state.
                         apply_live_metatile_overlay(state, env, location_name)
+                        # Rotating gates (FORTREE CITY GYM): walks plan their pushes from
+                        # the gates' live orientations (rotating_gates.py).
+                        puzzle, orientations = rotating_gate_state(
+                            env, porymap_map_name, state["map"]["porymap"].get("raw_tiles"), coord_offset
+                        )
+                        state["map"]["porymap"]["rotating_gates"] = puzzle
+                        state["map"]["porymap"]["gate_orientations"] = orientations
                         map_source = {"json_map": json_map, "porymap_map_name": porymap_map_name}
 
                         grid_dims = (
@@ -394,6 +416,58 @@ def _shown_objects(env, objects: list) -> list:
         if not hidden:
             shown.append(obj)
     return shown
+
+
+def rotating_gate_state(env, porymap_map_name: str, raw_tiles, coord_offset=None) -> tuple:
+    """(puzzle, live orientations) for a map with rotating gates, else (None, None).
+
+    The puzzle is found by the map's id (pret rotating_gate.c
+    GetCurrentMapRotatingGatePuzzleType); the orientations are read from VAR_TEMP_0 on.
+    When they can't be read, the gates are left out (the walk then bumps into them as
+    before) rather than planned from a guess."""
+    from utils.mapping import rotating_gates
+
+    puzzle = rotating_gates.puzzle_for_map(
+        _raw_map_json(porymap_map_name).get("id"), raw_tiles, tuple(coord_offset or (0, 0))
+    )
+    if puzzle is None:
+        return None, None
+    reader = getattr(env, "memory_reader", None)
+    orientations = None
+    try:
+        orientations = rotating_gates.read_orientations(reader, len(puzzle.gates)) if reader else None
+    except Exception as e:  # unreadable: walk as before rather than fail the walk
+        logger.warning(f"rotating gates: orientations unreadable: {e}")
+    if orientations is None:
+        logger.warning(f"rotating gates on {porymap_map_name}: no valid orientations in VAR_TEMP_0..; not modelled")
+        return None, None
+    return puzzle, orientations
+
+
+def live_gate_orientations(env, porymap_map_name: str) -> tuple | None:
+    """The gates' orientations now on this map (caller holds the lock), or None."""
+    from utils.mapping import rotating_gates
+
+    config = rotating_gates.PUZZLES.get(_raw_map_json(porymap_map_name).get("id") or "")
+    reader = getattr(env, "memory_reader", None)
+    if not config or reader is None:
+        return None
+    return rotating_gates.read_orientations(reader, len(config))
+
+
+def rotating_gate_blocks(reader, porymap_map_name: str, button: str, tile) -> bool:
+    """Did a rotating gate stop the step in direction button onto tile (caller holds the
+    lock)? The tile is floor; one of the gate's arms is in the way and a wall is in the
+    sweep of its turn (pret CheckForRotatingGatePuzzleCollision)."""
+    from utils.mapping import rotating_gates
+    from utils.mapping.porymap_state import layout_tiles
+
+    tiles = layout_tiles(porymap_map_name)
+    puzzle = rotating_gates.puzzle_for_map(_raw_map_json(porymap_map_name).get("id"), tiles)
+    if puzzle is None or button not in rotating_gates.DELTAS or puzzle.collision_at(*tile) != 0:
+        return False
+    orientations = rotating_gates.read_orientations(reader, len(puzzle.gates))
+    return orientations is not None and puzzle.step(orientations, button, tuple(tile)) is None
 
 
 def navigate_to_direct(
@@ -524,6 +598,8 @@ def navigate_to_direct(
             manhattan_dist = abs(x - start_x) + abs(y - start_y)
             if manhattan_dist > 100:
                 error_msg += f" (distance: {manhattan_dist} tiles - may be too far)"
+            if map_data.get("rotating_gates") is not None:
+                error_msg += " (planned through this map's rotating gates as they stand now)"
 
             return {"success": False, "error": error_msg, "target": f"({x}, {y})", "reason": "unreachable"}
 
@@ -551,6 +627,10 @@ def navigate_to_direct(
             "reason": nav_reason,
             "variance": variance_level or "none",
         }
+        if map_data.get("rotating_gates") is not None:
+            # The gates as the plan leaves them: the walk checks the game agrees.
+            result["gates_after"] = list(pathfinder.last_gate_orientations or ())
+            result["gates_before"] = list(map_data.get("gate_orientations") or ())
 
         # The pathfinder quietly retargets an unwalkable goal and returns partial paths;
         # without this note the model believes it reached the tile it asked for.

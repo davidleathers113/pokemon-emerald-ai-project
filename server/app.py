@@ -1096,6 +1096,19 @@ def _drop_rest_of_sequence(seq_id: int, keep_facing_presses: bool = False) -> in
     return dropped
 
 
+def _gate_blocked(button: str, tile) -> bool:
+    """A rotating gate, not the tile, stopped this step (caller holds the memory lock)."""
+    try:
+        from server.game_tools import rotating_gate_blocks
+        from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+        map_dir = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
+        return bool(map_dir) and rotating_gate_blocks(env.memory_reader, map_dir, button, tile)
+    except Exception as e:  # a message detail must never break the move judgement
+        logger.debug(f"rotating gate check failed: {e}")
+        return False
+
+
 def _judge_move(check: Dict[str, Any], after) -> None:
     global last_blocked_press
     from server.field_control import (
@@ -1122,7 +1135,15 @@ def _judge_move(check: Dict[str, Any], after) -> None:
         tx, ty = blocked_target(button, before)
         with memory_lock:
             occupied = npc_at(env.memory_reader, tx, ty)
+            gate = not occupied and _gate_blocked(button, (tx, ty))
         what = "is occupied by someone" if occupied else "is not walkable"
+        if gate:
+            # pret CheckForRotatingGatePuzzleCollision: the tile is floor; "not walkable"
+            # would send the model looking for another way round a tile it can stand on.
+            what = (
+                "is floor, but a rotating gate's arm is in the way and a wall stops the gate turning "
+                "(push it from another side, or let navigate_to plan the pushes)"
+            )
         message = (
             f"BLOCKED moving {button} at ({before.x},{before.y}) on {location}: ({tx},{ty}) {what}. "
             f"{skipped} of {total} presses skipped."
@@ -4992,6 +5013,9 @@ SURF_EFFECT_FRAMES = 900
 SURF_PRESSES = 4
 # Surf starts and landings one navigate_to may take before it stops and reports.
 SURF_MAX_STEPS = 4
+# Fresh plans one navigate_to makes when a walk through rotating gates ends off its plan
+# (mcp_navigate_to); a gate the model doesn't know about can't keep it walking forever.
+GATE_REPLANS = 3
 
 
 async def _start_surf(tile, source: str) -> Optional[str]:
@@ -7607,6 +7631,34 @@ WALK_SCENE_WAITS = 3
 WALK_BLOCKED_RETRIES = 2
 
 
+async def _settle_after_interruption() -> None:
+    """After the game stopped a walk: read plain text through and wait out a scene until
+    the player can walk again or a battle starts (as _walk_along does between maps).
+
+    Seen live in FORTREE CITY GYM: a trainer spotting the player ("!", the walk up, their
+    line) stopped talk_to's walk, and the walks it tried next pressed through the scene;
+    the press after such a scene was also lost. Nothing is pressed into a battle or a
+    YES/NO here."""
+    from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+
+    reads = waits = 0
+    while not _player_can_walk() and not _mem(lambda r: r.is_in_battle()):
+        status = _field_status()
+        if status in (DIALOGUE_PLAIN, DIALOGUE_BUSY) and reads < 6:
+            reads += 1
+            await _read_dialogue()
+            continue
+        if waits >= WALK_SCENE_WAITS:
+            return
+        waits += 1
+        await _await_game(
+            lambda: _mem(lambda r: r.is_in_battle())
+            or _player_can_walk()
+            or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY),
+            MACRO_TEXT_FRAMES,
+        )
+
+
 async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]]:
     """Walk to the nearest Pokémon Center 1F (game_tools.pokemon_center_route), running
     from wild battles on the way. Returns (maps entered, why it stopped short or None).
@@ -7895,6 +7947,17 @@ async def mcp_talk_to(request: dict = None):
         return refused
     if _field_snapshot() is None:
         return _refusal("The player's position could not be read.")
+    # The map (and so the model) shows people at their map-file tile; one who walked off
+    # it (a trainer who came over to battle stays where they stopped) is talked to where
+    # they stand (field_control.moved_people).
+    from server.field_control import moved_people, npc_at
+
+    moved_note = ""
+    if not _mem(npc_at, x, y):
+        now = next((n for spawn, n in _mem(moved_people) if spawn == (x, y)), None)
+        if now is not None:
+            moved_note = f"The person from ({x},{y}) stands at ({now[0]},{now[1]}) now. "
+            x, y = now
     entered, why = await _cross_to(
         [(x - dx, y - dy) for dx, dy in DIRECTION_DELTAS.values()],
         f"the person at ({x},{y})",
@@ -7902,9 +7965,11 @@ async def mcp_talk_to(request: dict = None):
         f"talk_to({x}, {y}) again",
     )
     if why:
-        return _refusal(f"Did not reach ({x},{y}): {why}. {_crossing_note(entered)}".strip())
+        return _refusal(f"{moved_note}Did not reach ({x},{y}): {why}. {_crossing_note(entered)}".strip())
     result = await _talk_next_to(x, y, source)
-    result["summary"] = _crossing_note(entered) + str(result.get("summary") or "")
+    result["summary"] = moved_note + _crossing_note(entered) + str(result.get("summary") or "")
+    if result.get("error"):
+        result["error"] = moved_note + result["error"]
     return result
 
 
@@ -7924,19 +7989,37 @@ async def _talk_next_to(x: int, y: int, source: str) -> Dict[str, Any]:
     tried = []
     for sx, sy, facing in sides:
         snap = _field_snapshot()
-        if snap is None or (snap.x, snap.y) != (sx, sy):
+        walk: dict[str, Any] = {}
+        # A second try when a scene stopped the first walk (it is planned again from
+        # where the scene left the player).
+        for _ in range(2):
+            if snap is not None and (snap.x, snap.y) == (sx, sy):
+                break
             # through_warps False: _cross_to already took any way through warps, and
             # each side alone must not send the walk off through them.
             walk = await mcp_navigate_to({
                 "x": sx, "y": sy, "variance": "none", "reason": f"{source}: next to ({x},{y})",
                 "consider_npcs": True, "through_warps": False,
             })
+            # A trainer who spots the player stops the walk with their scene; walks to the
+            # other sides would press through it. Let it play out first.
+            scene = not _mem(lambda r: r.is_in_battle()) and not _player_can_walk()
+            if scene:
+                await _settle_after_interruption()
             if _mem(lambda r: r.is_in_battle()):
-                return _refusal(f"A battle started on the way to ({x},{y}): fight it with use_move, then talk_to again.")
+                view = _read_battle_view() or {}
+                kind = "A trainer battle (a trainer spotted you)" if view.get("is_trainer") else "A battle"
+                return _refusal(
+                    f"{kind} started on the way to ({x},{y}): fight it with use_move, then talk_to({x}, {y}) again."
+                )
+            if not _player_can_walk():
+                return _refusal(f"The walk to ({x},{y}) was stopped and the player can't move yet{_screen_note()}")
             snap = _field_snapshot()
-            if snap is None or (snap.x, snap.y) != (sx, sy):
-                tried.append(f"({sx},{sy}): {str(walk.get('summary') or walk.get('error'))[:80]}")
-                continue
+            if not scene:
+                break
+        if snap is None or (snap.x, snap.y) != (sx, sy):
+            tried.append(f"({sx},{sy}): {str(walk.get('summary') or walk.get('error'))[:80]}")
+            continue
         from server.menu_state import phone_call_active
 
         calls = []
@@ -9630,11 +9713,56 @@ async def mcp_navigate_to(request: dict):
             # walked back in and out of a shop).
             response["summary"] = f"Went through a door/warp: now at {_position_text(snap)}."
         else:
+            gates_note = ""
+            if result.get("gates_after") is not None and snap is not None:
+                # Rotating gates: the walk is planned push by push, so where it ends and
+                # how the gates stand must be what the plan said. When not (a press lost,
+                # a trainer's walk-up or text cut it short), plan again from the game's
+                # gates; a battle is left to the player.
+                from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+                # A trainer's scene stops the walk and the press after it is lost: let it
+                # play out, then judge (and plan) from where the game really is.
+                if not at_target and not _player_can_walk() and not _mem(lambda r: r.is_in_battle()):
+                    await _settle_after_interruption()
+                    snap = _field_snapshot() or snap
+                if _mem(lambda r: r.is_in_battle()):
+                    gates_note = f" A battle started on the way: fight it with use_move, then navigate_to({x}, {y}) again."
+                map_dir = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
+                live = _mem(lambda r: game_tools.live_gate_orientations(env, map_dir))
+                planned_end = tuple(result.get("path_end") or ())
+                as_planned = (
+                    live is not None
+                    and list(live) == list(result["gates_after"])
+                    and (snap.x - ox, snap.y - oy) == planned_end
+                )
+                replans = int(request.get("_regated", 0))
+                if (
+                    not as_planned
+                    and not at_target
+                    and replans < GATE_REPLANS
+                    and _player_can_walk()
+                    and not _mem(lambda r: r.is_in_battle())
+                ):
+                    again = await mcp_navigate_to({**request, "_regated": replans + 1})
+                    again["summary"] = (
+                        f"The walk through the rotating gates did not go as planned (stopped at "
+                        f"({snap.x - ox},{snap.y - oy}), gates {list(live) if live is not None else 'unread'}, "
+                        f"planned {result['gates_after']}); planned again from there. "
+                        f"{again.get('summary') or again.get('error', '')}"
+                    ).strip()
+                    return told(again)
+                if not as_planned:
+                    gates_note += (
+                        f" The rotating gates stand {list(live) if live is not None else 'unread'}; "
+                        f"the walk planned {result['gates_after']}."
+                    )
             if at_target:
                 response["summary"] = f"Reached ({x},{y}). " + response["summary"]
             elif ran_clean:
                 reason_text = f" {result['note']}." if result.get("note") else ""
                 response["summary"] = f"Did not reach ({x},{y}).{reason_text} " + response["summary"]
+            response["summary"] += gates_note
             hint = exit_hint()
             if hint:
                 response["summary"] += f" {hint}"

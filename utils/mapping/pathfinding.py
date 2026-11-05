@@ -119,6 +119,7 @@ class Node:
     f_cost: float = 0  # Total cost (g + h)
     parent: Optional["Node"] = None
     carried: Optional[int] = None  # the walker's elevation (kept across BRIDGE_ELEVATION tiles)
+    gates: tuple | None = None  # rotating gates' orientations here (rotating_gates.py)
 
     def __post_init__(self):
         self.f_cost = self.g_cost + self.h_cost
@@ -167,6 +168,9 @@ class Pathfinder:
         # current (David, 2026-11-03: "make sure it doesn't avoid tall grass now. I want it
         # to battle pokemon") and GRASS_TILE_COST_MULTIPLIER otherwise.
         self.grass_cost = GRASS_TILE_COST_MULTIPLIER
+        # The rotating gates' orientations at the end of the last path found (None when
+        # the map has none): the walk compares them with the game's afterwards.
+        self.last_gate_orientations = None
 
     def find_path(
         self,
@@ -199,11 +203,19 @@ class Pathfinder:
         """
         # Extract map data from game state
         map_data = self._extract_map_data(game_state)
+        self.last_gate_orientations = None
 
         # CRITICAL: Require porymap data - no fallback allowed
         if not map_data:
             logger.error(f"Pathfinding: No map data available from {start} to {goal}")
             return None
+
+        # Among rotating gates a part-way walk toward the closest tile by distance turns
+        # gates on the way for nothing (the way may lie in the other direction), and the
+        # variance alternatives are planned without the gates: only whole planned walks.
+        if map_data.get("rotating_gates") is not None:
+            allow_partial = False
+            variance = None
 
         # Only use porymap data - reject other map types
         if map_data.get("type") != "porymap":
@@ -484,6 +496,10 @@ class Pathfinder:
                     "clearable": porymap.get("clearable", []),
                     # The party can Surf now (game_tools.can_surf): water joins the walk.
                     "surf": bool(porymap.get("surf")),
+                    # The map's rotating gate puzzle and the gates' live orientations
+                    # (game_tools.load_pathfinding_state): steps push and turn them.
+                    "rotating_gates": porymap.get("rotating_gates"),
+                    "gate_orientations": porymap.get("gate_orientations"),
                 }
 
                 # Include raw tiles with elevation if available
@@ -1411,20 +1427,42 @@ class Pathfinder:
             here = elevation(pos)
             return carried if here == BRIDGE_ELEVATION else here
 
-        def key(pos, carried):
+        # Rotating gates: which tiles join which depends on the gates' orientations and
+        # each push turns a gate, so the same tile with the gates turned otherwise is
+        # another search state (rotating_gates.py). Their check runs only for a step onto a
+        # tile with collision 0, as pret CheckForObjectEventCollision does it only when
+        # GetCollisionAtCoords found nothing (a ledge jump or Surf step never pushes one).
+        puzzle = map_data.get("rotating_gates")
+        start_gates = tuple(map_data.get("gate_orientations") or ()) if puzzle is not None else None
+        if puzzle is not None and len(start_gates) != len(puzzle.gates):
+            puzzle, start_gates = None, None
+
+        def gates_after(gates, pos, to):
+            if puzzle is None:
+                return gates
+            tile = raw_tile(to)
+            if tile is not None and len(tile) > 2 and tile[2] != 0:
+                return gates
+            dx, dy = to[0] - pos[0], to[1] - pos[1]
+            button = "RIGHT" if dx > 0 else "LEFT" if dx < 0 else "DOWN" if dy > 0 else "UP"
+            return puzzle.step(gates, button, to)
+
+        def key(pos, carried, gates=None):
             # On a bridge, the same tile walked on from different floors leads on
             # differently, so it is a different search state.
-            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None)
+            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None, gates)
 
         start_carried = carried_after(None, start)
-        start_node = Node(start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried)
+        start_node = Node(
+            start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried, gates=start_gates
+        )
         goal_node = Node(goal[0], goal[1])
         clearable = {tuple(t) for t in map_data.get("clearable") or []}
 
         open_list = []
         heapq.heappush(open_list, start_node)
         closed_set = set()
-        node_map = {key(start, start_carried): start_node}
+        node_map = {key(start, start_carried, start_gates): start_node}
 
         # Track the best node (closest to goal) in case we can't reach it
         best_node = start_node
@@ -1434,6 +1472,8 @@ class Pathfinder:
 
             # Check if we reached the goal
             if (current.x, current.y) == goal:
+                # How the walk leaves the gates, for the caller to check after walking.
+                self.last_gate_orientations = current.gates
                 return self._reconstruct_path(current)
 
             # Check if we've searched too far
@@ -1443,7 +1483,7 @@ class Pathfinder:
             if current.g_cost > max_distance * max(1.0, self.grass_cost):
                 continue
 
-            closed_set.add(key((current.x, current.y), current.carried))
+            closed_set.add(key((current.x, current.y), current.carried, current.gates))
 
             # Update best node if this one is closer to goal
             if current.h_cost < best_node.h_cost:
@@ -1457,11 +1497,13 @@ class Pathfinder:
             neighbors_with_cost = []
             for neighbor_pos in neighbors:
                 carried = carried_after(current.carried, neighbor_pos)
-                if key(neighbor_pos, carried) in closed_set:
-                    continue
-
                 # Check if this move is valid (handles ledge directions)
                 if not self._can_move_to((current.x, current.y), neighbor_pos, map_data, current.carried):
+                    continue
+                gates = gates_after(current.gates, (current.x, current.y), neighbor_pos)
+                if puzzle is not None and gates is None:
+                    continue  # a gate's arm is in the way and can't turn
+                if key(neighbor_pos, carried, gates) in closed_set:
                     continue
 
                 # Calculate movement cost - add penalty for grass tiles to avoid wild encounters
@@ -1484,16 +1526,16 @@ class Pathfinder:
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)
-                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost, carried))
+                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost, carried, gates))
 
             # Sort by h_cost (distance to goal) so we explore promising directions first
             # This helps find optimal paths when multiple neighbors have same f_cost
             neighbors_with_cost.sort(key=lambda x: x[2])  # Sort by h_cost
 
-            for neighbor_pos, g_cost, h_cost, carried in neighbors_with_cost:
-                state = key(neighbor_pos, carried)
+            for neighbor_pos, g_cost, h_cost, carried, gates in neighbors_with_cost:
+                state = key(neighbor_pos, carried, gates)
                 if state not in node_map:
-                    neighbor = Node(neighbor_pos[0], neighbor_pos[1], g_cost, h_cost, carried=carried)
+                    neighbor = Node(neighbor_pos[0], neighbor_pos[1], g_cost, h_cost, carried=carried, gates=gates)
                     neighbor.parent = current
                     node_map[state] = neighbor
                     heapq.heappush(open_list, neighbor)

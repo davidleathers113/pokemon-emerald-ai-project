@@ -28,7 +28,8 @@ REPO = Path(__file__).resolve().parent.parent
 IMAGE = "emerald-harness:local"
 # Longest first (minutes, measured serially), so the pool doesn't end on one long suite.
 DOCKER_SUITES = [
-    "train_macro", "macros", "warp_routes", "movement_exits", "objective_memory", "battle_flow", "battle_view",
+    "train_macro", "macros", "warp_routes", "rotating_gates", "movement_exits", "objective_memory", "battle_flow",
+    "battle_view",
     "use_item", "party_rule", "dialogue_agent", "dialogue_auto_advance", "phase4_agent",
     "movement_feedback", "surf", "prompt_cache", "play_endpoints", "phase4_backend", "phase23_health",
     "phase23_save_persistence", "gemini_fallback",
