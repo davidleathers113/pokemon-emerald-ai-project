@@ -323,21 +323,19 @@ def load_pathfinding_state(env) -> tuple:
                             ]
                         except Exception as e:  # positions are a refinement; the static list remains
                             logger.debug(f"live object positions unavailable: {e}")
-                        # Someone loaded and standing off their map-file tile (a trainer who
-                        # walked over to battle stays where they stopped) is in the live list
-                        # above: their map-file tile is free (field_control.moved_people).
+                        # Each object on the tile it stands on now, matched by local id
+                        # (field_control.object_places): a trainer who walked over to battle
+                        # stays where they stopped, a script moves statues; their map-file
+                        # tile is free.
                         try:
-                            from server.field_control import moved_people
+                            from server.field_control import object_places
+                            from utils.mapping.porymap_state import objects_where_they_stand
 
-                            ox, oy = coord_offset or (0, 0)
-                            left = {(sx - ox, sy - oy) for (sx, sy), _ in moved_people(env.memory_reader)}
-                            if left:
-                                state["map"]["porymap"]["objects"] = [
-                                    o for o in state["map"]["porymap"]["objects"]
-                                    if (o.get("x"), o.get("y")) not in left
-                                ]
+                            state["map"]["porymap"]["objects"] = objects_where_they_stand(
+                                state["map"]["porymap"]["objects"], object_places(env.memory_reader), coord_offset
+                            )
                         except Exception as e:  # the map-file tiles stay blocked, as before
-                            logger.debug(f"moved people unavailable: {e}")
+                            logger.debug(f"object places unavailable: {e}")
                         # Strength boulders where they stand now, apart from the people:
                         # walls, or pushed by the walk when the party can use STRENGTH
                         # (pathfinding _push_target; the walk pushes, server _push_boulder).
@@ -375,6 +373,12 @@ def load_pathfinding_state(env) -> tuple:
                         # Floor switches and scene triggers that would fire if stepped on:
                         # walks go round them unless that is the only way (find_path).
                         state["map"]["porymap"]["triggers"] = active_triggers(env, porymap_map_name)
+                        # A rotating tile puzzle's switches are never walked over: a press
+                        # moves statues, so only the puzzle's plan steps on one (puzzle_route).
+                        ox, oy = coord_offset or (0, 0)
+                        state["map"]["porymap"]["puzzle_switches"] = [
+                            (sx - ox, sy - oy) for sx, sy in puzzle_switches(porymap_map_name)
+                        ]
                         # Rocks and trees the party can clear: walkable for the planner
                         # (at a cost), cleared by the walk when it bumps into one.
                         state["map"]["porymap"]["clearable"] = list(clearable_obstacles(porymap_map_name))
@@ -963,6 +967,156 @@ def _raw_map_json(map_dir: str) -> dict:
             return _json.load(fh)
     except (OSError, ValueError):
         return {}
+
+
+def map_file_tiles(map_dir: str) -> Dict[int, Tuple[int, int]]:
+    """{local id: map.json tile} of a map's object events (pret's localId: the place in
+    object_events, from 1)."""
+    return {
+        number: (int(obj.get("x", -1)), int(obj.get("y", -1)))
+        for number, obj in enumerate(_raw_map_json(map_dir).get("object_events") or [], start=1)
+    }
+
+
+def statue_at(reader, map_dir: str, x: int, y: int) -> bool:
+    """Whether a statue (porymap_state.STATUE_GRAPHICS) stands on (x, y) now, by where
+    each object stands (field_control.object_places)."""
+    from server.field_control import object_places
+    from utils.mapping.porymap_state import STATUE_GRAPHICS
+
+    objects = _raw_map_json(map_dir).get("object_events") or []
+    return any(
+        tile == (x, y) and 0 < local_id <= len(objects) and objects[local_id - 1].get("graphics_id") in STATUE_GRAPHICS
+        for local_id, tile in object_places(reader).items()
+    )
+
+
+# A go_to route step that presses a rotating tile puzzle's floor switch (puzzle_route):
+# "FLOOR SWITCH (x, y)", walked onto by server/app.py _press_floor_switch.
+SWITCH_STEP = "FLOOR SWITCH"
+
+
+@lru_cache(maxsize=None)
+def puzzle_switches(map_dir: str) -> Dict[Tuple[int, int], int]:
+    """{tile: color} of a map's rotating tile puzzle switches: coord-event triggers whose
+    script runs `moverotatingtileobjects <color>` (pret MossdeepCity_Gym scripts.inc
+    MossdeepCity_Gym_EventScript_YellowFloorSwitch: moverotatingtileobjects 0). {} on
+    every other map."""
+    out = {}
+    for event in _raw_map_json(map_dir).get("coord_events") or []:
+        if event.get("type") != "trigger":
+            continue
+        for line in _script_lines(map_dir, str(event.get("script", ""))):
+            command, _, arg = line.partition(" ")
+            if command == "moverotatingtileobjects" and arg.strip().isdigit():
+                out[(int(event.get("x", -1)), int(event.get("y", -1)))] = int(arg.strip())
+                break
+    return out
+
+
+def _puzzle_is_trick_house(map_dir: str) -> bool:
+    """pret `initrotatingtilepuzzle TRUE` (the Trick House's tiles) in a switch's script."""
+    for event in _raw_map_json(map_dir).get("coord_events") or []:
+        for line in _script_lines(map_dir, str(event.get("script", ""))):
+            command, _, arg = line.partition(" ")
+            if command == "initrotatingtilepuzzle":
+                return arg.strip() == "TRUE"
+    return False
+
+
+def puzzle_objects(reader, map_dir: str) -> Tuple[Tuple[int, int], ...]:
+    """Where each shown object of the map stands now (field_control.object_places), in
+    object_events order; objects whose hide flag is set are left out. Read under the
+    emulator lock; the plan made from it (puzzle_route) is not."""
+    from server.field_control import object_places
+    from utils.mapping.flag_hide_constants import FLAG_HIDE_IDS
+
+    places = object_places(reader)
+    out = []
+    for local_id, obj in enumerate(_raw_map_json(map_dir).get("object_events") or [], start=1):
+        flag_id = FLAG_HIDE_IDS.get(str(obj.get("flag", "0")))
+        try:
+            hidden = flag_id is not None and reader._is_event_flag_set(flag_id)
+        except Exception:  # unreadable: the object counts as there
+            hidden = False
+        if not hidden and local_id in places:
+            out.append(places[local_id])
+    return tuple(out)
+
+
+def puzzle_plan(places, map_dir: str, position: Tuple[int, int], target_tiles) -> Optional[list]:
+    """rotating_tile_puzzle.plan from the player at position (map tiles) to any of
+    target_tiles, with the objects at places (puzzle_objects); None on a map without a
+    puzzle or when no way is found.
+
+    Steps are the tile planner's own (pathfinding.walk_steps) on the static layout, less
+    the objects' tiles. Other coord-event triggers and warps to other maps are never
+    stepped on; warps to another spot of this map (MOSSDEEP CITY GYM's pads) are rides.
+    """
+    return _puzzle_plan(tuple(places), map_dir, tuple(position), frozenset(tuple(t) for t in target_tiles))
+
+
+@lru_cache(maxsize=64)
+def _puzzle_plan(places: tuple, map_dir: str, position: tuple, goal: frozenset) -> Optional[tuple]:
+    """puzzle_plan, kept per (places, position, goal): a walk asks again after every step
+    and arrived() asks for the same one again (a search can take ~2 s)."""
+    from utils.mapping import rotating_tile_puzzle as puzzle
+    from utils.mapping.pathfinding import walk_steps
+    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid, _static_tiles, arrival_only_warps
+
+    switches = puzzle_switches(map_dir)
+    grid, tiles = _static_grid(map_dir), _static_tiles(map_dir)
+    if not switches or not grid or not tiles:
+        return None
+    raw = _raw_map_json(map_dir)
+    pads, closed = {}, set()
+    landing = arrival_only_warps(map_dir)
+    for i, warp in enumerate(raw.get("warp_events") or []):
+        tile = (int(warp.get("x", -1)), int(warp.get("y", -1)))
+        arrival = warp_arrival(warp)
+        if i in landing:
+            continue
+        if warp.get("dest_map") == raw.get("id") and arrival is not None:
+            pads[tile] = arrival
+        else:
+            closed.add(tile)
+    closed |= {
+        (int(e.get("x", -1)), int(e.get("y", -1))) for e in raw.get("coord_events") or []
+        if e.get("type") == "trigger"
+    } - set(switches)
+    closed -= goal
+    walls = set(_EDGE_BLOCKED)
+
+    def steps(tile, blocked):
+        for nx, ny, _ in walk_steps(tiles, grid, tile[0], tile[1], None, False, walls):
+            if (nx, ny) not in blocked and (nx, ny) not in closed:
+                yield nx, ny
+
+    found = puzzle.plan(
+        position, places, goal, steps, switches, pads, puzzle.arrows_of(tiles, _puzzle_is_trick_house(map_dir)),
+    )
+    return tuple(found) if found is not None else None
+
+
+def puzzle_route(places, map_dir: str, position: Tuple[int, int], target_tiles) -> Optional[List[Tuple[str, str]]]:
+    """puzzle_plan as go_to route steps, [(step, name of the map), ...]: a switch press is
+    (SWITCH_STEP + " (x, y)"), a pad the go_to_exit argument "MAP NAME (x, y)". [] when a
+    target tile can be walked to now, None when no way is found or the map has no
+    puzzle. Planned again after every step, from the objects' places then (places:
+    puzzle_objects, read live)."""
+    from utils.mapping.porymap_state import _readable_map_name
+
+    actions = puzzle_plan(places, map_dir, position, target_tiles)
+    if actions is None:
+        return None
+    name = _readable_map_name(str(_raw_map_json(map_dir).get("id", map_dir)))
+    out = []
+    for kind, (x, y) in actions:
+        if kind == "press":
+            out.append((f"{SWITCH_STEP} ({x}, {y})", name))
+        elif kind == "warp":
+            out.append((f"{name} ({x}, {y})", name))
+    return out
 
 
 # Map objects that block the way until an HM clears them. Seen live (2026-11-03): two
@@ -2767,6 +2921,11 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 # With Surf the plan crosses water already: water is no reason then.
                 + (". A ledge (one-way) or a person may be in the way." if surf
                    else ". A ledge (one-way), water (needs Surf) or a person may be in the way.")
+                # go_to_exit never steps on a puzzle's floor switch (find_path); navigate_to
+                # and go_to plan the presses (puzzle_route).
+                + (" This map's floor switches move its statues and are never walked over here: "
+                   "navigate_to a tile beyond them (or talk_to the person you want) and the walk steps on "
+                   "the switches it needs." if puzzle_switches(source.get("porymap_map_name") or "") else "")
             ),
         }
     # A route that pushes boulders is walked to its first push only (push_plan): the

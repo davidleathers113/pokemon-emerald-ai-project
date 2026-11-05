@@ -8117,13 +8117,14 @@ async def _walk_along(
     """
     from server import game_tools
     from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
 
     entered: List[str] = []
     # (map, go_to_exit argument) of every step that left a map. Seen live: go_to("Route
     # 113") crossed ROUTE 111 → ROUTE 112 → ROUTE 111 … fifteen times before its map budget
     # ran out. Taking the same exit off the same map twice in one walk is a loop.
     crossed = set()
-    reads = waits = blocked = 0
+    reads = waits = blocked = presses = 0
     for _ in range(max_maps * 3):
         if _mem(lambda r: r.is_in_battle()):
             view = _read_battle_view()
@@ -8167,11 +8168,24 @@ async def _walk_along(
             return entered, f"{goal} can't be reached {how} from {location}"
         if len(entered) >= max_maps:
             return entered, f"{goal} is still {len(route)} maps away"
-        if (location, route[0][0]) in crossed:
+        # On a rotating tile puzzle the same pad or switch can rightly come up again (each
+        # press moves the statues, and the plan is made again from where they stand).
+        puzzle = bool(game_tools.puzzle_switches(ROM_TO_PORYMAP_MAP.get(location, "")))
+        if (location, route[0][0]) in crossed and not puzzle:
             return entered, (
                 f'the way loops: go_to_exit("{route[0][0]}") from {location} was taken once already on this walk. '
                 f"The way planned now is {' → '.join(name for _, name in route)}"
             )
+        if route[0][0].startswith(game_tools.SWITCH_STEP):
+            presses += 1
+            if presses > PUZZLE_MAX_PRESSES:
+                return entered, f"the way needs more than {PUZZLE_MAX_PRESSES} floor switch presses"
+            trouble = await _press_floor_switch(route[0][0], source)
+            if trouble:
+                return entered, trouble
+            if on_the_way is not None:
+                on_the_way.append(f"on {location}: stepped on the {route[0][0]}")
+            continue
         if route[0][0] == game_tools.RIDE_EXIT:
             step = await _ride_cable_car(source, route[0][1])
         else:
@@ -8215,24 +8229,92 @@ async def _cross_to(target_tiles, goal: str, source: str, again: str) -> Tuple[L
     badges = _mem(lambda r: len(r.read_badges() or []))
     ox, oy = game_tools.map_coord_offset(map_dir, badges)
     tiles = [(tx + ox, ty + oy) for tx, ty in target_tiles]
-    route = await run_in_threadpool(game_tools.tile_route, map_dir, (snap.x, snap.y), tiles)
+
+    def way(here_dir: str, position):
+        """On a rotating tile puzzle (MOSSDEEP CITY GYM) the way through its switches and
+        pads from where the objects stand now (game_tools.puzzle_route, read again before
+        every step: after each press and each battle); elsewhere the static tile_route."""
+        if here_dir == map_dir and position is not None and game_tools.puzzle_switches(map_dir):
+            places = _mem(game_tools.puzzle_objects, map_dir)
+            found = game_tools.puzzle_route(places, map_dir, position, tiles)
+            if found is not None:
+                return found
+        return game_tools.tile_route(map_dir, position, tiles, here_dir=here_dir)
+
+    route = await run_in_threadpool(way, map_dir, (snap.x, snap.y))
     if not route:
         return [], None
 
     def next_route(here: str, position):
-        return game_tools.tile_route(map_dir, position, tiles, here_dir=ROM_TO_PORYMAP_MAP.get(here, ""))
+        return way(ROM_TO_PORYMAP_MAP.get(here, ""), position)
 
     def arrived() -> bool:
         here = _field_snapshot()
-        return (
-            here is not None
-            and _location_name() == location
-            and game_tools.tile_route(map_dir, (here.x, here.y), tiles) == []
-        )
+        return here is not None and _location_name() == location and way(map_dir, (here.x, here.y)) == []
 
     logger.info(f"{source}: {goal} is through {' → '.join(name for _, name in route)}")
     with _turbo():
         return await _walk_along(next_route, arrived, goal, source, again, GO_TO_MAX_MAPS)
+
+
+# Floor switch presses one walk may make (_walk_along); MOSSDEEP CITY GYM's way from
+# (3,20) to TATE AND LIZA needs 18 (game_tools.puzzle_plan).
+PUZZLE_MAX_PRESSES = 40
+# Frames a floor switch's script may take to start once the player is on it, and to end
+# (pret MossdeepCity_Gym_EventScript_YellowFloorSwitch: two sounds, then the moves).
+SWITCH_START_FRAMES = 60
+SWITCH_SCRIPT_FRAMES = 600
+
+
+async def _press_floor_switch(step: str, source: str) -> Optional[str]:
+    """Walk onto a rotating tile puzzle's floor switch (a game_tools.SWITCH_STEP route
+    step, "FLOOR SWITCH (x, y)") and wait for its script to move the statues. None when
+    it was pressed, else why not. The walk there never crosses another switch
+    (pathfinding: puzzle_switches); this one is its goal."""
+    from server.field_control import _integers_in
+
+    numbers = _integers_in(step)
+    if len(numbers) != 2:
+        return f"{step} names no tile"
+    x, y = numbers
+    # A switch fires on the step onto it (pret coord event): standing on it already, step
+    # off and back on. The plan presses one switch several times in a row (MOSSDEEP CITY
+    # GYM's blue switch (8,10) three times).
+    snap = _field_snapshot()
+    if snap is not None and (snap.x, snap.y) == (x, y):
+        from server import game_tools
+        from server.field_control import DIRECTION_DELTAS
+        from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+        map_dir = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
+        # Never onto another switch or a warp: either would do more than step off.
+        raw = game_tools._raw_map_json(map_dir)
+        not_off = set(game_tools.puzzle_switches(map_dir)) | {
+            (int(w.get("x", -1)), int(w.get("y", -1))) for w in raw.get("warp_events") or []
+        }
+        for dx, dy in DIRECTION_DELTAS.values():
+            if (x + dx, y + dy) in not_off:
+                continue
+            await mcp_navigate_to({
+                "x": x + dx, "y": y + dy, "variance": "none", "reason": f"{source}: off the floor switch",
+                "through_warps": False,
+            })
+            snap = _field_snapshot()
+            if snap is not None and (snap.x, snap.y) != (x, y):
+                break
+        else:
+            return f"could not step off the floor switch at ({x},{y}) to press it again"
+    walk = await mcp_navigate_to({
+        "x": x, "y": y, "variance": "none", "reason": f"{source}: press the floor switch", "through_warps": False,
+    })
+    await _await_game(lambda: not _player_can_walk(), SWITCH_START_FRAMES)
+    await _await_game(_player_can_walk, SWITCH_SCRIPT_FRAMES)
+    if _mem(lambda r: r.is_in_battle()):
+        return None  # a trainer saw the player on the way: _walk_along reports the battle
+    snap = _field_snapshot()
+    if snap is None or (snap.x, snap.y) != (x, y):
+        return f"did not reach the floor switch at ({x},{y}) ({walk.get('summary') or walk.get('error')})"
+    return None
 
 
 def _crossing_note(entered: List[str]) -> str:
@@ -8604,17 +8686,29 @@ async def mcp_talk_to(request: dict = None):
         return refused
     if _field_snapshot() is None:
         return _refusal("The player's position could not be read.")
-    # The map (and so the model) shows people at their map-file tile; one who walked off
-    # it (a trainer who came over to battle stays where they stopped) is talked to where
-    # they stand (field_control.moved_people).
+    # A tile from the map file (OBJECTIVES, the walkthrough) whose person walked off it (a
+    # trainer who came over to battle stays where they stopped) is talked to where they
+    # stand (field_control.moved_people, by local id).
+    from server import game_tools
     from server.field_control import moved_people, npc_at
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
 
+    map_dir = ROM_TO_PORYMAP_MAP.get(_location_name(), "")
     moved_note = ""
     if not _mem(npc_at, x, y):
-        now = next((n for spawn, n in _mem(moved_people) if spawn == (x, y)), None)
+        file_tiles = game_tools.map_file_tiles(map_dir)
+        now = next((n for spawn, n in _mem(moved_people, file_tiles) if spawn == (x, y)), None)
         if now is not None:
             moved_note = f"The person from ({x},{y}) stands at ({now[0]},{now[1]}) now. "
             x, y = now
+    # A statue is in the way like a person, but A in front of it does nothing (pret
+    # MossdeepCity_Gym: its statues' script is 0x0). Seen live at MOSSDEEP CITY GYM (3,20):
+    # talk_to(4,20) walked up, pressed A and said "nothing was said (nobody there…)".
+    if map_dir and _mem(game_tools.statue_at, map_dir, x, y):
+        return _refusal(
+            f"({x},{y}) is a statue, not a person: there is nobody to talk to. It blocks the way like a "
+            "person; navigate_to and go_to walk round it, or step on the floor switches that move it."
+        )
     entered, why = await _cross_to(
         [(x - dx, y - dy) for dx, dy in DIRECTION_DELTAS.values()],
         f"the person at ({x},{y})",
@@ -11161,6 +11255,15 @@ async def mcp_navigate_to(request: dict):
             avoid = [(int(p[0]), int(p[1])) for p in request.get("avoid") or []]
         except (TypeError, ValueError, IndexError):
             return {"success": False, "error": "avoid must be a list of [x, y] pairs."}
+        # The crossing can end on the target itself: a floor switch is reached by stepping
+        # on it (_press_floor_switch). The planner answers a walk from a tile to itself
+        # with "No path found".
+        here = _field_snapshot()
+        if here is not None and (here.x, here.y) == (x, y):
+            return told({
+                "success": True, "status": "DONE", "target": f"({x}, {y})", "path_length": 0,
+                "summary": f"Reached ({x},{y}): now at {_position_text(here)}.",
+            })
         result = game_tools.navigate_to_direct(
             env, x, y, reason=reason, variance=variance, blocked_coords=avoid or None
         )

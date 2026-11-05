@@ -582,6 +582,10 @@ class Pathfinder:
         # Rocks and trees the party can clear are walkable here (they are objects, so they
         # were blocked above); _astar charges CLEARABLE_TILE_COST for stepping on one.
         blocked -= {tuple(t) for t in map_data.get("clearable") or []}
+        # A rotating tile puzzle's floor switches (game_tools.puzzle_switches) are never
+        # walked over, not even as the only way: each press moves statues, so it is a step
+        # of its own in the puzzle's plan (rotating_tile_puzzle.plan), walked to as a goal.
+        blocked |= {tuple(t) for t in map_data.get("puzzle_switches") or []} - {start, goal}
         triggers = {tuple(t) for t in map_data.get("triggers") or []} - {start, goal}
         result = self._astar(start, goal, blocked | triggers, map_data, max_distance) if triggers else None
         if result is None or isinstance(result, tuple):
@@ -664,6 +668,8 @@ class Pathfinder:
                     "raw_warps": porymap.get("raw_warps", []),
                     # Coord-event triggers that would fire now (game_tools.active_triggers).
                     "triggers": porymap.get("triggers", []),
+                    # Floor switches of a rotating tile puzzle: never walked over (find_path).
+                    "puzzle_switches": porymap.get("puzzle_switches", []),
                     # Rocks/trees the party can clear (game_tools.clearable_obstacles).
                     "clearable": porymap.get("clearable", []),
                     # The party can Surf now (game_tools.can_surf): water joins the walk.

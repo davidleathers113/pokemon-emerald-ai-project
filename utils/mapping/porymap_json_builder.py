@@ -305,9 +305,12 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
         objects = override['objects']
     else:
         objects = []
-        for obj in map_data.get("object_events", []):
+        for number, obj in enumerate(map_data.get("object_events", []), start=1):
             objects.append({
                 "local_id": obj.get("local_id", ""),
+                # The game's localId: the object's place in object_events, from 1 (pret
+                # tools/mapjson). Live positions are matched by it (field_control.object_places).
+                "event_id": number,
                 "x": obj.get("x", 0),
                 "y": obj.get("y", 0),
                 "elevation": obj.get("elevation", 0),

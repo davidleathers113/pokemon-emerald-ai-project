@@ -501,12 +501,34 @@ def _is_npc_object_event(obj: Dict[str, Any]) -> bool:
 
 
 BOULDER_GRAPHICS = "OBJ_EVENT_GFX_PUSHABLE_BOULDER"
+# Statues are object events with no script (pret MossdeepCity_Gym map.json: 21 of them,
+# script 0x0): they block the way like a person, and A in front of one does nothing.
+STATUE_GRAPHICS = frozenset({"OBJ_EVENT_GFX_TRICK_HOUSE_STATUE"})
+STATUE_MARKER = "Z"
+
+
+def objects_where_they_stand(
+    objects: List[Dict[str, Any]], places: Dict[int, Tuple[int, int]], offset: Optional[Tuple[int, int]] = None
+) -> List[Dict[str, Any]]:
+    """The objects with x, y set to where they stand now: places is {local id: tile}
+    (server.field_control.object_places), matched by each object's "event_id"; offset
+    turns map tiles into the walking tools' (local = map - offset). Objects without an
+    event_id (an override map's own) and Strength boulders (their pushes are read apart,
+    _boulder_places) keep their tile."""
+    ox, oy = offset or (0, 0)
+    out = []
+    for obj in objects:
+        place = places.get(obj.get("event_id")) if obj.get("graphics_id") != BOULDER_GRAPHICS else None
+        out.append({**obj, "x": place[0] - ox, "y": place[1] - oy} if place is not None else obj)
+    return out
 
 
 def _object_ascii_marker(obj: Dict[str, Any]) -> str:
     """Choose ASCII marker for reconciled object events."""
     if obj.get("graphics_id") == BOULDER_GRAPHICS:
         return "R"  # a Strength boulder, not a person to talk to
+    if obj.get("graphics_id") in STATUE_GRAPHICS:
+        return STATUE_MARKER  # in the way like a person, but nobody to talk to
     if _is_item_object_event(obj):
         return "I"
     if _is_npc_object_event(obj):
@@ -1342,6 +1364,17 @@ def _format_porymap_info(
             except Exception as e:
                 logger.warning(f"Failed to filter map by elevation: {e}")
 
+        # Each object on the tile it stands on now (field_control.object_places), before
+        # anything below compares tiles: seen live in MOSSDEEP CITY GYM, a statue the floor
+        # switch had moved to (4,20) was drawn on its map-file tile (5,21).
+        if memory_reader is not None and json_map.get("objects"):
+            try:
+                from server.field_control import object_places
+
+                json_map["objects"] = objects_where_they_stand(json_map["objects"], object_places(memory_reader))
+            except Exception as e:  # unreadable: the map-file tiles, as before
+                logger.debug(f"object places unavailable: {e}")
+
         # Reconcile static porymap objects against runtime object events.
         npc_source = "static_reference"
         static_objects = json_map.get("objects", [])
@@ -1573,7 +1606,7 @@ def _format_porymap_info(
                 "'R' = boulder (your party can use STRENGTH: navigate_to and go_to push it)"
                 if _party_can_push_boulders() else "'R' = boulder (STRENGTH pushes it)"
             )
-            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = floor at another elevation or cut off from you (no direct step onto it; navigate_to and go_to take the stairs, ladder or ramp when there is one), 'N' = NPC, 'I' = item, 'O' = other object, {boulder}, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
+            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = floor at another elevation or cut off from you (no direct step onto it; navigate_to and go_to take the stairs, ladder or ramp when there is one), 'N' = NPC, 'Z' = statue (in the way; nobody to talk to), 'I' = item, 'O' = other object, {boulder}, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
 
             exits = _format_exits(json_map, ascii_lines, surf)
             if exits:

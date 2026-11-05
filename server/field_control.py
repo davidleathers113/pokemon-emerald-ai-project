@@ -207,33 +207,69 @@ def npc_at(reader, x: int, y: int) -> bool:
     return (x, y) in npc_positions(reader)
 
 
-def moved_people(reader) -> list[tuple[tuple[int, int], tuple[int, int]]]:
-    """(map-file tile, where they stand now) of this map's loaded people who stand off
-    their map-file tile.
+# pret include/global.h struct SaveBlock1 +0xC70 objectEventTemplates[64]; struct
+# ObjectEventTemplate (24 bytes): +0 localId, +1 graphicsId, +4 s16 x, +6 s16 y.
+SAVE_BLOCK1_OBJECT_EVENT_TEMPLATES = 0xC70
+OBJECT_EVENT_TEMPLATE_SIZE = 24
+OBJECT_EVENT_TEMPLATES_COUNT = 64
 
-    pret include/global.fieldmap.h struct ObjectEvent: +0x09 mapNum, +0x0A mapGroup,
-    +0x0C initialCoords (the template's x, y + MAP_OFFSET: map.json's tile), +0x10
-    currentCoords. Seen live in FORTREE CITY GYM: JARED walked over to battle and stayed
-    at (4,16), while the map (map.json) still put him at (4,14). Walks and talk_to take
-    people from here, not from the map file.
+
+def object_places(reader) -> Dict[int, Tuple[int, int]]:
+    """{local id: tile} of this map's object events now (pret's localId is the object's
+    place in map.json's object_events, from 1).
+
+    A loaded object (struct ObjectEvent +0x08 localId, +0x09 mapNum, +0x0A mapGroup,
+    +0x10 currentCoords) is where it stands; any other is on its template's tile in
+    SaveBlock1, where it would spawn. Scripts move templates: pret rotating_tile_puzzle.c
+    MoveRotatingTileObjects (MOSSDEEP CITY GYM's statues and trainers, kept across the
+    gym's pads), setobjectxyperm. Seen live in MOSSDEEP CITY GYM: a statue stood at (4,20)
+    and BLAKE at (4,21), while the map file has (5,21) and (5,20); both were drawn and
+    planned on the map file's tiles.
     """
+    places: Dict[int, Tuple[int, int]] = {}
+    sb1 = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR)
+    for i in range(OBJECT_EVENT_TEMPLATES_COUNT):
+        base = sb1 + SAVE_BLOCK1_OBJECT_EVENT_TEMPLATES + i * OBJECT_EVENT_TEMPLATE_SIZE
+        local_id = reader._read_u8(base)
+        if local_id:
+            places[local_id] = (reader._read_s16(base + 4), reader._read_s16(base + 6))
     player_base = _player_object_base(reader)
     map_group, map_num = reader._read_current_map()
-    moved = []
     for i in range(OBJECT_EVENT_COUNT):
         base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
-        if base == player_base:
-            continue
-        flags = reader._read_u8(base) | (reader._read_u8(base + 1) << 8)
-        if not flags & 0x1 or flags & (1 << 13):  # inactive or invisible
+        if base == player_base or not reader._read_u8(base) & 0x1:
             continue
         if (reader._read_u8(base + 0x0A), reader._read_u8(base + 0x09)) != (map_group, map_num):
-            continue  # a neighbouring map's person: not in this map's file
-        spawn = (reader._read_s16(base + 0x0C) - MAP_OFFSET, reader._read_s16(base + 0x0E) - MAP_OFFSET)
-        now = (reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET)
-        if spawn != now:
-            moved.append((spawn, now))
-    return moved
+            continue  # a neighbouring map's object: its local id is that map's
+        places[reader._read_u8(base + 0x08)] = (
+            reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET
+        )
+    return places
+
+
+def moved_people(
+    reader, map_file_tiles: Optional[Dict[int, Tuple[int, int]]] = None
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """(map-file tile, where they stand now) of this map's objects that stand off their
+    map-file tile; map_file_tiles is {local id: map.json tile} (game_tools.map_file_tiles),
+    by default the current map's.
+
+    Matched by local id (object_places). Seen live in FORTREE CITY GYM: JARED walked over
+    to battle and stayed at (4,16), while the map (map.json) still put him at (4,14).
+    Before, the map-file tile was read from the loaded object's initialCoords, which is
+    its template's tile when it spawned: wrong once a script moves templates (MOSSDEEP
+    CITY GYM's statues), where it named BLAKE's map-file tile for a statue.
+    """
+    if map_file_tiles is None:
+        from server.game_tools import map_file_tiles as file_tiles
+        from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+        map_file_tiles = file_tiles(ROM_TO_PORYMAP_MAP.get(reader.read_location(), ""))
+    now = object_places(reader)
+    return [
+        (tile, now[local_id]) for local_id, tile in sorted(map_file_tiles.items())
+        if local_id in now and now[local_id] != tile
+    ]
 
 
 OBJ_EVENT_GFX_PUSHABLE_BOULDER = 87  # pret include/constants/event_objects.h
