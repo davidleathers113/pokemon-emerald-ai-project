@@ -632,14 +632,52 @@ def _register_every_map() -> None:
             ROM_TO_PORYMAP_MAP.setdefault(location.name.replace("_", " "), map_dir)
 
 
-@lru_cache(maxsize=64)
+# map dir -> the LAYOUT_* a script drew the map from when the player was last on it, where
+# that is not its map file's (dynamic_map_overlay.swapped_layout, kept by
+# game_tools.note_live_layout). pret data/maps/SkyPillar_4F/scripts.inc OnTransition draws
+# LAYOUT_SKY_PILLAR_4F_CLEAN while VAR_SKY_PILLAR_STATE < 2. Seen live (2026-11-05): the
+# route areas came from the map file's layout, whose cracked floor is not the clean one's,
+# and go_to("SKY PILLAR 5F") from 4F (11,2) said it can't be reached.
+_live_layouts: Dict[str, str] = {}
+
+
+def note_layout(map_dir: str, layout: str) -> bool:
+    """Record the layout map_dir is drawn from now ("" for its map file's own); True when
+    that changed, so what was planned from the old one is stale."""
+    if not map_dir or _live_layouts.get(map_dir, "") == (layout or ""):
+        return False
+    if layout:
+        _live_layouts[map_dir] = layout
+    else:
+        _live_layouts.pop(map_dir, None)
+    return True
+
+
 def _static_build(map_dir: str) -> tuple:
     """(grid, tiles) of a map from the decomp: the collision grid, one string per row, and
     the tiles walks are planned on, (tile id, behavior, collision, elevation) per cell by
     row (porymap_json_builder raw_tiles: the layout's, also under an ASCII override of the
-    same size). (None, ()) when it can't be built."""
+    same size). (None, ()) when it can't be built. A map a script was seen drawing from
+    another layout (note_layout) is built from that one."""
+    return _build_layout(map_dir, _live_layouts.get(map_dir, ""))
+
+
+@lru_cache(maxsize=64)
+def _build_layout(map_dir: str, layout: str) -> tuple:
+    """_static_build from `layout` ("" for the map file's own)."""
     from utils.mapping.porymap_json_builder import build_json_map
 
+    if layout:
+        from utils.mapping.map_formatter import format_tile_to_symbol
+
+        tiles = layout_tiles(map_dir, layout)
+        if tiles:
+            # The symbols the live overlay draws the same tiles with (dynamic_map_overlay).
+            grid = tuple(
+                "".join(format_tile_to_symbol(tile, x=x, y=y) for x, tile in enumerate(row))
+                for y, row in enumerate(tiles)
+            )
+            return grid, tiles
     root = _get_pokeemerald_root()
     if not root:
         return None, ()
@@ -1020,6 +1058,60 @@ def _map_script_labels(map_dir: str) -> Dict[str, List[str]]:
         except OSError:
             continue
     return labels
+
+
+@lru_cache(maxsize=None)
+def hole_warp(map_dir: str) -> Tuple[str, bool]:
+    """(the map dir a fall from map_dir lands on, whether its cracked floor breaks under a
+    walker); ("", False) for a map nobody falls from.
+
+    Read from the scripts the map's MapScripts table names, and those they call or go to:
+    `setholewarp MAP_X` (pret scrcmd.c ScrCmd_setholewarp → SetFixedHoleWarp; warphole
+    MAP_UNDEFINED then lands on MAP_X at the very tile fallen from, ScrCmd_warphole) and
+    `setstepcallback STEP_CB_CRACKED_FLOOR` (field_tasks.c CrackedFloorPerStepCallback).
+    Sky Pillar 2F/4F, Granite Cave B1F, Mirage Tower 2F/3F and Mt. Pyre 2F have both.
+    """
+    labels = _map_script_labels(map_dir)
+    dest, breaks = "", False
+    seen, todo = set(), [f"{map_dir}_MapScripts"]
+    while todo:
+        label = todo.pop()
+        if label in seen or label not in labels:
+            continue
+        seen.add(label)
+        for line in labels[label]:
+            words = line.replace(",", " ").split()
+            if len(words) >= 2 and words[0] == "setholewarp":
+                dest = _map_dirs_by_const().get(words[1], "")
+            elif words[:2] == ["setstepcallback", "STEP_CB_CRACKED_FLOOR"]:
+                breaks = True
+            todo.extend(word for word in words[1:] if word in labels)
+    return dest, breaks and bool(dest)
+
+
+def fall_tiles(map_dir: str, tiles) -> frozenset:
+    """The (x, y) of `tiles` (layout tuples by row, map_dir's) a walker on foot falls
+    through to the floor below (hole_warp).
+
+    pret field_tasks.c CrackedFloorPerStepCallback: a step onto MB_CRACKED_FLOOR slower
+    than the Mach Bike's top speed (GetPlayerSpeed() != PLAYER_SPEED_FASTEST) sets
+    VAR_ICE_STEP_COUNT to 0, and so does a step towards MB_CRACKED_FLOOR_HOLE (a cracked
+    tile already broken, SetCrackedFloorHoleMetatile); the map's ON_FRAME table
+    (data/scripts/cave_hole.inc CaveHole_CheckFallDownHole) then runs
+    EventScript_FallDownHole. field_control_avatar.c TryStartMiscWalkingScripts runs it
+    too for a step onto a hole. Seen live (2026-11-05): RIGHT from SKY PILLAR 4F (5,4)
+    onto (6,4) landed on SKY PILLAR 3F (6,4).
+    """
+    dest, breaks = hole_warp(map_dir)
+    if not dest:
+        return frozenset()
+    falls = {"CRACKED_FLOOR_HOLE"} | ({"CRACKED_FLOOR"} if breaks else set())
+    return frozenset(
+        (x, y)
+        for y, row in enumerate(tiles or ())
+        for x, tile in enumerate(row)
+        if tile is not None and len(tile) > 1 and str(getattr(tile[1], "name", tile[1])) in falls
+    )
 
 
 def _badge_set_in(lines: List[str]) -> Optional[int]:

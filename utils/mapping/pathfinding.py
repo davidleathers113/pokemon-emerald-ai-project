@@ -590,6 +590,9 @@ class Pathfinder:
         # walked over, not even as the only way: each press moves statues, so it is a step
         # of its own in the puzzle's plan (rotating_tile_puzzle.plan), walked to as a goal.
         blocked |= {tuple(t) for t in map_data.get("puzzle_switches") or []} - {start, goal}
+        # Cracked floor and holes drop the walker to the floor below (porymap_state.fall_tiles):
+        # never walked across, only walked onto as the goal, a drop the route takes.
+        blocked |= {tuple(t) for t in map_data.get("falls") or []} - {start, goal}
         triggers = {tuple(t) for t in map_data.get("triggers") or []} - {start, goal}
         result = self._astar(start, goal, blocked | triggers, map_data, max_distance) if triggers else None
         if result is None or isinstance(result, tuple):
@@ -686,6 +689,8 @@ class Pathfinder:
                     "scenes": porymap.get("scenes") or [],
                     # Floor switches of a rotating tile puzzle: never walked over (find_path).
                     "puzzle_switches": porymap.get("puzzle_switches", []),
+                    # Tiles that drop the walker to the floor below: only ever a goal (find_path).
+                    "falls": porymap.get("falls", []),
                     # Rocks/trees the party can clear (game_tools.clearable_obstacles).
                     "clearable": porymap.get("clearable", []),
                     # The party can Surf now (game_tools.can_surf): water joins the walk.

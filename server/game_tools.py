@@ -264,6 +264,7 @@ def load_pathfinding_state(env) -> tuple:
 
             if pokeemerald_root:
                 porymap_map_name = ROM_TO_PORYMAP_MAP.get(location_name)
+                note_live_layout(env.memory_reader)
 
                 if porymap_map_name:
                     effective_map_name = get_effective_map_name(porymap_map_name, badge_count=badge_count)
@@ -406,6 +407,13 @@ def load_pathfinding_state(env) -> tuple:
                         # For selected dynamic maps (e.g. Mauville Gym), replace static
                         # porymap tiles with the current live map buffer state.
                         apply_live_metatile_overlay(state, env, location_name)
+                        # Tiles that drop the walker to the floor below: walks go round
+                        # them; only a drop the route takes (FALL_STEP) walks onto one.
+                        from utils.mapping.porymap_state import fall_tiles
+
+                        state["map"]["porymap"]["falls"] = sorted(
+                            fall_tiles(porymap_map_name, state["map"]["porymap"].get("raw_tiles"))
+                        )
                         # Rotating gates (FORTREE CITY GYM): walks plan their pushes from
                         # the gates' live orientations (rotating_gates.py).
                         puzzle, orientations = rotating_gate_state(
@@ -1755,11 +1763,14 @@ def _walk_areas_without(
     from utils.mapping.pathfinding import (
         BRIDGE_ELEVATION, PASSABLE_WITH_COLLISION, WATER_ELEVATION, is_surf_water, walk_steps,
     )
-    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid, _static_tiles
+    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid, _static_tiles, fall_tiles
 
     grid = _static_grid(map_dir) if map_dir else None
     if not grid:
         return {}
+    # A tile that drops the walker to the floor below is no floor to walk across; the
+    # drop is a way of its own (_fall_exits).
+    obstacles = obstacles | fall_tiles(map_dir, _static_tiles(map_dir))
     grid = [
         "".join("#" if (x, y) in obstacles else cell for x, cell in enumerate(row))
         for y, row in enumerate(grid)
@@ -1993,6 +2004,40 @@ def _ride_exits_with(map_dir: str, surf: bool) -> tuple:
     mine = _areas_at(map_dir, x, y + 1, _route_areas(map_dir))
     theirs = _areas_at(dest, x, y + 1, _route_areas(dest))
     return tuple((m, RIDE_EXIT, dest, t, _readable_map_name(const)) for m in mine for t in theirs)
+
+
+# A route step that drops through the floor (_fall_exits): "FALL THROUGH (x, y)", walked
+# by stepping onto that tile (server/app.py _fall_through).
+FALL_STEP = "FALL THROUGH"
+
+
+def _fall_exits(map_dir: str) -> tuple:
+    """_walk_exits' shape for each tile of this map that drops the walker to the floor
+    below (porymap_state.fall_tiles), at the same tile there (pret ScrCmd_warphole).
+
+    pret data/maps/SkyPillar_4F: before Rayquaza wakes (VAR_SKY_PILLAR_STATE < 2) the 5F
+    stairs at (3,1) are reached only from 3F's stairs at (7,1), which stand in a pocket of
+    3F that nothing walks into: the way in is a drop through 4F's cracked floor at (6,4).
+    """
+    return _fall_exits_with(map_dir, can_surf())
+
+
+@lru_cache(maxsize=None)
+def _fall_exits_with(map_dir: str, surf: bool) -> tuple:
+    """_fall_exits, kept per Surf ability: the areas it names (_route_areas) change with it."""
+    from utils.mapping.porymap_state import _readable_map_name, _static_tiles, fall_tiles, hole_warp
+
+    dest = hole_warp(map_dir)[0]
+    if not dest:
+        return ()
+    name = _readable_map_name(str(_raw_map_json(dest).get("id", dest)))
+    here, there = _route_areas(map_dir), _route_areas(dest)
+    out = set()
+    for x, y in sorted(fall_tiles(map_dir, _static_tiles(map_dir))):
+        for mine in _areas_at(map_dir, x, y, here):
+            for theirs in _areas_at(dest, x, y, there):
+                out.add((mine, f"{FALL_STEP} ({x}, {y})", dest, theirs, name))
+    return tuple(sorted(out))
 
 
 def _downhill(map_dir: str, area: int) -> set:
@@ -2231,7 +2276,7 @@ def _far_map_hint(map_dir: str, matches, position: Optional[Tuple[int, int]] = N
 
 def _walk_paths(
     map_dir: str, matches, position: Optional[Tuple[int, int]] = None, other_parts_of_here: bool = False,
-    rides: bool = False, goal: Optional[frozenset] = None,
+    rides: bool = False, goal: Optional[frozenset] = None, falls: bool = False,
 ) -> List[List[Tuple[str, str]]]:
     """Ways on foot to every map `matches(readable map name)` accepts, nearest first.
 
@@ -2251,6 +2296,9 @@ def _walk_paths(
 
     goal: (map dir, area) nodes to reach instead of maps `matches` accepts (tile_route);
     the ways to the nearest of them, [] among them when the player's area is one.
+
+    falls: a drop through the floor to the floor below counts as a step too (_fall_exits).
+    Callers ask for that only when no way without one is found (_walk_paths_or_fall).
     """
     if not map_dir:
         return []
@@ -2285,7 +2333,9 @@ def _walk_paths(
             break  # the goal's nearest areas: no way through more exits is wanted
         nxt = []
         for node in frontier:
-            for from_area, exit_arg, dest, dest_area, name in _walk_exits(node[0]) + (_ride_exits(node[0]) if rides else ()):
+            for from_area, exit_arg, dest, dest_area, name in (
+                _walk_exits(node[0]) + (_ride_exits(node[0]) if rides else ()) + (_fall_exits(node[0]) if falls else ())
+            ):
                 target = (dest, dest_area)
                 if from_area != node[1] or target in parent:
                     continue
@@ -2344,8 +2394,17 @@ def tile_route(
     goal = frozenset((map_dir, areas[tuple(t)]) for t in target_tiles if tuple(t) in areas)
     if not goal:
         return None
-    paths = _walk_paths(here_dir or map_dir, lambda name: False, position, goal=goal)
+    paths = _walk_paths_or_fall(here_dir or map_dir, lambda name: False, position, goal=goal)
     return paths[0] if paths else None
+
+
+def _walk_paths_or_fall(map_dir: str, matches, position: Optional[Tuple[int, int]] = None, **kwargs):
+    """_walk_paths, and only when it finds no way, _walk_paths with drops through the
+    floor (falls=True): a drop can't be walked back, so it is taken only when it is the
+    way, never as a shortcut, and only on the way to the goal."""
+    return _walk_paths(map_dir, matches, position, **kwargs) or _walk_paths(
+        map_dir, matches, position, falls=True, **kwargs
+    )
 
 
 def map_coord_offset(map_dir: str, badge_count: int) -> Tuple[int, int]:
@@ -2393,7 +2452,7 @@ def pokemon_center_route(location_name: str, position: Optional[Tuple[int, int]]
     target = _squash_name(POKEMON_CENTER_1F)
     if _squash_name(location_name).endswith(target):
         return []
-    paths = _walk_paths(
+    paths = _walk_paths_or_fall(
         ROM_TO_PORYMAP_MAP.get(location_name, ""), lambda name: _squash_name(name).endswith(target), position
     )
     return paths[0] if paths else []
@@ -2950,7 +3009,7 @@ def place_route(location_name: str, position: Optional[Tuple[int, int]], target:
     map_dir = ROM_TO_PORYMAP_MAP.get(location_name, "")
     for matcher in (lambda name: _same_place_words(name, words), matches):
         # go_to walks this, so the Cable Car is a step it can take (RIDE_EXIT).
-        paths = _walk_paths(map_dir, matcher, position, rides=True)
+        paths = _walk_paths_or_fall(map_dir, matcher, position, rides=True)
         if paths:
             return paths[0]
     return None
@@ -3159,6 +3218,21 @@ def fly_plan(
     return best
 
 
+def note_live_layout(reader) -> None:
+    """Tell the route planner which layout the player's map is drawn from now
+    (porymap_state.note_layout; dynamic_map_overlay.swapped_layout reads it from the save),
+    and forget the areas planned from another one. Caller holds the emulator lock."""
+    from utils.mapping.dynamic_map_overlay import swapped_layout
+    from utils.mapping.porymap_state import decomp_map_at, note_layout
+
+    found = decomp_map_at(*reader._read_current_map())
+    if found is None:
+        return
+    if note_layout(found[0], (swapped_layout(reader) or {}).get("id", "")):
+        for cached in (_walk_areas_without, _edge_dead_ends_with, _ride_exits_with, _fall_exits_with, _puzzle_plan):
+            cached.cache_clear()
+
+
 def _live_tile_reader(env):
     """(x, y) map coordinates -> the metatile in the game's map buffer now, or None
     (utils/mapping/dynamic_map_overlay: the buffer has a 7-tile border)."""
@@ -3333,8 +3407,14 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                    if puzzle else "")
             ),
         }
-        if puzzle and targets:
+        # A floor that drops the walker to the one below (hole_warp): the exit may be
+        # reached through the floor below and back up (tile_route with falls, _fall_exits).
+        from utils.mapping.porymap_state import hole_warp
+
+        drops = bool(hole_warp(source.get("porymap_map_name") or "")[0])
+        if (puzzle or drops) and targets:
             failed["puzzle_targets"] = list(dict.fromkeys(targets))
+            failed["crossing"] = "through the floor switches" if puzzle else "by a drop to the floor below"
         return failed
     # A route that pushes boulders is walked to its first push only (push_plan): the
     # caller pushes, then plans again. Its edge press is kept for the last plan.

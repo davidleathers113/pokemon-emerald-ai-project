@@ -5627,7 +5627,7 @@ async def mcp_go_to_exit(request: dict):
                 cleared.extend(switched)
                 if why:
                     on_the_way = f" On the way: {'; '.join(cleared)}." if cleared else ""
-                    error = f"Did not reach the exit {exit_query} through the floor switches: {why}."
+                    error = f"Did not reach the exit {exit_query} {plan.get('crossing', 'through the floor switches')}: {why}."
                     return {
                         "success": False, "error": error, "on_the_way": list(cleared),
                         "summary": f"{error} Now at {_position_text(_field_snapshot())}.{on_the_way}",
@@ -9710,6 +9710,7 @@ async def _walk_along(
             return entered, f"something has the player's attention on the way{_screen_note()}"
         snap = _field_snapshot()
         location = _location_name()
+        _mem(game_tools.note_live_layout)  # the route areas of a map a script redrew
         route = await run_in_threadpool(next_route, location, (snap.x, snap.y) if snap is not None else None)
         if route == []:
             return entered, None  # arrived by the map's own measure
@@ -9745,6 +9746,8 @@ async def _walk_along(
             continue
         if route[0][0] == game_tools.RIDE_EXIT:
             step = await _ride_cable_car(source, route[0][1])
+        elif route[0][0].startswith(game_tools.FALL_STEP):
+            step = await _fall_through(route[0][0], route[0][1], source)
         else:
             step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
         if on_the_way is not None and step.get("on_the_way"):
@@ -9876,6 +9879,38 @@ async def _press_floor_switch(step: str, source: str) -> Optional[str]:
     if snap is None or (snap.x, snap.y) != (x, y):
         return f"did not reach the floor switch at ({x},{y}) ({walk.get('summary') or walk.get('error')})"
     return None
+
+
+# From the step onto a cracked floor to the floor below: EventScript_FallDownHole (pret
+# data/scripts/cave_hole.inc: delay 20, the fall, delay 60, warphole) and the warp's fades,
+# a few hundred frames; the budget is several times that, as WARP_FRAMES is for a door.
+FALL_FRAMES = 900
+
+
+async def _fall_through(step: str, into: str, source: str) -> Dict[str, Any]:
+    """Drop through the floor (a game_tools.FALL_STEP route step, "FALL THROUGH (x, y)"):
+    walk onto that tile and wait for the floor below, `into`. The walk there goes round
+    every other such tile (pathfinding: falls); this one is its goal."""
+    from server.field_control import _integers_in
+
+    numbers = _integers_in(step)
+    if len(numbers) != 2:
+        return _refusal(f"{step} names no tile")
+    x, y = numbers
+    location = _location_name()
+    walk = await mcp_navigate_to({
+        "x": x, "y": y, "variance": "none", "reason": f"{source}: drop to {into}", "through_warps": False,
+    })
+    await _await_game(lambda: _location_name() != location, FALL_FRAMES)
+    await _await_game(_player_can_walk, MAP_CHANGE_GRACE_FRAMES)
+    now = _location_name()
+    if now != into:
+        return _refusal(
+            f"did not drop through the floor at ({x},{y}) to {into}: now on {now} "
+            f"({walk.get('summary') or walk.get('error')})"
+        )
+    summary = f"dropped through the floor at ({x},{y}) to {into}"
+    return {"success": True, "summary": summary, "on_the_way": [summary]}
 
 
 def _crossing_note(entered: List[str]) -> str:
