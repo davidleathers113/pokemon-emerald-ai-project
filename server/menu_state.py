@@ -688,6 +688,109 @@ def in_box_step(position: int, goal: int) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Fly: the party menu's FLY entry and the fly map (fly_to, go_to). pret
+# src/party_menu.c (CursorCb_FieldMove), src/region_map.c (CB2_OpenFlyMap, the fly map's
+# callbacks, struct RegionMap in include/region_map.h). US .sym addresses; each was
+# watched in memory on test_fly_ready.state while fly_to ran (local_tests/test_fly.py).
+# ---------------------------------------------------------------------------
+
+# The party menu lists a Pokémon's field moves after SUMMARY / SWITCH / ITEM as action
+# MENU_FIELD_MOVES + the move's FIELD_MOVE_* number (SetPartyMonFieldSelectionActions).
+MENU_FIELD_MOVES = 19
+FIELD_MOVE_FLY = 5
+MENU_FLY = MENU_FIELD_MOVES + FIELD_MOVE_FLY
+# gMapHeader.mapType (u8 at +0x17 of struct MapHeader): SetUpFieldMove_Fly allows FLY
+# only on these (Overworld_MapTypeAllowsTeleportAndFly).
+G_MAP_HEADER = 0x02037318
+MAP_HEADER_MAP_TYPE = 0x17
+MAP_TYPE_TOWN, MAP_TYPE_CITY, MAP_TYPE_ROUTE, MAP_TYPE_OCEAN_ROUTE = 1, 2, 3, 6
+FLY_MAP_TYPES = (MAP_TYPE_TOWN, MAP_TYPE_CITY, MAP_TYPE_ROUTE, MAP_TYPE_OCEAN_ROUTE)
+MAP_TYPE_NAMES = {0: "nowhere", 4: "a cave", 5: "underwater", 7: "an unknown place", 8: "a building", 9: "a secret base"}
+# FLY chosen on the party menu: Task_ClosePartyMenu → CB2_OpenFlyMap builds the map over
+# ~11 frames → CB2_FlyMap runs sFlyMap->callback each frame: CB_FadeInFlyMap, then
+# CB_HandleFlyMapInput (state 0 reads input), CB_ExitFlyMap after A or B.
+CB2_FLY_MAP = 0x081248D4
+S_FLY_MAP = 0x0203A148          # pointer to sFlyMap; NULL while the map is closed
+FLY_MAP_CALLBACK = 0x0          # void (*callback)(void)
+FLY_MAP_STATE = 0x4             # u16 state
+FLY_MAP_REGION_MAP = 0x8        # struct RegionMap regionMap (after u16 mapSecId)
+CB_HANDLE_FLY_MAP_INPUT = 0x08124D64
+# struct RegionMap: the cursor is on (cursorPosX, cursorPosY), over mapSecId of
+# mapSecType (MAPSECTYPE_CITY_CANFLY 2 or MAPSECTYPE_BATTLE_FRONTIER 4: A flies there).
+# A held D-pad starts a move (ProcessRegionMapInput_Full: cursorMovementFrameCounter = 4,
+# inputCallback = MoveRegionMapCursor_Full), which ends 4 frames later one cell on; still
+# held, the next one starts. So the cursor is moved one short press at a time and read
+# back after each (pokebot-gen3's fly_to holds the button and overshoots).
+REGION_MAP_MAPSEC_ID = 0x00
+REGION_MAP_MAPSEC_TYPE = 0x02
+REGION_MAP_INPUT_CALLBACK = 0x18
+REGION_MAP_CURSOR_X = 0x54
+REGION_MAP_CURSOR_Y = 0x56
+REGION_MAP_CURSOR_MOVE_FRAMES = 0x7A
+PROCESS_REGION_MAP_INPUT_FULL = 0x081230C4
+MAPSECTYPE_CITY_CANFLY, MAPSECTYPE_BATTLE_FRONTIER = 2, 4
+
+
+@dataclass
+class FlyCursor:
+    x: int
+    y: int
+    mapsec: int
+    mapsec_type: int
+
+
+def map_type(reader) -> int:
+    return reader._read_u8(G_MAP_HEADER + MAP_HEADER_MAP_TYPE)
+
+
+def fly_map(reader) -> int:
+    """sFlyMap while CB2_FlyMap runs, else 0."""
+    if not callback2_is(reader, CB2_FLY_MAP):
+        return 0
+    return reader._read_u32(S_FLY_MAP)
+
+
+def fly_cursor(reader) -> Optional[FlyCursor]:
+    """Where the fly map's cursor is, or None while the map is not up."""
+    base = fly_map(reader)
+    if not base:
+        return None
+    region = base + FLY_MAP_REGION_MAP
+    return FlyCursor(
+        x=reader._read_u16(region + REGION_MAP_CURSOR_X),
+        y=reader._read_u16(region + REGION_MAP_CURSOR_Y),
+        mapsec=reader._read_u16(region + REGION_MAP_MAPSEC_ID),
+        mapsec_type=reader._read_u8(region + REGION_MAP_MAPSEC_TYPE),
+    )
+
+
+def fly_map_ready(reader) -> bool:
+    """The fly map reads input: faded in (CB_HandleFlyMapInput, state 0) and no cursor
+    move under way (ProcessRegionMapInput_Full is the input callback again)."""
+    base = fly_map(reader)
+    if not base or fade_active(reader):
+        return False
+    region = base + FLY_MAP_REGION_MAP
+    return (
+        _is(reader._read_u32(base + FLY_MAP_CALLBACK), CB_HANDLE_FLY_MAP_INPUT)
+        and reader._read_u16(base + FLY_MAP_STATE) == 0
+        and _is(reader._read_u32(region + REGION_MAP_INPUT_CALLBACK), PROCESS_REGION_MAP_INPUT_FULL)
+        and reader._read_u8(region + REGION_MAP_CURSOR_MOVE_FRAMES) == 0
+    )
+
+
+def fly_cursor_step(at: Tuple[int, int], goal: Tuple[int, int]) -> Optional[str]:
+    """One press toward the goal cell, across first, then up or down; None there. The
+    fly map has no walls: every cell inside its frame can be crossed."""
+    (x, y), (gx, gy) = at, goal
+    if x != gx:
+        return "RIGHT" if gx > x else "LEFT"
+    if y != gy:
+        return "DOWN" if gy > y else "UP"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Mart
 # ---------------------------------------------------------------------------
 

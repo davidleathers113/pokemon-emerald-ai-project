@@ -173,7 +173,7 @@ def truncate_middle(text: Any, max_chars: int) -> Any:
 # when its presses are done, like use_move.
 MACRO_TOOLS = (
     "heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to",
-    "teach_move", "set_lead", "give_item", "use_item", "deposit_pokemon", "withdraw_pokemon",
+    "teach_move", "set_lead", "give_item", "use_item", "deposit_pokemon", "withdraw_pokemon", "fly_to",
 )
 # Battle calls decided for one match-up (who is out on each side): they carry the
 # get_game_state battle_key the model saw. Seen live: switch_pokemon("BRELOOM"), chosen

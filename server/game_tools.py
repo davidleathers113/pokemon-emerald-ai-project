@@ -10,6 +10,7 @@ tool calls to app.py over HTTP instead.
 import logging
 import os
 import unicodedata
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1077,8 +1078,14 @@ FIELD_MOVE_OBSTACLES = {
 # script it runs (data/scripts/surf.inc EventScript_UseSurf, checkpartymove MOVE_SURF)
 # skips eggs.
 SURF = "SURF"
+# Fly (outside battle) needs the Feather Badge: pret src/party_menu.c CursorCb_FieldMove
+# refuses a field move up to FIELD_MOVE_WATERFALL until FlagGet(FLAG_BADGE01_GET +
+# fieldMove), and FIELD_MOVE_FLY is 5, so FLAG_BADGE06_GET (pokebot-gen3's fly_to checks
+# badge 3, which is wrong for Emerald). The party menu only lists it for a Pokémon that
+# knows the move (SetPartyMonFieldSelectionActions), and never for an egg.
+FLY = "FLY"
 # Every field move the walks use, by the badge number that allows it outside battle.
-FIELD_MOVE_BADGES = {**{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5}
+FIELD_MOVE_BADGES = {**{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5, FLY: 6}
 # () -> set of field moves usable now (known by a party Pokémon, badge set), installed by
 # the server. None: no obstacle is clearable and no water crossable.
 field_moves_reader = None
@@ -2313,6 +2320,153 @@ def place_route(location_name: str, position: Optional[Tuple[int, int]], target:
         if paths:
             return paths[0]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Fly (go_to, fly_to)
+# ---------------------------------------------------------------------------
+
+# Where Fly works: pret src/party_menu.c SetUpFieldMove_Fly allows it only when
+# Overworld_MapTypeAllowsTeleportAndFly(gMapHeader.mapType): routes, towns, cities and
+# ocean routes, never in a building, cave or underwater. The server reads the live map
+# type from gMapHeader; the planner reads the map's map.json.
+FLY_MAP_TYPES = ("MAP_TYPE_TOWN", "MAP_TYPE_CITY", "MAP_TYPE_ROUTE", "MAP_TYPE_OCEAN_ROUTE")
+# A flight's cost in maps walked: START → POKéMON → FLY → the region map → the flight
+# and the landing, ~1200 game frames from Lavaridge to Mauville in local_tests/test_fly.py.
+# Counted as two maps (a judgement, not measured against walks), a flight is taken only
+# when it saves three maps of walking or more, or the walk can't be found at all.
+FLY_COST_MAPS = 2
+
+# ROM tables the fly map works from (US Emerald, pret .sym; src/region_map.c).
+# gRegionMapEntries[mapsec]: struct RegionMapLocation {u8 x, y, width, height; const u8
+# *name}; the cursor's cell is that plus (MAPCURSOR_X_MIN, MAPCURSOR_Y_MIN)
+# (InitMapBasedOnPlayerLocation). sMapHealLocations[mapsec]: {map group, map num, heal
+# location id}; CB_ExitFlyMap warps to that heal location, sHealLocations[id - 1]
+# (src/data/heal_locations.h: {s8 group, s8 num, s16 x, s16 y}).
+G_REGION_MAP_ENTRIES = 0x085A147C
+REGION_MAP_ENTRY_SIZE = 8
+S_MAP_HEAL_LOCATIONS = 0x085A1E3C
+MAP_HEAL_LOCATION_SIZE = 3
+S_HEAL_LOCATIONS = 0x0859F53C
+HEAL_LOCATION_SIZE = 8
+MAPCURSOR_X_MIN, MAPCURSOR_Y_MIN = 1, 2
+# MAPSEC_LITTLEROOT_TOWN (0) .. MAPSEC_EVER_GRANDE_CITY (15): the towns with a
+# FLAG_VISITED_* flag, which GetMapsecType makes MAPSECTYPE_CITY_CANFLY once it is set.
+TOWN_MAPSECS = 16
+MAPSEC_LITTLEROOT_TOWN, MAPSEC_EVER_GRANDE_CITY = 0, 15
+# CB_ExitFlyMap's two exceptions to sMapHealLocations. Littleroot lands outside the
+# player's own house: HEAL_LOCATION_LITTLEROOT_TOWN_BRENDANS_HOUSE or _MAYS_HOUSE by
+# gSaveBlock2Ptr->playerGender (u8 at +8, after the 8-byte name). Ever Grande lands at the
+# Pokémon League from the mapsec's top cell (posWithinMapSec 0) once
+# FLAG_LANDMARK_POKEMON_LEAGUE is set, so its bottom cell, the city's own Pokémon Center,
+# is the one used.
+HEAL_LOCATION_BRENDANS_HOUSE, HEAL_LOCATION_MAYS_HOUSE = 12, 13
+G_SAVE_BLOCK2_PTR = 0x03005D90
+SAVE_BLOCK2_PLAYER_GENDER = 8
+FEMALE = 1
+
+
+@dataclass(frozen=True)
+class FlyDestination:
+    town: str                 # the town's map name, as read_location gives it (LILYCOVE CITY)
+    mapsec: int
+    cell: Tuple[int, int]     # the fly map cursor cell (cursorPosX, cursorPosY) to press A on
+    landing_map: str          # the map the flight lands on
+    landing: Tuple[int, int]  # the tile it lands on
+    visited: bool             # FLAG_VISITED_<town>: the fly map only takes A on a visited town
+
+
+def _map_name(group: int, num: int) -> str:
+    from pokemon_env.enums import MapLocation
+
+    try:
+        return MapLocation((group << 8) | num).name.replace("_", " ")
+    except ValueError:
+        return ""
+
+
+def fly_destinations(reader) -> List[FlyDestination]:
+    """Every town on the fly map with its cursor cell and landing tile, from the ROM tables
+    (so no cell or landing is typed in here), and whether it was visited, from the save's
+    flags. `reader` is the emulator's memory reader."""
+    entries = bytes(reader._read_bytes(G_REGION_MAP_ENTRIES, REGION_MAP_ENTRY_SIZE * TOWN_MAPSECS))
+    heals = bytes(reader._read_bytes(S_MAP_HEAL_LOCATIONS, MAP_HEAL_LOCATION_SIZE * TOWN_MAPSECS))
+    visited_flags = _first_visit_flags()
+    out = []
+    for mapsec in range(TOWN_MAPSECS):
+        x, y, _, height = entries[mapsec * REGION_MAP_ENTRY_SIZE:mapsec * REGION_MAP_ENTRY_SIZE + 4]
+        group, num, heal_id = heals[mapsec * MAP_HEAL_LOCATION_SIZE:(mapsec + 1) * MAP_HEAL_LOCATION_SIZE]
+        town = _map_name(group, num)
+        row = y + height - 1 if mapsec == MAPSEC_EVER_GRANDE_CITY else y
+        if mapsec == MAPSEC_LITTLEROOT_TOWN:
+            save2 = reader._read_u32(G_SAVE_BLOCK2_PTR)
+            female = reader._read_u8(save2 + SAVE_BLOCK2_PLAYER_GENDER) == FEMALE
+            heal_id = HEAL_LOCATION_MAYS_HOUSE if female else HEAL_LOCATION_BRENDANS_HOUSE
+        heal = bytes(reader._read_bytes(S_HEAL_LOCATIONS + (heal_id - 1) * HEAL_LOCATION_SIZE, HEAL_LOCATION_SIZE))
+        flag = visited_flags.get(town)
+        out.append(
+            FlyDestination(
+                town=town,
+                mapsec=mapsec,
+                cell=(x + MAPCURSOR_X_MIN, row + MAPCURSOR_Y_MIN),
+                landing_map=_map_name(heal[0], heal[1]),
+                landing=(int.from_bytes(heal[2:4], "little", signed=True), int.from_bytes(heal[4:6], "little", signed=True)),
+                visited=bool(flag) and bool(reader._is_event_flag_set(flag)),
+            )
+        )
+    return out
+
+
+def fly_destination_named(destinations: List[FlyDestination], name: str) -> Optional[FlyDestination]:
+    """The town `name` names: the town itself ("Lilycove", "LILYCOVE CITY") or a place in
+    it ("Lilycove City Pokemon Center")."""
+    wanted = _squash_name(name)
+    if not wanted:
+        return None
+    for d in destinations:
+        town = _squash_name(d.town)
+        if town.startswith(wanted) or wanted.startswith(town) or _names_same_place(d.town, name):
+            return d
+    return None
+
+
+def can_fly() -> bool:
+    """A party Pokémon (not an egg) knows FLY and the Feather Badge is set."""
+    return FLY in _usable_field_moves()
+
+
+def map_allows_fly(map_dir: str) -> bool:
+    return _raw_map_json(map_dir).get("map_type") in FLY_MAP_TYPES
+
+
+def fly_plan(
+    location_name: str, position: Optional[Tuple[int, int]], target: str, destinations: List[FlyDestination]
+) -> Optional[Tuple[FlyDestination, List[Tuple[str, str]]]]:
+    """(town to fly to, the walk from where it lands) when flying there and walking on
+    reaches `target` clearly sooner than walking all the way, else None.
+
+    David (2026-11-04): "use TROPIUS + Fly instead of long walks". Both ways are counted
+    in maps walked (place_route), a flight as FLY_COST_MAPS more. A walk place_route can't
+    find at all (water without Surf, the Route 111 desert without the Go-Goggles, or more
+    than _FAR_MAP_MAX_STEPS maps) loses to any flight that gets there. Only visited towns
+    count (the fly map refuses the others), and only when the party can fly from here.
+    """
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    usable = [d for d in destinations if d.visited and d.landing_map and d.landing_map != location_name]
+    if not usable or not can_fly() or not map_allows_fly(ROM_TO_PORYMAP_MAP.get(location_name, "")):
+        return None
+    walk = place_route(location_name, position, target)
+    if walk is not None and len(walk) <= FLY_COST_MAPS:
+        return None  # no flight can beat a walk this short
+    best = None
+    for d in usable:
+        rest = place_route(d.landing_map, d.landing, target)
+        if rest is not None and (best is None or len(rest) < len(best[1])):
+            best = (d, rest)
+    if best is None or (walk is not None and len(best[1]) + FLY_COST_MAPS >= len(walk)):
+        return None
+    return best
 
 
 def _live_tile_reader(env):

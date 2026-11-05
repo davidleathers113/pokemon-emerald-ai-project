@@ -8128,6 +8128,10 @@ async def mcp_go_to(request: dict = None):
     on the way cost a ~35 s model decision (go_to_exit, then think again); this walks the
     whole way game_tools.place_route gives, running from wild battles, reading through
     scenes, and stopping for a trainer battle or a question.
+
+    David (2026-11-04): "use TROPIUS + Fly instead of long walks". When a party Pokémon
+    can fly from here and flying to a visited town, then walking on, is clearly shorter
+    (game_tools.fly_plan), it flies there first (_fly_to) and walks the rest.
     """
     if env is None:
         return {"success": False, "error": "Emulator not initialized"}
@@ -8143,13 +8147,24 @@ async def mcp_go_to(request: dict = None):
         return refused
     snap = _field_snapshot()
     start = _location_name()
-    if game_tools.arrived_at(start, (snap.x, snap.y) if snap is not None else None, target):
+    position = (snap.x, snap.y) if snap is not None else None
+    if game_tools.arrived_at(start, position, target):
         return {"success": True, "status": "ARRIVED", "summary": f"You are already on {start} ({target})."}
 
     def arrived() -> bool:
         here = _field_snapshot()
         return game_tools.arrived_at(_location_name(), (here.x, here.y) if here is not None else None, target)
 
+    flown, fly_note = None, ""
+    plan = await run_in_threadpool(_go_to_fly_plan, start, position, target)
+    if plan is not None:
+        town = plan[0]
+        with _turbo():
+            failed = await _fly_to(town, source)
+        if failed:
+            fly_note = f" Tried to fly to {town.town} first, but {failed}; walked instead."
+        else:
+            flown = town.town
     on_the_way: List[str] = []
     with _turbo():
         entered, why = await _walk_along(
@@ -8161,7 +8176,10 @@ async def mcp_go_to(request: dict = None):
             GO_TO_MAX_MAPS,
             on_the_way,
         )
-    walked = f" Walked {' → '.join(entered)}." if entered else ""
+    if flown:
+        walked = f" Flew to {flown}" + (f", then walked {' → '.join(entered)}." if entered else ".")
+    else:
+        walked = fly_note + (f" Walked {' → '.join(entered)}." if entered else "")
     if on_the_way:
         walked += f" On the way: {'; '.join(on_the_way)}."
     if why:
@@ -8170,6 +8188,222 @@ async def mcp_go_to(request: dict = None):
         "success": True,
         "status": "ARRIVED",
         "summary": f"Arrived at {target}: now at {_position_text(_field_snapshot())}.{walked}",
+        **({"flew_to": flown} if flown else {}),
+    }
+
+
+# -- Fly: fly_to, and go_to's flights -------------------------------------------------
+#
+# David (2026-11-04): "use TROPIUS + Fly instead of long walks". By hand: START → POKéMON
+# → the Pokémon that knows FLY → FLY (its menu lists field moves after SUMMARY / SWITCH /
+# ITEM) → the fly map → the cursor onto the town → A, and the player flies off and lands
+# at the town's heal location. Emerald asks nothing more: CB_HandleFlyMapInput takes A on
+# a visited town at once (CB_ExitFlyMap). Every press waits for its screen, read from
+# memory (server/menu_state.py "Fly"); the landing is checked, map and tile.
+
+# Fly map presses allowed beyond the cells between the cursor and the town (one the map
+# dropped, an overshoot to correct) before the move gives up.
+FLY_CURSOR_SLACK = 8
+# Presses in a row that left the cursor where it was before the move gives up.
+FLY_CURSOR_STUCK = 3
+# A D-pad press the fly map turns into exactly one cell: held 2 frames, shorter than the
+# 4 frames a cell's move takes, so it is let go before the move ends (a button still held
+# then starts the next move: ProcessRegionMapInput_Full reads JOY_HELD). Seen in
+# local_tests/test_fly.py: RIGHT held 30 frames moved the cursor 7 cells.
+FLY_CURSOR_HOLD_FRAMES = 2
+# From A on the fly map to walking on the landing tile: the fade out, the flight off
+# (FldEff_UseFly), the warp and the flight in (Task_FlyIntoMap). Seen in
+# local_tests/test_fly.py: a whole fly_to, menus and cursor included, took ~1200 frames.
+FLY_LANDING_FRAMES = 2400
+# The fly map cells the cursor stood on during the last flight's cursor move, start first
+# (for the tests: the path is checked step by step).
+last_fly_cursor_path: List[Tuple[int, int]] = []
+
+
+def _flyer() -> Tuple[Optional[int], str]:
+    """(party slot of the first Pokémon that can fly us, "") or (None, why the party can't
+    fly from here): the Pokémon (not an egg) knows FLY, the Feather Badge is set
+    (CursorCb_FieldMove), and the map is outdoors (SetUpFieldMove_Fly reads
+    gMapHeader.mapType)."""
+    from server import game_tools
+    from server import menu_state as ms
+
+    with memory_lock:
+        reader = env.memory_reader
+        party = reader.read_party_pokemon() or []
+        badge = reader._is_event_flag_set(game_tools.FLAG_BADGE01_GET + game_tools.FIELD_MOVE_BADGES[game_tools.FLY] - 1)
+        here = ms.map_type(reader)
+    index = next((i for i, p in enumerate(party) if not p.is_egg and game_tools.FLY in p.moves), None)
+    if index is None:
+        return None, 'no Pokémon in your party knows FLY (teach_move("HM02", ...) teaches it)'
+    if not badge:
+        return None, "FLY outside battle needs the Feather Badge (Fortree City Gym)"
+    if here not in ms.FLY_MAP_TYPES:
+        return None, f"FLY can't be used in {ms.MAP_TYPE_NAMES.get(here, 'this place')}: go outside first"
+    return index, ""
+
+
+def _go_to_fly_plan(location: str, position: Optional[Tuple[int, int]], target: str):
+    """game_tools.fly_plan for go_to, or None when the party can't fly from here now."""
+    from server import game_tools
+
+    if _flyer()[0] is None:
+        return None
+    return game_tools.fly_plan(location, position, target, _mem(game_tools.fly_destinations))
+
+
+async def _fly_cursor_press(button: str, source: str) -> None:
+    queued = await take_action(
+        ActionRequest(buttons=[button], hold_frames=FLY_CURSOR_HOLD_FRAMES, release_frames=FLY_CURSOR_HOLD_FRAMES, source=source)
+    )
+    await _await_sequence(queued.get("sequence_id"), _sequence_frames(1))
+
+
+async def _move_fly_cursor(goal: Tuple[int, int], source: str) -> Optional[str]:
+    """Closed loop (pokebot-gen3's method, without its held button): one short press
+    toward the goal, wait for the move to end, read the cursor back, again. A press that
+    went one cell too far is undone by the next, which reads where the cursor really is.
+    None once the cursor is on the goal, else why not."""
+    from server import menu_state as ms
+
+    def cell(r):
+        cursor = ms.fly_cursor(r)
+        return (cursor.x, cursor.y) if cursor is not None else None
+
+    at = _mem(cell)
+    if at is None:
+        return "the fly map is not open"
+    last_fly_cursor_path[:] = [at]
+    stuck = 0
+    for _ in range(abs(at[0] - goal[0]) + abs(at[1] - goal[1]) + FLY_CURSOR_SLACK):
+        step = ms.fly_cursor_step(at, goal)
+        if step is None:
+            return None
+        await _fly_cursor_press(step, source)
+        moved = await _await_game(
+            lambda at=at: _mem(lambda r: ms.fly_map_ready(r) and cell(r) not in (None, at)), MACRO_MENU_FRAMES
+        )
+        now = _mem(cell)
+        if now is None:
+            return "the fly map closed"
+        if not moved:
+            stuck += 1
+            if stuck >= FLY_CURSOR_STUCK:
+                return f"the fly map's cursor did not move {step} from {at}"
+            continue
+        stuck = 0
+        at = now
+        last_fly_cursor_path.append(at)
+    if at != goal:
+        return f"could not put the fly map's cursor on {goal} (it is on {at})"
+    return None
+
+
+async def _leave_fly_map(source: str) -> bool:
+    """B out of the fly map (CB_ExitFlyMap goes back to the party menu,
+    CB2_ReturnToPartyMenuFromFlyMap), then out of the menus; True once the player can walk."""
+    from server import menu_state as ms
+
+    if _mem(ms.fly_map):
+        await _macro_press(["B"], source)
+        await _await_game(lambda: not _mem(ms.fly_map) and (_mem(_party_ready) or _player_can_walk()), MACRO_MENU_FRAMES * 3)
+    return await _close_field_menus(source)
+
+
+async def _open_fly_map(source: str) -> Optional[str]:
+    """START → POKéMON → the flyer → FLY: None once the fly map reads input, else why not
+    (menus may still be open: _leave_fly_map closes them)."""
+    from server import menu_state as ms
+
+    index, why = _flyer()
+    if index is None:
+        return why
+    error = await _open_party_mon_menu(index, ms.MENU_FLY, "FLY", source)
+    if error:
+        return error
+    options = _mem(ms.party_menu_actions)
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, options.index(ms.MENU_FLY), source):
+        return "could not put the menu cursor on FLY"
+    await _macro_press(["A"], source)
+    # The party menu closes, CB2_OpenFlyMap builds the map and CB_FadeInFlyMap fades it in.
+    if not await _await_game(lambda: _mem(ms.fly_map_ready), MACRO_MENU_FRAMES * 3):
+        return "chose FLY but the fly map did not open"
+    return None
+
+
+async def _fly_to(town, source: str) -> Optional[str]:
+    """Fly to `town` (a visited game_tools.FlyDestination): START → POKéMON → the flyer
+    → FLY → the cursor onto the town → A, then wait to stand on its landing tile. None
+    once there, else why not (the menus are closed again when the flight didn't start)."""
+    from server import menu_state as ms
+
+    error = await _open_fly_map(source)
+    if error is None:
+        error = await _move_fly_cursor(town.cell, source)
+    if error is None:
+        cursor = _mem(ms.fly_cursor)
+        if cursor is None or cursor.mapsec != town.mapsec:
+            error = f"the fly map's cursor is not on {town.town}"
+        elif cursor.mapsec_type not in (ms.MAPSECTYPE_CITY_CANFLY, ms.MAPSECTYPE_BATTLE_FRONTIER):
+            error = f"the fly map won't fly to {town.town} (not visited)"
+    if error:
+        closed = await _leave_fly_map(source)
+        return error + ("" if closed else ". A menu is still open: look at the screen")
+    await _macro_press(["A"], source)
+    landed = await _await_game(
+        lambda: _location_name() == town.landing_map and _player_can_walk(), FLY_LANDING_FRAMES
+    )
+    if not landed:
+        return f"pressed A on {town.town} on the fly map but did not land on {town.landing_map}{_screen_note()}"
+    snap = _field_snapshot()
+    if snap is None or (snap.x, snap.y) != town.landing:
+        where = f"({snap.x},{snap.y})" if snap is not None else "an unknown tile"
+        return f"landed on {town.landing_map} at {where}, not at its heal location {town.landing}"
+    return None
+
+
+@app.post("/mcp/fly_to")
+async def mcp_fly_to(request: dict = None):
+    """MCP Tool: outdoors, fly to a town visited before, in one call.
+
+    Needs a party Pokémon that knows FLY and the Feather Badge (pret CursorCb_FieldMove:
+    FLAG_BADGE06_GET), and a map Fly works on (towns, cities, routes; not buildings or
+    caves). The town is found on the fly map from ROM (gRegionMapEntries) and the landing
+    from its heal location (sMapHealLocations); everything is refused before a button is
+    pressed when one of these is missing. go_to flies by itself when that is shorter.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import game_tools
+
+    source = "fly_to"
+    request = request or {}
+    wanted = str(request.get("town") or request.get("place") or "").strip()
+    if not wanted:
+        return _refusal('town is required: a town you have visited, e.g. fly_to("LILYCOVE CITY").')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    destinations = _mem(game_tools.fly_destinations)
+    visited = ", ".join(d.town for d in destinations if d.visited) or "none"
+    town = game_tools.fly_destination_named(destinations, wanted)
+    if town is None:
+        return _refusal(f"{wanted} is not a town Fly goes to. Towns you can fly to: {visited}.")
+    if not town.visited:
+        return _refusal(f"You haven't been to {town.town} yet, and Fly only goes to towns you have visited: {visited}.")
+    index, why = _flyer()
+    if index is None:
+        return _refusal(f"Can't fly: {why}.")
+    with memory_lock:
+        flyer = (env.memory_reader.read_party_pokemon() or [])[index].species_name.upper()
+    with _turbo():
+        failed = await _fly_to(town, source)
+    if failed:
+        return _refusal(f"Did not fly to {town.town}: {failed}.")
+    return {
+        "success": True,
+        "status": "FLEW",
+        "summary": f"{flyer} flew you to {town.town}: now at {_position_text(_field_snapshot())}.",
     }
 
 
@@ -8812,6 +9046,23 @@ async def _open_item_submenu(index: int, source: str) -> Optional[str]:
     """START → POKéMON → party slot `index` → ITEM: GIVE / TAKE / CANCEL open, or why not."""
     from server import menu_state as ms
 
+    error = await _open_party_mon_menu(index, ms.MENU_ITEM, "ITEM", source)
+    if error:
+        return error
+    options = _mem(ms.party_menu_actions)
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, options.index(ms.MENU_ITEM), source):
+        return "Could not put the menu cursor on ITEM."
+    await _macro_press(["A"], source)
+    if not await _await_game(lambda: _mem(lambda r: ms.MENU_GIVE in ms.party_menu_actions(r)), MACRO_MENU_FRAMES):
+        return "Chose ITEM but GIVE / TAKE did not open."
+    return None
+
+
+async def _open_party_mon_menu(index: int, entry: int, entry_name: str, source: str) -> Optional[str]:
+    """START → POKéMON → party slot `index` → A: its menu open and listing `entry` (a
+    party_menu.c MENU_* action, named entry_name in the reason), or why not."""
+    from server import menu_state as ms
+
     await _macro_press(["START"], source)
     if not await _await_game(lambda: _mem(ms.start_menu_open), MACRO_MENU_FRAMES):
         return "The START menu did not open."
@@ -8826,14 +9077,8 @@ async def _open_item_submenu(index: int, source: str) -> Optional[str]:
     if not await _step_cursor(ms.party_menu_slot, index, source):
         return f"Could not put the party cursor on slot {index + 1}."
     await _macro_press(["A"], source)
-    if not await _await_game(lambda: _mem(lambda r: ms.MENU_ITEM in ms.party_menu_actions(r)), MACRO_MENU_FRAMES):
-        return f"Slot {index + 1}'s menu did not open (or has no ITEM)."
-    options = _mem(ms.party_menu_actions)
-    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, options.index(ms.MENU_ITEM), source):
-        return "Could not put the menu cursor on ITEM."
-    await _macro_press(["A"], source)
-    if not await _await_game(lambda: _mem(lambda r: ms.MENU_GIVE in ms.party_menu_actions(r)), MACRO_MENU_FRAMES):
-        return "Chose ITEM but GIVE / TAKE did not open."
+    if not await _await_game(lambda: _mem(lambda r: entry in ms.party_menu_actions(r)), MACRO_MENU_FRAMES):
+        return f"Slot {index + 1}'s menu did not open (or has no {entry_name})."
     return None
 
 

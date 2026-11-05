@@ -609,7 +609,8 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "description": (
             "Walk to a named place in one call: a town, route, building or cave floor, map "
             "after map (e.g. 'Route 117', 'Mauville City Pokemon Center'). Runs from wild "
-            "battles on the way; stops for a trainer battle or a question."
+            "battles on the way; stops for a trainer battle or a question. Flies to a "
+            "visited town first when that is much shorter (a Pokemon knows FLY, Feather Badge)."
         ),
         "parameters": {
             "type_": "OBJECT",
@@ -618,6 +619,23 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
                 "reasoning": {"type_": "STRING", "description": "One short sentence: why go there."},
             },
             "required": ["place", "reasoning"],
+        },
+    },
+    # David (2026-11-04): "use TROPIUS + Fly instead of long walks".
+    {
+        "name": "fly_to",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Outdoors: fly to a town you have visited, in one call (a party Pokemon must know "
+            "FLY, and you need the Feather Badge). go_to already flies when that is shorter."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "town": {"type_": "STRING", "description": "A visited town, e.g. 'LILYCOVE CITY'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why fly there."},
+            },
+            "required": ["town", "reasoning"],
         },
     },
     {
