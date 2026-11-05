@@ -147,7 +147,9 @@ def test_a_match_call_is_read_to_its_hang_up_in_one_read():
     print("   ", r)
     assert not _call_on(s), r
     assert r.get("call_open") is False and "read to its end" in r["summary"], r
-    assert any("This is" in t or "DAVID" in t for t in r["texts"]), r
+    # Who calls is chosen by Random() (any registered trainer: RICKY's call says neither
+    # "This is" nor DAVID), so only the shape is checked: the message quoted, once.
+    assert len(r["texts"]) == 1 and r["texts"][0] in r["summary"], r
     assert not any("doing okay in my training" in t for t in r["texts"]), r
     assert r["presses"] <= 10, r
     assert s.srv._player_can_walk(), "control should be back"
