@@ -337,6 +337,10 @@ def _format_state_summary(state_data):
 def _battle_mon_line(mon):
     hp = f"HP {mon['hp']}/{mon['max_hp']}" if mon['hp'] > 0 else "fainted"
     status = f", {mon['status']}" if mon.get('status', 'OK') != 'OK' else ""
+    # Seen live (ROUTE 120, 2026-11-05): wild POOCHYENA's SWAGGER confused SABLEYE, which
+    # hurt itself and fainted; confusion (gBattleMons[].status2) was shown nowhere.
+    if mon.get('confusion_turns') and mon['hp'] > 0:
+        status += ", confused"
     # The game's own ability for the Pokémon out (gBattleMons): LEVITATE, HUGE POWER...
     ability = f", {mon['ability_name']}" if mon.get('ability_name') else ""
     # Seen live (TATE & LIZA, 2026-11-05): XATU used CALM MIND twice and swept the team
@@ -457,6 +461,16 @@ def format_battle_view(view):
     elif moves:
         lines.append("No damaging move with PP left: switch Pokémon, use an item, or run.")
     player = view['player']
+    confusion = view.get('confusion')
+    if confusion and (confusion['low'] or confusion['knocks_out']):
+        # Seen live (ROUTE 120): SABLEYE at 27/111 HP, confused by SWAGGER (+2 Attack),
+        # attacked and "hurt itself in its confusion" until it fainted.
+        knocks = ", a knock-out" if confusion['knocks_out'] else ""
+        way = "switch_pokemon() is" if view['is_trainer'] else "switch_pokemon() or run_from_battle() is"
+        lines.append(
+            f"{player['name'].upper()} is confused: one move in two it hits itself for ~{confusion['self_hit']} "
+            f"of its {player['hp']} HP{knocks}. {way} safer than attacking."
+        )
     if not view['is_trainer'] and player['max_hp'] and player['hp'] < player['max_hp'] * WILD_LEAD_LOW_HP_SHARE:
         lines.append(
             f"{player['name'].upper()} is low on HP ({player['hp']}/{player['max_hp']}): "

@@ -590,6 +590,65 @@ def test_use_move_waits_out_a_turn_then_refuses_if_a_new_pokemon_is_out():
     assert out.move_pp == was.move_pp, (was.move_pp, out.move_pp)  # nothing used
 
 
+# pret struct BattlePokemon +0x50 status2: STATUS2_CONFUSION, the low 3 bits, counts the
+# turns left; +0x18 statStages (6 neutral, ATK at index 1).
+STATUS2, STAGES = 0x50, 0x18
+WILD_TWO = HERE / "test_wild_two_party.state"  # TORCHIC Lv11 18/33 out vs wild SILCOON Lv5
+
+
+def _confuse(s, battler, turns):
+    base = 0x02024084 + 0x58 * battler
+    with s.srv.memory_lock:
+        status2 = s.srv.env.memory_reader._read_u32(base + STATUS2)
+    _poke(s, 32, base + STATUS2, (status2 & ~7) | turns)
+
+
+def test_confusion_is_shown_for_both_sides():
+    """Seen live (ROUTE 120, 2026-11-05): "Wild POOCHYENA used BITE! · SABLEYE is confused!
+    · It hurt itself in its confusion! · SABLEYE fainted!" at 27/111 HP. Wild POOCHYENA
+    Lv25 and MIGHTYENA Lv27 know SWAGGER (the ROM's gLevelUpLearnsets), and confusion
+    (gBattleMons[].status2) was shown nowhere. test_wild_two_party.state; RAM: both
+    battlers confused for 3 turns, TORCHIC at 8/33 HP (under half)."""
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(WILD_TWO)
+    lines = format_battle_view(_view(s))
+    assert not any("confused" in line for line in lines), lines
+    _confuse(s, 0, 3)
+    _confuse(s, 1, 3)
+    _poke(s, 16, 0x02024084 + 0x28, 8)
+    view = _view(s)
+    lines = format_battle_view(view)
+    print("   ", "\n    ".join(lines))
+    assert lines[0].startswith("Wild battle vs SILCOON Lv5 (BUG), HP ") and ", confused" in lines[0], lines[0]
+    assert lines[1].startswith("You: TORCHIC Lv11 (FIRE), HP 8/33, confused"), lines[1]
+    # pret CalculateBaseDamage(TORCHIC, TORCHIC, MOVE_POUND, power 40): no badge yet here.
+    me = view["player"]
+    level_part = 2 * me["level"] // 5 + 2
+    expected = me["stats"]["attack"] * 40 * level_part // me["stats"]["defense"] // 50 + 2
+    assert view["confusion"] == {"self_hit": expected, "knocks_out": expected >= 8, "low": True}, view["confusion"]
+    advice = next(line for line in lines if "is confused" in line)
+    assert advice == (
+        f"TORCHIC is confused: one move in two it hits itself for ~{expected} of its 8 HP"
+        f"{', a knock-out' if expected >= 8 else ''}. switch_pokemon() or run_from_battle() is safer than attacking."
+    ), advice
+    assert s.srv._battle_hp_text(view) == "Now: TORCHIC HP 8/33, confused; foe SILCOON HP {}/{}, confused.".format(
+        view["opponents"][0]["hp"], view["opponents"][0]["max_hp"]
+    )
+    # SWAGGER's +2 Attack (stage 8) doubles the attack in the self-hit.
+    _poke(s, 8, 0x02024084 + STAGES + 1, 8)
+    boosted = _view(s)["confusion"]["self_hit"]
+    assert boosted == 2 * me["stats"]["attack"] * 40 * level_part // me["stats"]["defense"] // 50 + 2, boosted
+    # One turn left: the next move snaps out of it first (pret CANCELLER_CONFUSED), so no
+    # warning, though it is still shown as confused.
+    _confuse(s, 0, 1)
+    view = _view(s)
+    lines = format_battle_view(view)
+    assert view["confusion"] is None and ", confused" in lines[1], (view["confusion"], lines)
+    assert not any("is confused" in line for line in lines), lines
+
+
 def _run_all():
     import test_movement_feedback as harness
 

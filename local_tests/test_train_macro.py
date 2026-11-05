@@ -949,6 +949,87 @@ def test_a_trapped_battler_fights_on():
     assert trap is not None and trap.why == "FIRE SPIN" and not trap.can_run, trap
 
 
+# -- confusion (2026-11-05) ----------------------------------------------------------
+# Seen live (ROUTE 120): wild POOCHYENA Lv25 and MIGHTYENA Lv27 know SWAGGER (+2 Attack,
+# confusion; the ROM's gLevelUpLearnsets) and KECLEON PSYBEAM. train attacked on, and
+# MANECTRIC, TROPIUS and SABLEYE (27/111 HP) "hurt itself in its confusion" and fainted.
+# RAM: STATUS2_CONFUSION, the low 3 bits of gBattleMons[0].status2, set to 3 turns.
+CONFUSED_3_TURNS = 3
+
+
+def _confused_and_low(s):
+    """RAM: our battler confused for 3 turns and at a third of its max HP (under half)."""
+    status2 = _read(s, lambda r: r._read_u32(BATTLE_MONS + STATUS2))
+    _write(s, 32, BATTLE_MONS + STATUS2, (status2 & ~7) | CONFUSED_3_TURNS)
+    max_hp = _read(s, lambda r: r._read_u16(BATTLE_MONS + 0x2C))
+    _write(s, 16, BATTLE_MONS + 0x28, max(1, max_hp // 3))
+
+
+def test_a_confused_battler_under_half_hp_is_switched_out():
+    """test_shoal_cave_low_tide.state, the live team (TROPIUS, the LOWEST, holds the Exp.
+    Share and stays benched; AZUMARILL leads and fights). RAM, at the first battle's first
+    decision (train's battle step wrapped to make the write there): AZUMARILL confused and
+    at a third of its HP. A teammate that wins comfortably comes in instead of an attack."""
+    s = server()
+    s.load(LOW_TIDE)
+    real = s.srv._train_battle
+    confused = []
+
+    async def confuse_the_first_battle(*args, **kwargs):
+        if not confused:
+            view = s.srv._read_battle_view()
+            if view is not None and view["menu"] == "busy":
+                assert (await s.srv._play_out_battle("test"))["end"] == "action"
+            _confused_and_low(s)
+            confused.append(str(s.srv._read_battle_view()["player"]["name"]).upper())
+        return await real(*args, **kwargs)
+
+    s.srv._train_battle = confuse_the_first_battle
+    try:
+        r = s.call("mcp_train", {"trainee": "LOWEST", "until_level": 48, "max_minutes": 0.3, "reasoning": "test"})
+    finally:
+        s.srv._train_battle = real
+    print("   ", r["summary"])
+    first = r["battles"][0]
+    print("      ", first)
+    assert confused == ["AZUMARILL"], confused
+    whys = first.get("confused") or []
+    assert len(whys) == 1 and whys[0].startswith("AZUMARILL is confused at "), first
+    assert " takes over (wins in " in whys[0] and first["switched"] is True, first
+    assert first.get("partner") not in (None, "AZUMARILL", "TROPIUS") and not first.get("ran"), first
+    assert "AZUMARILL fainted" not in r["summary"] and "Confusion: AZUMARILL is confused at " in r["summary"], r
+
+
+def test_a_confused_battler_runs_from_a_wild_battle_with_no_good_switch():
+    """test_wild_two_party.state: TORCHIC out, SHROOMISH (the trainee, never a stand-in)
+    benched, so nobody can take over. RAM: TORCHIC confused, at 11/33 HP. train runs."""
+    s = server()
+    s.load(WILD_TWO)
+    _confused_and_low(s)
+    r = s.call("mcp_train", {"trainee": "SHROOMISH", "max_minutes": 0.1, "reasoning": "test"})
+    print("   ", r["summary"])
+    first = r["battles"][0]
+    print("      ", first)
+    assert first.get("ran") is True and first["outcome"] == "ran away", first
+    assert first["confused"][0].startswith("TORCHIC is confused at 11/33 HP") and first["confused"][0].endswith(": ran"), first
+    assert "TORCHIC fainted" not in r["summary"], r
+
+
+def test_a_confused_battler_that_is_trapped_fights_on():
+    """As above, but wrapped by FIRE SPIN (battler_trap): no switch or run can work, so
+    TORCHIC fights it out (test_a_trapped_battler_fights_on)."""
+    s = server()
+    s.load(WILD_TWO)
+    _fire_spin(s)
+    _confused_and_low(s)
+    r = s.call("mcp_train", {"trainee": "SHROOMISH", "max_minutes": 0.1, "reasoning": "test"})
+    print("   ", r["summary"])
+    first = r["battles"][0]
+    print("      ", first)
+    assert first.get("trapped") == "FIRE SPIN" and first["turns"] >= 1, first
+    assert not first.get("confused") and not first.get("ran") and first["switched"] is False, first
+
+
 def test_a_party_read_mid_update_is_read_again():
     """Seen live: "Error in train: 3677367865", the trainee's personality missing from
     the party, after "Failed to read Pokemon at slot 3: 40996 is not a valid Move". The

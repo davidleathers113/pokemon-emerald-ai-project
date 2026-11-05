@@ -149,6 +149,15 @@ STAT_STAGE_RATIOS = (
     (10, 40), (10, 35), (10, 30), (10, 25), (10, 20), (10, 15), (10, 10),
     (15, 10), (20, 10), (25, 10), (30, 10), (35, 10), (40, 10),
 )
+# Confusion. pret include/constants/battle.h: struct BattlePokemon +0x50 status2, whose
+# low 3 bits (STATUS2_CONFUSION) count the turns left. battle_util.c
+# AtkCanceller_UnableToUseMove (CANCELLER_CONFUSED) takes one off before each move, so at
+# 1 the next move snaps out of it; otherwise it hits itself one time in two, for
+# CalculateBaseDamage(attacker, attacker, MOVE_POUND, power 40): a typeless physical hit
+# with its own Attack and Defense, stat stages and badge boosts, no random roll.
+BATTLE_MON_STATUS2 = 0x50
+STATUS2_CONFUSION = 0x07
+CONFUSION_SELF_HIT_POWER = 40
 
 
 def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]:
@@ -1696,9 +1705,37 @@ class PokemonEmeraldReader:
         power = data["power"]
         if not power or move_type == 9:  # TYPE_MYSTERY
             return 0.0
+        damage = self._base_damage(attacker, defender, move_type, power, effect)
+        if not damage:
+            return 0.0
+        if move_type in attacker["type_ids"]:
+            damage *= 1.5
+        return damage * effectiveness * 0.925  # the 85-100% roll averages 92.5%
+
+    def confusion_self_hit(self, mon: Dict[str, Any]) -> float:
+        """HP a confused battle-view mon (_read_battle_mon) loses when it hits itself: pret's
+        CalculateBaseDamage(mon, mon, MOVE_POUND, power 40) (STATUS2_CONFUSION above). No
+        STAB, type chart or random roll: a GHOST type hurts itself too. Seen live (ROUTE
+        120, 2026-11-05): wild POOCHYENA's SWAGGER (+2 Attack, confused), then SABLEYE at
+        27/111 HP "hurt itself in its confusion" and fainted."""
+        return float(self._base_damage(mon, mon, PokemonType.NORMAL.value, CONFUSION_SELF_HIT_POWER, 0))
+
+    def confusion_danger(self, mon: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """{"self_hit": HP, "knocks_out": bool, "low": bool} while a battle-view mon's next
+        move can still end in a self-hit (2+ turns of confusion left: at 1 it snaps out
+        first, STATUS2_CONFUSION above), else None. "low": under half its max HP."""
+        if not mon or mon.get("confusion_turns", 0) < 2 or mon["hp"] <= 0:
+            return None
+        hit = self.confusion_self_hit(mon)
+        return {"self_hit": round(hit), "knocks_out": hit >= mon["hp"], "low": mon["hp"] * 2 < mon["max_hp"]}
+
+    def _base_damage(self, attacker: Dict[str, Any], defender: Dict[str, Any], move_type: int, power: int, effect: int) -> int:
+        """pret CalculateBaseDamage for estimate_damage and confusion_self_hit: stats,
+        stat stages, abilities, burn and badge boosts, the +2 included; 0 without stats."""
+        ability = defender.get("ability")
         a_stats, d_stats = attacker.get("stats") or {}, defender.get("stats") or {}
         if not a_stats or not d_stats:
-            return 0.0
+            return 0
         attack, defense = a_stats["attack"], d_stats["defense"]
         sp_attack, sp_defense = a_stats["sp_attack"], d_stats["sp_defense"]
         a_ability = attacker.get("ability")
@@ -1750,10 +1787,7 @@ class PokemonEmeraldReader:
         else:
             damage = staged(sp_attack, a_stages, 4) * power * (2 * attacker["level"] // 5 + 2)
             damage = damage // max(1, staged(sp_defense, d_stages, 5)) // 50
-        damage += 2
-        if move_type in attacker["type_ids"]:
-            damage *= 1.5
-        return damage * effectiveness * 0.925  # the 85-100% roll averages 92.5%
+        return damage + 2
 
     def status_move_failure(self, move_id: int, target: Optional[Dict[str, Any]]) -> Optional[str]:
         """Why a status move would fail on this target (a battle-view target dict), or None.
@@ -2279,6 +2313,10 @@ class PokemonEmeraldReader:
             "ability": self._read_u8(base + 0x20),
             "ability_name": self.ability_name(self._read_u8(base + 0x20)),
             "personality": self._read_u32(base + 0x48),
+            # Turns of confusion left (STATUS2_CONFUSION); 0 when not confused. Seen live
+            # (ROUTE 120, 2026-11-05): SWAGGER from wild POOCHYENA and MIGHTYENA, and nothing
+            # in the battle view said so.
+            "confusion_turns": self._read_u32(base + BATTLE_MON_STATUS2) & STATUS2_CONFUSION,
         }
         mon["stage_changes"] = self.stage_changes(mon)
         return mon
@@ -2550,6 +2588,7 @@ class PokemonEmeraldReader:
             "switch_hint": switch_hint,
             "better_switch": better_switch,
             "danger": danger,
+            "confusion": self.confusion_danger(player),
             "item_hint": item_hint,
         }
 

@@ -6824,9 +6824,16 @@ def _turn_text(texts: List[str]) -> str:
 def _battle_hp_text(view: Optional[Dict[str, Any]]) -> str:
     if not view or not view.get("player"):
         return ""
+
+    def confused(mon: Dict[str, Any]) -> str:
+        # STATUS2_CONFUSION (memory_reader). Seen live (ROUTE 120, 2026-11-05): "Foe
+        # POOCHYENA used SWAGGER!" scrolled by and SABLEYE kept attacking until a self-hit
+        # knocked it out.
+        return ", confused" if mon.get("confusion_turns") and mon["hp"] > 0 else ""
+
     player = view["player"]
-    text = f"{player['name'].upper()} HP {player['hp']}/{player['max_hp']}"
-    foes = [f"foe {m['name'].upper()} HP {m['hp']}/{m['max_hp']}" for m in view.get("opponents") or []]
+    text = f"{player['name'].upper()} HP {player['hp']}/{player['max_hp']}{confused(player)}"
+    foes = [f"foe {m['name'].upper()} HP {m['hp']}/{m['max_hp']}{confused(m)}" for m in view.get("opponents") or []]
     return f"Now: {'; '.join([text] + foes)}."
 
 
@@ -7755,6 +7762,42 @@ def _trainee_threat(party: List[Tuple[int, Any]], trainee_pid: int, view: Option
     return None
 
 
+def _train_confusion_way_out(
+    party: List[Tuple[int, Any]], trainee_pid: int, active: Optional[int], view: Optional[Dict[str, Any]],
+) -> Optional[Tuple[Optional[int], str]]:
+    """(party index, why) of a teammate to switch in for our confused battler, (None, why)
+    to run instead, or None to fight on.
+
+    Seen live (ROUTE 120, 2026-11-05): wild POOCHYENA Lv25 and MIGHTYENA Lv27 know SWAGGER
+    (+2 Attack and confusion; pret gLevelUpLearnsets, the ROM's own) and KECLEON PSYBEAM;
+    train kept attacking, and MANECTRIC, then TROPIUS, then SABLEYE at 27/111 HP "hurt
+    itself in its confusion" and fainted. Asked for (2026-11-05): a confused battler under
+    half HP, or one a self-hit would knock out (read_battle_view's "confusion"), goes out
+    for a teammate that wins comfortably (pick_fighter's bar; never the trainee, above half
+    HP); with none, a wild battle is run from. The caller leaves a trapped battler
+    (battler_trap) to fight.
+    """
+    danger = (view or {}).get("confusion")
+    target = (view or {}).get("target")
+    if not danger or not (danger["low"] or danger["knocks_out"]) or not target or not target.get("hp"):
+        return None
+    player = view["player"]
+    state = f"{player['name'].upper()} is confused at {player['hp']}/{player['max_hp']} HP (a self-hit takes ~{danger['self_hit']})"
+    able = [
+        i for i, (pid, mon) in enumerate(party)
+        if pid not in (trainee_pid, active) and not mon.is_egg and mon.max_hp and mon.current_hp * 2 > mon.max_hp
+    ]
+    with memory_lock:
+        reader = env.memory_reader
+        out = {pid for i, (pid, _) in enumerate(party) if i not in able}
+        pick = reader.pick_fighter(target, out, switching_in=True) if able else None
+    if pick is not None and pick["comfortable"] and pick["slot"] - 1 in able:
+        return pick["slot"] - 1, f"{state}: {pick['name']} takes over ({pick['why']})"
+    if view["is_trainer"]:
+        return None
+    return None, f"{state} and no teammate wins comfortably: ran"
+
+
 def _train_note_faints(record: Dict[str, Any], hp_seen: Dict[int, int], party: List[Tuple[int, Any]]) -> None:
     """Add to record["fainted"] each party Pokémon whose HP went from above 0 to 0 since
     hp_seen, with the foe and move that last hit our battler (menu_state.last_hit), and
@@ -7854,7 +7897,27 @@ async def _train_battle(
         # The trainee is never left out against a foe with a move super-effective on it.
         threat = _trainee_threat(party, trainee_pid, view)
         advantage = _trainee_advantage(view) if view is not None and threat is None else None
-        if trap is None and active == trainee_pid and advantage is not None:
+        way_out = _train_confusion_way_out(party, trainee_pid, active, view) if trap is None else None
+        if way_out is not None and way_out[0] is not None:
+            # Confused and low: a teammate that wins comfortably takes over.
+            index, why = way_out
+            record.setdefault("confused", []).append(why)
+            result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {why}"})
+            record["switched"] = record["switched"] or bool(result.get("success"))
+        elif way_out is not None:
+            # Nobody wins comfortably: run (a wild battle; a failed try costs no self-hit).
+            why = way_out[1]
+            record.setdefault("confused", []).append(why)
+            result = await mcp_run_from_battle({"reasoning": f"train: {why}"})
+            record["turns"] += 1
+            if result.get("status") == "STILL_IN_BATTLE":
+                # "Can't escape!": try again next turn; pret TryRunFromBattle adds 30 to the
+                # odds for each try (gBattleStruct->runTries).
+                continue
+            if result.get("status") == "ESCAPED":
+                record["ran"] = True
+                break
+        elif trap is None and active == trainee_pid and advantage is not None:
             # The foe is weak to the trainee and can't hit it hard: it fights itself, and
             # is switched out as soon as it drops to half HP (checked every turn).
             result = await mcp_use_move({"move": advantage["slot"], "reasoning": f"train: {advantage['name']}"})
@@ -8135,6 +8198,10 @@ def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, wh
     traps = list(dict.fromkeys(b["trapped"] for b in battles if b.get("trapped")))
     if traps:
         text += f". Trapped by {', '.join(traps)}: fought it out"
+    # Confused and low (_train_confusion_way_out): who went out, or that train ran.
+    confused = list(dict.fromkeys(why for b in battles for why in b.get("confused") or []))
+    if confused:
+        text += ". Confusion: " + "; ".join(confused)
     # Every faint, with what did it (_train_note_faints).
     faints = [f for b in battles for f in b.get("fainted") or []]
     if faints:
