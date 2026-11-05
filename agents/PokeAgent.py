@@ -476,6 +476,7 @@ class MCPToolAdapter:
                 "get_game_state": "/mcp/get_game_state",
                 "player_position": "/player_position",
                 "maintain_party": "/maintain_party",
+                "harness_step": "/harness_step",
                 "get_map_data": "/mcp/get_map_data",
                 "press_buttons": "/mcp/press_buttons",
                 "navigate_to": "/mcp/navigate_to",
@@ -2907,18 +2908,20 @@ class PokeAgent:
         if function_name in STORE_WRITING_TOOLS:
             self._store_ctx_cache = None
 
-    def _maintain_party(self) -> None:
-        """Ask the server to apply David's party rule; report a change in <last_result>."""
+    def _harness_step(self) -> None:
+        """Ask the server to apply the harness's own rules (server harness_step): in a
+        battle, WILD_BATTLES=run and the DANGER switch; outside one, David's party rule.
+        What it did goes in <last_result> under the rule's name, like a tool result."""
         try:
-            result = self.mcp_adapter.call_tool("maintain_party", {})
+            result = self.mcp_adapter.call_tool("harness_step", {})
         except Exception as e:
-            logger.warning(f"maintain_party failed: {e}")
+            logger.warning(f"harness_step failed: {e}")
             return
         summary = result.get("summary") if isinstance(result, dict) else None
         if summary:
             logger.info(f"👥 {summary}")
             self._store_function_result_for_context(
-                "party_rule", json.dumps({"success": bool(result.get("changed")), "summary": summary})
+                result.get("rule") or "party_rule", json.dumps({"success": bool(result.get("changed")), "summary": summary})
             )
 
     def _end_position(self) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
@@ -3669,11 +3672,13 @@ Step {step_count}"""
                 self._auto_advance_dialogue()
                 self._step_timing["auto_advance_s"] = round(time.time() - part_start, 2)
 
-                # David's party rule (server maintain_party): the lowest-level Pokémon
-                # leads, or holds the Exp. Share once there is one. Applied by the
-                # harness when the player can walk; a change is reported like a result.
+                # The harness's own rules (server harness_step), so the model doesn't
+                # spend a decision on them: in a wild battle it runs (WILD_BATTLES=run), in
+                # any battle it takes the DANGER switch; outside one, David's party rule
+                # (the lowest-level Pokémon leads while training, or holds the Exp. Share;
+                # an HM carrier that doesn't fight never leads). Reported like a result.
                 part_start = time.time()
-                self._maintain_party()
+                self._harness_step()
                 self._step_timing["maintain_party_s"] = round(time.time() - part_start, 2)
 
                 # Fetch game state

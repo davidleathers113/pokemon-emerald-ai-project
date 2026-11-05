@@ -25,6 +25,7 @@ from pokemon_env.emerald_utils import (
 )
 from .enums import MetatileBehavior, StatusCondition, Tileset, PokemonType, PokemonSpecies, Move, Badge, MapLocation
 from .types import PokemonData
+from . import hm_carriers
 from utils.ocr_dialogue import create_ocr_detector
 from utils import state_formatter
 from utils.mapping import map_stitcher_singleton
@@ -1893,6 +1894,11 @@ class PokemonEmeraldReader:
             options.append((index, mon, cand, ex, share))
         if not options:
             return None
+        # David's HM protocol (pokemon_env/hm_carriers.py): a carrier that isn't a fighter
+        # (TROPIUS, the Fly carrier) comes in only when nobody else wins. Seen live: it led
+        # into a Magma TORKOAL and fainted.
+        fighters = [o for o in options if not hm_carriers.sits_out(o[1].species_name)]
+        options = fighters or options
         comfortable = [o for o in options if o[4] >= COMFORT_HP_SHARE]
         if comfortable:
             index, mon, cand, ex, share = min(comfortable, key=lambda o: (o[1].level, -o[4], o[3]["hits"]))

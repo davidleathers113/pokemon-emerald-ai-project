@@ -310,17 +310,27 @@ def test_waiting_for_the_queue_polls_instead_of_sleeping_a_second():
 
 
 def test_a_party_rule_change_reaches_the_next_prompt():
-    """David's party rule (server maintain_party) runs at the start of each step; what it
-    did is put in <last_result> like a tool result, and nothing when it did nothing."""
+    """The harness's rules (server harness_step: the party rule, WILD_BATTLES, the DANGER
+    switch) run at the start of each step in one call; what they did is put in
+    <last_result> like a tool result under the rule's name, and nothing when nothing was
+    done. (Until the battle rules this called maintain_party itself.)"""
     agent = _bare_agent()
     agent.mcp_adapter.call_tool.side_effect = lambda name, args: (
-        {"changed": True, "summary": "Lead set to NUMEL (lowest level, Lv19)."} if name == "maintain_party" else {}
+        {"changed": True, "rule": "party_rule", "summary": "Lead set to NUMEL (lowest level, Lv19)."}
+        if name == "harness_step" else {}
     )
-    agent._maintain_party()
+    agent._harness_step()
     block = agent._get_function_results_context()
     assert "party_rule" in block and "Lead set to NUMEL (lowest level, Lv19)." in block, block
+    agent.mcp_adapter.call_tool.side_effect = lambda name, args: (
+        {"changed": True, "rule": "wild_battles", "summary": "Ran from wild ZUBAT Lv20 (WILD_BATTLES=run)."}
+        if name == "harness_step" else {}
+    )
+    agent._harness_step()
+    block = agent._get_function_results_context()
+    assert "wild_battles" in block and "Ran from wild ZUBAT Lv20" in block, block
     agent.mcp_adapter.call_tool.side_effect = lambda name, args: {"changed": False, "summary": ""}
-    agent._maintain_party()
+    agent._harness_step()
     assert agent._get_function_results_context() == ""
 
 

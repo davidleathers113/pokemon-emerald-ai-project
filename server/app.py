@@ -4562,6 +4562,12 @@ async def mcp_get_game_state():
                                 result["state_text"] = f"{catch_line}\n\n{result['state_text']}"
                         except Exception as e:
                             logger.warning(f"catch target check failed: {e}")
+                        try:
+                            wild_line = _note_wild_battles(categorized_guidance)
+                            if wild_line and isinstance(result.get("state_text"), str):
+                                result["state_text"] = f"{wild_line}\n\n{result['state_text']}"
+                        except Exception as e:
+                            logger.warning(f"wild battle line failed: {e}")
                         result["categorized_objectives"] = categorized_guidance
 
                     # Add categorized status
@@ -7431,12 +7437,16 @@ async def mcp_train(request: dict = None):
         return {"success": False, "error": "Emulator not initialized"}
     if game_type != "emerald":
         return {"success": False, "error": "train is only implemented for Emerald"}
+    global _train_running
+    _train_running = True  # the step hook (harness_step) stays out of train's battles
     try:
         with _turbo():
             return await _train(request or {})
     except Exception as e:
         logger.error(f"Error in train: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
+    finally:
+        _train_running = False
 
 
 async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -9234,6 +9244,30 @@ def _party_rule_target(party) -> Optional[int]:
     return min(able, key=lambda ip: (ip[1].level, -needs[ip[0]], ip[0]))[0]
 
 
+def _hm_carrier_swap(party: List[Any]) -> Optional[Tuple[int, str]]:
+    """(party index, why) of the Pokémon to lead instead of an HM carrier that isn't a
+    fighter (pokemon_env/hm_carriers.py), or None when the lead is fine or nobody can.
+
+    Outside a battle no foe is known yet, so there is no match-up to pick by: the
+    highest-level Pokémon able to battle that isn't such a carrier leads (party order on
+    a tie). It is the safest against whatever comes, a trainer who spots the player
+    included. A wrong pick costs nothing lasting: in a battle the DANGER switch
+    (_danger_switch_rule) and the model still choose who fights.
+    """
+    from pokemon_env import hm_carriers
+
+    if len(party) < 2 or not hm_carriers.sits_out(party[0].species_name):
+        return None
+    able = [
+        (i, p) for i, p in enumerate(party)
+        if i > 0 and not p.is_egg and p.current_hp > 0 and not hm_carriers.sits_out(p.species_name)
+    ]
+    if not able:
+        return None
+    index = max(able, key=lambda ip: (ip[1].level, -ip[0]))[0]
+    return index, "the highest level able to battle"
+
+
 @app.post("/maintain_party")
 async def maintain_party(request: dict = None):
     """David's rule (2026-11-04, verbatim): "I want the pokemon with the lowest level to
@@ -9253,7 +9287,12 @@ async def maintain_party(request: dict = None):
     while a training objective is current (_training_objective_current); train() leads
     with its own trainee either way. The Exp. Share half stays on: holding it changes
     nothing about who fights.
+
+    David's HM protocol (pokemon_env/hm_carriers.py): outside training, an HM carrier
+    that isn't a fighter (TROPIUS) never leads (_hm_carrier_swap). Seen live: TROPIUS led
+    into a Magma TORKOAL and fainted.
     """
+    from pokemon_env import hm_carriers
     from server import menu_state as ms
     from server.field_control import DIALOGUE_NONE
 
@@ -9278,7 +9317,16 @@ async def maintain_party(request: dict = None):
     mon = party[target]
     who = f"{mon.species_name.upper()} (lowest level, Lv{mon.level})"
     holder = next((i for i, p in enumerate(party) if p.held_item == ms.ITEM_EXP_SHARE), None)
-    if share_in_bag or holder is not None:
+    training = bool(_training_objective_current or (request or {}).get("training"))
+    swap = None if training else _hm_carrier_swap(party)
+    if swap is not None:
+        carrier, (index, why) = party[0].species_name.upper(), swap
+        result = await mcp_set_lead({"pokemon": str(index + 1)})
+        summary = (
+            f"Lead set to {party[index].species_name.upper()} (Lv{party[index].level}, {why}): {carrier} carries "
+            f"{', '.join(hm_carriers.carried_hms(carrier))} and isn't a fighter, so it doesn't lead outside training"
+        )
+    elif share_in_bag or holder is not None:
         if holder == target:
             return nothing(f"{who} already holds the Exp. Share")
         # David (2026-11-04, verbatim): "yes, keep it on the current holder for ties". Seen
@@ -9294,7 +9342,7 @@ async def maintain_party(request: dict = None):
         summary = f"Exp. Share given to {who}" + (f", from {party[holder].species_name.upper()}" if holder is not None else "")
     else:
         # train() passes {"training": True}: it is training whatever the objective says.
-        if not (_training_objective_current or (request or {}).get("training")):
+        if not training:
             return nothing("not training: the lead is the AI's choice (the party rule is only for training)")
         if target == 0:
             return nothing(f"{who} already leads (fainted ones and eggs don't count)")
@@ -9308,6 +9356,234 @@ async def maintain_party(request: dict = None):
     del _pause_events[:-PAUSE_EVENTS_KEPT]
     logger.info(f"👥 maintain_party: {summary}")
     return {"changed": bool(result.get("success")), "summary": summary + "."}
+
+
+# -- the harness step hook: battle rules (WILD_BATTLES, DANGER switch), the party rule --
+
+# David (2026-11-04, verbatim): "I want it to run from the wild pokemon and focus on
+# fighting the trainers." An 8B model doesn't reliably follow advice, so the harness does
+# it. WILD_BATTLES=run (the default) or fight; play-local.sh passes it through.
+WILD_BATTLES_ENV = "WILD_BATTLES"
+WILD_BATTLES_MODES = ("run", "fight")
+WILD_BATTLES_DEFAULT = "run"
+
+# Wild battles the harness never runs from, by gBattleTypeFlags bit (pret
+# include/constants/battle.h), each left to the model:
+_WILD_RUN_NEVER = (
+    # pret battle_main.c IsRunningFromBattleImpossible refuses RUN in this one.
+    (1 << 4, "Prof. Birch's first battle (the game won't let you run)"),  # BATTLE_TYPE_FIRST_BATTLE
+    (1 << 7, "a Safari Zone battle (its own BALL/BAIT/ROCK/RUN menu)"),  # BATTLE_TYPE_SAFARI
+    (1 << 9, "Wally's catching tutorial (Wally plays it)"),  # BATTLE_TYPE_WALLY_TUTORIAL
+    # Scripted encounters the player walks up to on purpose: KYOGRE_GROUDON, LEGENDARY,
+    # REGI, GROUDON, KYOGRE, RAYQUAZA.
+    ((1 << 12) | (1 << 13) | (1 << 14) | (1 << 28) | (1 << 29) | (1 << 30), "a legendary Pokémon's scripted battle"),
+    # BATTLE_TYPE_FRONTIER (the Battle Pyramid's wild battles among them).
+    ((1 << 8) | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21), "a Battle Frontier battle"),
+)
+
+# The battle rules act once per foe (gBattleMons[1] personality): "run:<pid>" after an
+# escape that failed (a trapping ability fails every time, and each try gives the foe a
+# free hit), "switch:<pid>" after a DANGER switch (the matchup changes with it, and a
+# second switch could send the first Pokémon back in: ping-pong).
+_battle_rules_done: Dict[str, str] = {}
+BATTLE_RULES_KEPT = 32
+
+# Set while train() runs: it fights wild battles and switches on its own, and the step
+# hook must not act in its battles (a request reaching the server mid-train would).
+_train_running = False
+
+# The last categorized objective guidance a state read saw (get_game_state), for the catch
+# exception. None until the first state read: until then nothing is run from.
+_objective_guidance_seen: Optional[Dict[str, Any]] = None
+
+
+def _wild_battles_mode() -> str:
+    """WILD_BATTLES, "run" or "fight"; anything else reads as the default, "run"."""
+    value = os.environ.get(WILD_BATTLES_ENV, "").strip().lower()
+    return value if value in WILD_BATTLES_MODES else WILD_BATTLES_DEFAULT
+
+
+def _foe_personality() -> str:
+    key = _battle_key()
+    return key.split(":")[1] if key else ""
+
+
+def _remember_battle_rule(key: str, what: str) -> None:
+    _battle_rules_done[key] = what
+    for old in list(_battle_rules_done)[:-BATTLE_RULES_KEPT]:
+        del _battle_rules_done[old]
+
+
+def _wild_run_exception(view: Dict[str, Any], guidance: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why the harness leaves this battle to the model under WILD_BATTLES=run, or None to
+    run from it.
+
+    A training objective (_training_objective_current, the test the grass cost uses):
+    wild battles are the point, and the model may fight them or call train. A catch
+    objective (_catch_wanted): the wild Pokémon it wants is not run from. One below the
+    wanted level is (_catch_target_line tells the model "NOT THIS ONE ... run"), and so is
+    any other species: running is what David asked for, and the hunt goes on.
+    """
+    if view.get("is_trainer"):
+        return "a trainer battle"
+    flags = _battle_type_flags()
+    for mask, why in _WILD_RUN_NEVER:
+        if flags & mask:
+            return why
+    if _training_objective_current:
+        return "a training objective is current (wild battles are the point)"
+    if guidance is None:
+        return "no objectives read yet (no state read since the start)"
+    wanted = _catch_wanted(guidance)
+    for foe in view.get("opponents") or []:
+        name = str(foe.get("name", "")).upper()
+        if name in wanted and foe.get("level", 0) >= wanted[name]:
+            return f"the objective wants this {name} caught"
+    return None
+
+
+def _wild_foe_text(view: Dict[str, Any]) -> str:
+    foe = view.get("target") or next(iter(view.get("opponents") or []), None) or {}
+    return f"wild {str(foe.get('name', '?')).upper()} Lv{foe.get('level', '?')}"
+
+
+def _battle_event(text: str) -> None:
+    _pause_events.append({
+        "time": datetime.datetime.utcnow().isoformat(), "kind": "battle_rule", "source": "harness", "text": text,
+    })
+    del _pause_events[:-PAUSE_EVENTS_KEPT]
+
+
+async def _wild_run_rule(view: Dict[str, Any], whys: List[str]) -> Optional[Dict[str, Any]]:
+    """WILD_BATTLES=run: flee a wild battle at its FIGHT/BAG/POKEMON/RUN menu (or its
+    intro text, which run_from_battle presses through), unless _wild_run_exception. An
+    escape that fails (Shadow Tag, Arena Trap, Mean Look: pret battle_main.c
+    IsRunningFromBattleImpossible; or a slower Pokémon's speed roll: battle_util.c
+    TryRunFromBattle) is not retried: the battle is the model's."""
+    if view.get("is_trainer"):
+        return None
+    if _wild_battles_mode() != "run":
+        whys.append("WILD_BATTLES=fight")
+        return None
+    if view.get("menu") not in ("action", "busy"):
+        whys.append(f"not at the battle menu ({view.get('menu')})")
+        return None
+    key = f"run:{_foe_personality()}"
+    if key in _battle_rules_done:
+        whys.append("the escape already failed in this battle")
+        return None
+    why = _wild_run_exception(view, _objective_guidance_seen)
+    if why:
+        whys.append(f"not running: {why}")
+        return None
+    foe = _wild_foe_text(view)
+    ran = await mcp_run_from_battle({"reasoning": "harness: WILD_BATTLES=run"})
+    said = ran.get("summary") or ran.get("error") or ""
+    if not _mem(lambda r: r.is_in_battle()):
+        summary = f"Ran from {foe} (WILD_BATTLES=run). {said}".strip()
+        _battle_event(f"Ran from {foe} (WILD_BATTLES=run)")
+        logger.info(f"🏃 harness: {summary}")
+        return {"changed": True, "rule": "wild_battles", "summary": summary}
+    _remember_battle_rule(key, said)
+    summary = (
+        f"Tried to run from {foe} (WILD_BATTLES=run) and couldn't: {said} The harness won't try "
+        "again in this battle: fight it (use_move), switch, or call run_from_battle yourself."
+    )
+    _battle_event(f"Couldn't run from {foe} (WILD_BATTLES=run): left to the AI")
+    logger.info(f"🏃 harness: {summary}")
+    return {"changed": False, "rule": "wild_battles", "summary": summary}
+
+
+async def _danger_switch_rule(view: Dict[str, Any], whys: List[str]) -> Optional[Dict[str, Any]]:
+    """At the battle menu, when the battle view's DANGER says the Pokémon out loses the
+    exchange and names a teammate that wins it, switch to that teammate.
+
+    Seen live (2026-11-04): TROPIUS led into a Magma trainer's TORKOAL; DANGER said
+    switch to AZUMARILL (SURF 2x, wins in 1) and the 8B model attacked; TROPIUS fainted.
+    Once per foe (_battle_rules_done), so a matchup that changes after the switch doesn't
+    ping-pong. Never to an HM carrier that isn't a fighter: pick_fighter names one only
+    when nobody else wins, and then the choice is the model's.
+    """
+    from pokemon_env import hm_carriers
+
+    danger = view.get("danger")
+    if view.get("menu") != "action" or not danger:
+        return None
+    pick = danger.get("switch")
+    if not pick:
+        whys.append("DANGER, but no teammate wins the exchange")
+        return None
+    if hm_carriers.sits_out(pick["name"]):
+        whys.append(f"DANGER, but the one that wins is {pick['name']}, an HM carrier that doesn't fight")
+        return None
+    key = f"switch:{_foe_personality()}"
+    if key in _battle_rules_done:
+        whys.append("already switched once for this foe")
+        return None
+    _remember_battle_rule(key, pick["name"])
+    me = str(view["player"]["name"]).upper()
+    foe = str(view["target"]["name"]).upper()
+    why = (
+        f"{me} loses to {foe}'s {danger['foe_move']} ({danger['effectiveness']:g}x, ~{round(danger['foe_damage'])} "
+        f"of its {view['player']['hp']} HP a hit)"
+    )
+    result = await mcp_switch_pokemon({"pokemon": str(pick["slot"]), "reasoning": "harness: DANGER switch"})
+    said = result.get("summary") or result.get("error") or ""
+    if result.get("success"):
+        summary = f"Switched to {pick['name']}: {why} (harness, DANGER). {said}".strip()
+        _battle_event(f"Switched to {pick['name']}: {why} (DANGER)")
+    else:
+        summary = f"DANGER switch to {pick['name']} not done ({why}): {said}"
+        _battle_event(summary)
+    logger.info(f"🔀 harness: {summary}")
+    return {"changed": bool(result.get("success")), "rule": "danger_switch", "summary": summary}
+
+
+@app.post("/harness_step")
+async def harness_step(request: dict = None):
+    """The agent's one harness call per step, before the model decides (agents/PokeAgent
+    _harness_step, after auto-advance). In a battle: WILD_BATTLES (_wild_run_rule), then
+    the DANGER switch (_danger_switch_rule). Outside one: the party rule (maintain_party).
+    Nothing while train() runs. Returns {"changed", "summary", "rule", "why"}."""
+    if env is None:
+        return {"changed": False, "summary": "", "why": "no emulator"}
+    if _train_running:
+        return {"changed": False, "summary": "", "why": "train() is running: it plays its own battles"}
+    if game_type == "emerald" and _mem(lambda r: r.is_in_battle()):
+        view = _read_battle_view()
+        if view is None:
+            return {"changed": False, "summary": "", "why": "in a battle, no battle view"}
+        whys: List[str] = []
+        done = await _wild_run_rule(view, whys) or await _danger_switch_rule(view, whys)
+        return done or {"changed": False, "summary": "", "why": "; ".join(whys) or "in a battle: nothing to do"}
+    result = await maintain_party({})
+    result["rule"] = "party_rule"
+    return result
+
+
+def _note_wild_battles(guidance: Dict[str, Any]) -> str:
+    """On each state read: keep the guidance for the step hook's catch exception, and
+    return a top-of-state line in a wild battle under WILD_BATTLES=run, so the model
+    doesn't fight it (the battle view below still ends with "Best move now: ... use_move";
+    the catch line is placed the same way for the same reason).
+
+    The step hook has normally run from it already; the model sees the line when the hook
+    couldn't act yet (a menu other than FIGHT/BAG/POKEMON/RUN). Nothing under the
+    exceptions, or once the escape failed: then the battle is the model's.
+    """
+    global _objective_guidance_seen
+    _objective_guidance_seen = guidance
+    if _wild_battles_mode() != "run" or not _mem(lambda r: r.is_in_battle()):
+        return ""
+    view = _read_battle_view()
+    if view is None or view.get("is_trainer") or f"run:{_foe_personality()}" in _battle_rules_done:
+        return ""
+    if _wild_run_exception(view, guidance):
+        return ""
+    return (
+        f"WILD BATTLE: the harness runs from wild battles (WILD_BATTLES=run; David: run from wild "
+        f"Pokémon, fight the trainers). Don't fight this {_wild_foe_text(view)}: call run_from_battle."
+    )
 
 
 # -- medicine from the bag: use_item, and train healing on the spot -------------------
