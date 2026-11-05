@@ -238,8 +238,11 @@ def test_go_to_walks_map_after_map():
     # Seen live from ROUTE 117: "Mauville City Poke Mart can't be reached on foot".
     r = s.call("mcp_go_to", {"place": "Mauville City Poke Mart", "reasoning": "test"})
     assert r["success"] is True and s.srv._location_name() == "MAUVILLE CITY MART", (s.srv._location_name(), r)
+    # A name no map has. This asserted "Did not reach Nowhere Town" (the walk's "can't be
+    # reached"); superseded: an unknown name is now answered as unknown, with the closest
+    # real names, before any walk (test_movement_exits test_go_to_an_unknown_name_*).
     r = s.call("mcp_go_to", {"place": "Nowhere Town", "reasoning": "test"})
-    assert r["success"] is False and "Did not reach Nowhere Town" in r["error"], r
+    assert r["success"] is False and r["status"] == "UNKNOWN_PLACE" and "Unknown place" in r["error"], r
 
 
 def test_go_to_from_south_route111_goes_round_the_desert():

@@ -9,7 +9,6 @@ tool calls to app.py over HTTP instead.
 
 import logging
 import os
-import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -545,6 +544,44 @@ def push_plan(start: Tuple[int, int], buttons: List[str], pushes: List[dict]) ->
     }
 
 
+# pret src/event_object_movement.c GetLedgeJumpDirection (from field_player_avatar.c
+# CheckForObjectEventCollision): a press toward an MB_JUMP_SOUTH/NORTH/WEST/EAST tile, the
+# way it points, jumps over it (PlayerJumpLedge: a two-tile jump) onto the tile beyond.
+# The diagonal MB_JUMP_* are not in its table, and slides drawn with the same arrows are
+# no jump.
+LEDGE_JUMP_STEPS = {"JUMP_SOUTH": (0, 1), "JUMP_NORTH": (0, -1), "JUMP_WEST": (-1, 0), "JUMP_EAST": (1, 0)}
+
+
+def jump_presses(start: Tuple[int, int], buttons: List[str], tiles) -> List[str]:
+    """The presses that walk a planned path: the planner gives one press per tile (onto a
+    ledge, then onto its landing), the game jumps both tiles on the first press, so the
+    landing's press is dropped. tiles: the plan's layout tuples by row, in its coordinates.
+
+    Seen live in LILYCOVE CITY: go_to_exit("east") from (24,15) jumped the east ledge
+    (47,10) with one RIGHT; the press planned for its landing carried the player a tile
+    past the path, and every press after that was one tile off, until "BLOCKED moving DOWN
+    at (49,13): (49,14) is not walkable"."""
+    from server.field_control import DIRECTION_DELTAS
+    from utils.mapping.pathfinding import tile_behavior_name
+
+    x, y = start
+    out: List[str] = []
+    landing = None  # the step that lands a jump just made, already walked by the game
+    for button in buttons:
+        step = DIRECTION_DELTAS.get(button)
+        if step is None:
+            out.append(button)
+            continue
+        x, y = x + step[0], y + step[1]
+        if landing == step:
+            landing = None
+            continue
+        out.append(button)
+        tile = tiles[y][x] if tiles and 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
+        landing = step if LEDGE_JUMP_STEPS.get(tile_behavior_name(tile)) == step else None
+    return out
+
+
 def navigate_to_direct(
     env,
     x,
@@ -702,6 +739,7 @@ def navigate_to_direct(
             "variance": variance_level or "none",
         }
         result.update(push_plan(start, buttons, pushes))
+        result["buttons"] = jump_presses(start, result["buttons"], map_data.get("raw_tiles"))
         if map_data.get("rotating_gates") is not None:
             # The gates as the plan leaves them: the walk checks the game agrees.
             result["gates_after"] = list(pathfinder.last_gate_orientations or ())
@@ -1076,7 +1114,9 @@ def _puzzle_plan(places: tuple, map_dir: str, position: tuple, goal: frozenset) 
         arrival = warp_arrival(warp)
         if i in landing:
             continue
-        if warp.get("dest_map") == raw.get("id") and arrival is not None:
+        # A pad that is itself the goal (go_to_exit to "MOSSDEEP CITY GYM (1, 23)") is
+        # walked to, not ridden: plan() never counts a pad's tile as reached.
+        if warp.get("dest_map") == raw.get("id") and arrival is not None and tile not in goal:
             pads[tile] = arrival
         else:
             closed.add(tile)
@@ -1926,9 +1966,11 @@ def _squash_name(text: str) -> str:
 
     Map names are plain ASCII (POKEMON CENTER); objectives write "PokéMart"/"Pokémon
     Center", and 'É'.isalnum() is True, so the accent has to go, not just the apostrophe.
+    The same as go_to_exit's exit names (field_control.normalize_name).
     """
-    decomposed = unicodedata.normalize("NFKD", str(text).upper())
-    return "".join(ch for ch in decomposed if ch.isalnum() and not unicodedata.combining(ch))
+    from server.field_control import normalize_name
+
+    return normalize_name(text)
 
 
 _HALVES = {"NORTH": (1, -1), "SOUTH": (1, 1), "WEST": (0, -1), "EAST": (0, 1)}
@@ -1964,28 +2006,103 @@ def _same_word(a: str, b: str) -> bool:
     return len(short) >= 4 and long_.startswith(short)
 
 
+# The most words in a row (_words_in_order) that may stand for one word written together
+# on the other side: "HOUSE 3" for HOUSE3, "ROUTE104" for ROUTE 104.
+_JOINED_WORDS_MAX = 3
+
+
+def _words_in_order(have: Tuple[str, ...], want: Tuple[str, ...], to_the_end: bool = False) -> bool:
+    """True when want's words (_place_words) appear in have's in order, spaces aside: a
+    run of words on one side may stand for one word written together on the other.
+    to_the_end: want's last word must stand for have's last.
+
+    Seen live: go_to("MOSSDEEP CITY HOUSE 3"), standing in Mossdeep, answered "can't be
+    reached on foot or by Surf": the map is MOSSDEEP CITY HOUSE3, and word by word no map
+    matched."""
+
+    @lru_cache(maxsize=None)
+    def from_(i: int, j: int) -> bool:
+        if i == len(want):
+            return not to_the_end or j == len(have)
+        for start in range(j, len(have)):
+            for k in range(1, min(_JOINED_WORDS_MAX, len(want) - i) + 1):
+                wanted = "".join(want[i:i + k])
+                for m in range(1, min(_JOINED_WORDS_MAX, len(have) - start) + 1):
+                    if k > 1 and m > 1:
+                        continue  # a run on one side stands for a single word on the other
+                    had = "".join(have[start:start + m])
+                    same = _same_word(had, wanted) if k == m == 1 else had == wanted
+                    if same and from_(i + k, start + m):
+                        return True
+        return False
+
+    return from_(0, 0)
+
+
+def _same_place_words(name: str, words: List[str]) -> bool:
+    """A map name written as the words, spaces, case and punctuation aside ("MOSSDEEP CITY
+    HOUSE 3" is MOSSDEEP CITY HOUSE3)."""
+    return "".join(_place_words(name)) == "".join(words)
+
+
 def _names_same_place(location_name: str, target: str) -> bool:
     """True when a loosely written target names this map.
 
     Seen live: the objective list writes "Dewford Gym" for DEWFORD TOWN GYM and "Granite
-    Cave" for GRANITE CAVE 1F. The target's words must appear in the map name in order,
-    and the map name, without a floor or room suffix, must end with the target's last word. So
-    "Rustboro City" does not match RUSTBORO CITY GYM.
+    Cave" for GRANITE CAVE 1F. The target's words must appear in the map name in order
+    (_words_in_order, spaces aside), and the map name, without a floor or room suffix, must
+    end with the target's last word. So "Rustboro City" does not match RUSTBORO CITY GYM.
     """
     have = _place_words(location_name)
     while have and _is_floor_or_variant(have[-1]):
         have = have[:-1]
     want = _place_words(target)
-    if not have or not want or not _same_word(have[-1], want[-1]):
+    if not have or not want:
         return False
-    at = 0
-    for word in want:
-        while at < len(have) and not _same_word(have[at], word):
-            at += 1
-        if at == len(have):
-            return False
-        at += 1
-    return True
+    return _words_in_order(tuple(have), tuple(want), to_the_end=True)
+
+
+@lru_cache(maxsize=None)
+def _all_place_names() -> Tuple[str, ...]:
+    """Every map's name as the game's state shows it (MOSSDEEP CITY HOUSE3), sorted."""
+    from utils.mapping.porymap_state import _map_dirs_by_const, _readable_map_name
+
+    return tuple(sorted({_readable_map_name(const) for const in _map_dirs_by_const()}))
+
+
+# How many real names an unknown place name is answered with (unknown_place).
+UNKNOWN_PLACE_SUGGESTIONS = 3
+
+
+def _target_words(target: str) -> List[str]:
+    """The target's words as go_to matches them: a trailing North/South/East/West (a half
+    of a route, arrived_at) dropped."""
+    words = _place_words(target)
+    if len(words) > 1 and words[-1] in _HALVES:
+        words = words[:-1]
+    return words
+
+
+def unknown_place(target: str) -> Optional[List[str]]:
+    """None when some map is named by target the way go_to matches names (place_route:
+    the name itself, or its words in order, spaces, case and punctuation aside); else the
+    UNKNOWN_PLACE_SUGGESTIONS real names closest to it (difflib), for an answer that says
+    the name is unknown rather than that the place can't be reached."""
+    import difflib
+
+    words = _target_words(target)
+    names = _all_place_names()
+    if words and any(
+        _same_place_words(name, words) or _words_in_order(tuple(_place_words(name)), tuple(words)) for name in names
+    ):
+        return None
+    by_squash = {}
+    for name in names:
+        by_squash.setdefault(_squash_name(name), name)
+    close = difflib.get_close_matches(
+        "".join(words) or _squash_name(target), list(by_squash), n=UNKNOWN_PLACE_SUGGESTIONS, cutoff=0.0
+    )
+    return [by_squash[squashed] for squashed in close]
 
 
 def arrived_at(location_name: str, position: Optional[Tuple[int, int]], target: str) -> bool:
@@ -2311,14 +2428,7 @@ def next_pokemon_center(location_name: str, toward: Optional[str]) -> Optional[s
     names = {d: _readable_map_name(c) for c, d in _map_dirs_by_const().items()}
 
     def is_goal(map_dir: str) -> bool:
-        have, at = _place_words(names.get(map_dir, "")), 0
-        for word in words:
-            while at < len(have) and not _same_word(have[at], word):
-                at += 1
-            if at == len(have):
-                return False
-            at += 1
-        return True
+        return _words_in_order(tuple(_place_words(names.get(map_dir, ""))), tuple(words))
 
     parent = {start: None}
     queue = deque([start])
@@ -2702,21 +2812,12 @@ def way_to_place(location_name: str, position: Optional[Tuple[int, int]], target
 
     if arrived_at(location_name, position, target):
         return ""
-    words = _place_words(target)
-    if len(words) > 1 and words[-1] in _HALVES:
-        words = words[:-1]
+    words = _target_words(target)
     if not words:
         return ""
 
     def matches(name: str) -> bool:
-        have, at = _place_words(name), 0
-        for word in words:
-            while at < len(have) and not _same_word(have[at], word):
-                at += 1
-            if at == len(have):
-                return False
-            at += 1
-        return True
+        return _words_in_order(tuple(_place_words(name)), tuple(words))
 
     if matches(location_name):
         return ""  # on the named map already (e.g. the other half of a route)
@@ -2724,7 +2825,7 @@ def way_to_place(location_name: str, position: Optional[Tuple[int, int]], target
     # A map named exactly as the target wins. Seen live: "Route 116" matched ROUTE 116
     # TUNNELERS REST HOUSE too, and the hint (which shows the farthest match per first
     # exit) routed into that house instead of onto the route.
-    exact = _far_map_hint(map_dir, lambda name: _place_words(name) == words, position, nearest=True)
+    exact = _far_map_hint(map_dir, lambda name: _same_place_words(name, words), position, nearest=True)
     return exact or _far_map_hint(map_dir, matches, position, nearest=True)
 
 
@@ -2740,24 +2841,15 @@ def place_route(location_name: str, position: Optional[Tuple[int, int]], target:
 
     if arrived_at(location_name, position, target):
         return []
-    words = _place_words(target)
-    if len(words) > 1 and words[-1] in _HALVES:
-        words = words[:-1]
+    words = _target_words(target)
     if not words:
         return None
 
     def matches(name: str) -> bool:
-        have, at = _place_words(name), 0
-        for word in words:
-            while at < len(have) and not _same_word(have[at], word):
-                at += 1
-            if at == len(have):
-                return False
-            at += 1
-        return True
+        return _words_in_order(tuple(_place_words(name)), tuple(words))
 
     map_dir = ROM_TO_PORYMAP_MAP.get(location_name, "")
-    for matcher in (lambda name: _place_words(name) == words, matches):
+    for matcher in (lambda name: _same_place_words(name, words), matches):
         # go_to walks this, so the Cable Car is a step it can take (RIDE_EXIT).
         paths = _walk_paths(map_dir, matcher, position, rides=True)
         if paths:
@@ -3051,6 +3143,10 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
 
     best = None
     tried = []
+    # The tiles each matched exit is taken from. When no plain walk reaches one on a
+    # rotating tile puzzle map, a failed plan hands them back ("puzzle_targets"), and
+    # go_to_exit walks through the floor switches to them (server/app.py _cross_to).
+    targets: list = []
     for exit_entry in matches:
         if exit_entry["kind"] == "edge":
             candidates = edge_candidates(grid, exit_entry["direction"], surf=surf)
@@ -3068,6 +3164,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
             if not candidates:
                 tried.append(f"{exit_entry['label']}: no standable tile on that edge (water or wall)")
                 continue
+            targets.extend(candidates[:max_edge_candidates])
             for tile in candidates[:max_edge_candidates]:
                 buttons = route_to(tile)
                 if buttons is not None:
@@ -3098,6 +3195,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 fronts = []
                 for button, (dx, dy) in DIRECTION_DELTAS.items():
                     front = (tile[0] - dx, tile[1] - dy)
+                    targets.append(front)
                     buttons = route_to(front)
                     if buttons is not None:
                         fronts.append((len(buttons), front, button, buttons))
@@ -3107,6 +3205,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 _, front, button, buttons = min(fronts)
                 way.update({"kind": "sign_door", "target": front, "face": button})
             else:
+                targets.append(tile)
                 buttons = route_to(tile)
                 if buttons is None:
                     tried.append(f"{exit_entry['label']}: no walkable path to the warp at {tile}")
@@ -3116,7 +3215,10 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 best = {**way, "label": exit_entry["label"], "to": exit_entry["name"], "buttons": buttons, "final_button": None}
 
     if best is None:
-        return {
+        # A plain walk never steps on a puzzle's floor switch (find_path): a press moves the
+        # statues. go_to_exit plans the presses itself from the targets (puzzle_route).
+        puzzle = bool(puzzle_switches(source.get("porymap_map_name") or ""))
+        failed = {
             "success": False,
             "error": (
                 f"Cannot reach '{exit_query}' from ({pos.get('x')}, {pos.get('y')}) on {location}: "
@@ -3124,20 +3226,22 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                 # With Surf the plan crosses water already: water is no reason then.
                 + (". A ledge (one-way) or a person may be in the way." if surf
                    else ". A ledge (one-way), water (needs Surf) or a person may be in the way.")
-                # go_to_exit never steps on a puzzle's floor switch (find_path); navigate_to
-                # and go_to plan the presses (puzzle_route).
-                + (" This map's floor switches move its statues and are never walked over here: "
-                   "navigate_to a tile beyond them (or talk_to the person you want) and the walk steps on "
-                   "the switches it needs." if puzzle_switches(source.get("porymap_map_name") or "") else "")
+                + (" This map's floor switches move its statues, and no way through them was found either."
+                   if puzzle else "")
             ),
         }
+        if puzzle and targets:
+            failed["puzzle_targets"] = list(dict.fromkeys(targets))
+        return failed
     # A route that pushes boulders is walked to its first push only (push_plan): the
     # caller pushes, then plans again. Its edge press is kept for the last plan.
     best.update(push_plan(start, best["buttons"], pushes_to.get(tuple(best["target"])) or []))
+    raw_tiles = state.get("map", {}).get("porymap", {}).get("raw_tiles")
+    best["buttons"] = jump_presses(start, best["buttons"], raw_tiles)
     best.update({
         "success": True,
         "grid": grid,
-        "raw_tiles": state.get("map", {}).get("porymap", {}).get("raw_tiles"),
+        "raw_tiles": raw_tiles,
         "coord_offset": coord_offset,
         "location": location,
     })

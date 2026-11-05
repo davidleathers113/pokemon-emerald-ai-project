@@ -33,6 +33,11 @@ ACRO_BIKE_ONLY_BEHAVIORS = frozenset({
     "BUMPY_SLOPE", "ISOLATED_VERTICAL_RAIL", "ISOLATED_HORIZONTAL_RAIL", "VERTICAL_RAIL", "HORIZONTAL_RAIL",
 })
 
+# The ledges the game jumps, by behavior name, and their arrows (pret
+# src/event_object_movement.c GetLedgeJumpDirection: MetatileBehavior_IsJumpSouth, _North,
+# _West, _East, each true for its own MB_JUMP_* only).
+LEDGE_SYMBOLS_BY_BEHAVIOR = {"JUMP_SOUTH": "↓", "JUMP_NORTH": "↑", "JUMP_WEST": "←", "JUMP_EAST": "→"}
+
 
 def _get_behavior_enum():
     """Return the appropriate behavior enum for the current game type.
@@ -160,9 +165,11 @@ def is_tile_walkable(tile) -> bool:
     if any(terrain in behavior_name for terrain in walkable_terrain):
         return True
 
-    # Directional behaviors (JUMP_*, WALK_*, SLIDE_*, slopes) are walkable
-    # but need special handling in neighbor checking for one-way movement
-    if ("JUMP" in behavior_name or
+    # Directional behaviors (ledges, WALK_*, SLIDE_*, slopes) are walkable
+    # but need special handling in neighbor checking for one-way movement. Only the four
+    # straight ledges are jumped (LEDGE_SYMBOLS_BY_BEHAVIOR); the diagonal MB_JUMP_* are
+    # ledge corners, which the collision decides like plain ground.
+    if (behavior_name in LEDGE_SYMBOLS_BY_BEHAVIOR or
         "WALK" in behavior_name or
         "SLIDE" in behavior_name or
         "MUDDY_SLOPE" in behavior_name):
@@ -287,24 +294,18 @@ def format_tile_to_symbol(tile, x=None, y=None, location_name=None, player_pos=N
     elif "MACHINE" in behavior_name or "DEVICE" in behavior_name:
         return "M"  # Machine/Device
     elif "JUMP" in behavior_name:
-        if "SOUTH" in behavior_name:
-            return "↓"
-        elif "EAST" in behavior_name:
-            return "→"
-        elif "WEST" in behavior_name:
-            return "←"
-        elif "NORTH" in behavior_name:
-            return "↑"
-        elif "NORTHEAST" in behavior_name:
-            return "↗"
-        elif "NORTHWEST" in behavior_name:
-            return "↖"
-        elif "SOUTHEAST" in behavior_name:
-            return "↘"
-        elif "SOUTHWEST" in behavior_name:
-            return "↙"
-        else:
-            return "J"
+        # pret src/event_object_movement.c GetLedgeJumpDirection: only MB_JUMP_SOUTH,
+        # _NORTH, _WEST and _EAST are jumped. The diagonal MB_JUMP_* are TILE_FLAG_UNUSED
+        # (metatile_behavior.c sTileBitAttributes) and never jumped: ledge corners, drawn
+        # by their collision like plain ground. Found on the LILYCOVE CITY plateau: the
+        # corners (49,17) and (46,20) (collision 1) were drawn '↓', as "SOUTH" is in
+        # "JUMP_SOUTHWEST", and walks were planned over them.
+        ledge = LEDGE_SYMBOLS_BY_BEHAVIOR.get(behavior_name)
+        if ledge:
+            return ledge
+        if any(word in behavior_name for word in ("NORTH", "SOUTH", "EAST", "WEST")):
+            return "." if collision == 0 else "#"
+        return "J"
     elif "SLIDE" in behavior_name:
         # Slides are directional like jumps, but allow movement in one direction
         if "SOUTH" in behavior_name:

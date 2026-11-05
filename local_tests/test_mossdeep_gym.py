@@ -143,17 +143,28 @@ def test_a_floor_switch_moves_the_statues_and_the_plan_follows():
 
 def test_walks_never_cross_a_floor_switch_they_do_not_mean_to_press():
     """From (3,20) the only way to the pad (1,23) is over the yellow switch (2,21). A walk
-    over it moves the statues as a side effect, so go_to_exit won't take it (the old rule
-    walked over a trigger when it was the only way); navigate_to plans the press itself."""
+    over it moves the statues as a side effect, so the plain walk won't take it (the old
+    rule walked over a trigger when it was the only way): its plan fails and hands back
+    the exit's tile for the puzzle's plan. go_to_exit then presses the switch on purpose,
+    as one step of that plan, and rides the pad.
+
+    This test used to assert that go_to_exit refused here ("floor switches" in its error).
+    That rule is superseded: go_to_exit, and go_to and heal_at_pokecenter through it,
+    could then never leave the gym from (3,20)."""
+    from server import game_tools
+
     s = server()
     _load(s)
     before = _places(s)
+    with s.srv.memory_lock:
+        plan = game_tools.plan_exit_route(s.srv.env, "MOSSDEEP CITY GYM (1, 23)")
+    assert plan["success"] is False and (1, 23) in plan.get("puzzle_targets", ()), plan
+    assert _places(s) == before, (before, _places(s))
     r = s.call("mcp_go_to_exit", {"exit": "MOSSDEEP CITY GYM (1, 23)", "reasoning": "test"})
     print("   ", r.get("summary") or r.get("error"))
-    assert r["success"] is False and "floor switches" in r["error"], r
-    assert _places(s) == before, (before, _places(s))
-    snap = s.snapshot()
-    assert (snap.x, snap.y) != YELLOW_SWITCH, snap
+    assert r["success"] is True, r
+    pressed = [step for step in r["on_the_way"] if "FLOOR SWITCH" in step]
+    assert len(pressed) == 1 and f"FLOOR SWITCH {YELLOW_SWITCH}" in pressed[0], r["on_the_way"]
 
 
 def test_navigate_to_tate_and_liza_goes_through_the_switches_and_pads():
@@ -184,6 +195,55 @@ def test_navigate_to_tate_and_liza_goes_through_the_switches_and_pads():
     snap = s.snapshot()
     assert r["success"] and (snap.x, snap.y) == BELOW_TATE, (r, snap)
     assert s.srv._location_name() == "MOSSDEEP CITY GYM", s.srv._location_name()
+
+
+GYM_EXITS = ((6, 35), (7, 35))  # pret MossdeepCity_Gym map.json warp_events -> MAP_MOSSDEEP_CITY
+
+
+def test_go_to_exit_walks_out_through_the_switches_it_needs_and_no_more():
+    """Found while building fixtures: from (3,20) no plain walk reaches the gym's door,
+    and go_to_exit refused ("floor switches ... are never walked over here"). It now
+    walks the puzzle's plan to the door: the presses it makes are the ones the fewest-step
+    plan from the start needs (game_tools.puzzle_plan, from where the objects stand at
+    the start), none more."""
+    from server import game_tools
+
+    s = server()
+    _load(s)
+    with s.srv.memory_lock:
+        live = game_tools.puzzle_objects(s.srv.env.memory_reader, GYM)
+    needed = [tile for kind, tile in game_tools.puzzle_plan(live, GYM, (3, 20), GYM_EXITS) if kind == "press"]
+    assert needed, "the door is reachable without a press: the test shows nothing"
+    with _gym_gate(None):  # the gate keeps the party from the leader, never from the door out
+        r = s.call("mcp_go_to_exit", {"exit": "MOSSDEEP CITY", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] is True and s.srv._location_name() == "MOSSDEEP CITY", (r, s.srv._location_name())
+    # The plan is made again after every press; another way as short may be taken, so the
+    # count is what must hold.
+    pressed = [step for step in r["on_the_way"] if "FLOOR SWITCH" in step]
+    assert len(pressed) == len(needed), (pressed, needed)
+
+
+PARTY = 0x020244EC  # gPlayerParty (pret sym), 100 bytes a Pokémon, current HP at +0x56
+
+
+def test_heal_at_pokecenter_walks_out_of_the_gym_and_heals():
+    """heal_at_pokecenter from (3,20): out through the switches, across MOSSDEEP CITY to
+    its POKéMON CENTER, and the nurse. RAM write: the first party Pokémon's HP set to 1,
+    so the heal is seen in memory. The gym level gate stays at its table (Lv48, which this
+    party is under): walking out is allowed."""
+    s = server()
+    _load(s)
+    with s.srv.memory_lock:
+        s.srv.env.core.memory.u16[PARTY + 0x56] = 1
+        s.srv.env.memory_reader._invalidate_mem_cache()
+    with _gym_gate(None):
+        r = s.call("mcp_heal_at_pokecenter", {"reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] is True and r["status"] == "HEALED", r
+    assert s.srv._location_name() == "MOSSDEEP CITY POKEMON CENTER 1F", s.srv._location_name()
+    first = r["after"][0]
+    assert r["before"][0]["hp"] == 1 and first["hp"] == first["max_hp"], (r["before"][0], first)
 
 
 # The gym level gate (server/app.py GYM_MIN_LEVELS: MOSSDEEP CITY GYM 48). David

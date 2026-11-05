@@ -5562,6 +5562,7 @@ async def mcp_go_to_exit(request: dict):
         start = _field_snapshot()
         snap = start
         pushes, push_trouble = 0, None
+        puzzle_crossed = False
         for _attempt in range(7 + STRENGTH_MAX_PUSHES):
             # Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the
             # door, then planned again from inside METEOR FALLS and answered "No exit of
@@ -5577,6 +5578,31 @@ async def mcp_go_to_exit(request: dict):
                     return game_tools.plan_exit_route(env, exit_query, avoid=tuple(avoid))
 
             plan = await run_in_threadpool(_plan)
+            # On a rotating tile puzzle map (MOSSDEEP CITY GYM) a plain walk never steps on
+            # a floor switch, so the exit is often out of reach until the right switches
+            # move the statues. Found while building fixtures: heal_at_pokecenter from (3,20)
+            # stopped at "Cannot reach 'MOSSDEEP CITY GYM (1, 23)'". Walk the puzzle's plan
+            # (game_tools.puzzle_route, the fewest presses and pad rides, made again from
+            # where the statues stand after each) until a plain walk reaches the exit, then
+            # plan it again. Only when the plain walk fails: no switch is pressed for nothing.
+            if not plan.get("success") and plan.get("puzzle_targets") and not puzzle_crossed:
+                puzzle_crossed = True
+                if first_from is None:
+                    first_from = _position_text(_field_snapshot())
+                switched: List[str] = []
+                entered, why = await _cross_to(
+                    plan["puzzle_targets"], f"the exit {exit_query}", "go_to_exit",
+                    f'go_to_exit("{exit_query}") again', on_the_way=switched,
+                )
+                cleared.extend(switched)
+                if why:
+                    on_the_way = f" On the way: {'; '.join(cleared)}." if cleared else ""
+                    error = f"Did not reach the exit {exit_query} through the floor switches: {why}."
+                    return {
+                        "success": False, "error": error, "on_the_way": list(cleared),
+                        "summary": f"{error} Now at {_position_text(_field_snapshot())}.{on_the_way}",
+                    }
+                continue
             if not plan.get("success"):
                 plan.setdefault("summary", plan.get("error", "go_to_exit failed"))
                 return plan
@@ -8855,6 +8881,13 @@ async def _walk_along(
                 f'the way loops: go_to_exit("{route[0][0]}") from {location} was taken once already on this walk. '
                 f"The way planned now is {' → '.join(name for _, name in route)}"
             )
+        # A route off a puzzle map that rides its pads first was planned on the map file
+        # alone, without the statues (tile_route): seen in a test, heal_at_pokecenter from
+        # MOSSDEEP CITY GYM (3,20) was sent to the pad (1,23) first. go_to_exit on the
+        # exit itself plans the presses and pads from where the statues stand.
+        leaves = next((i for i, (_, name) in enumerate(route) if name != location), 0)
+        if puzzle and leaves:
+            route = route[leaves:]
         if route[0][0].startswith(game_tools.SWITCH_STEP):
             presses += 1
             if presses > PUZZLE_MAX_PRESSES:
@@ -8886,13 +8919,17 @@ async def _walk_along(
     return entered, "the walk took too many steps"
 
 
-async def _cross_to(target_tiles, goal: str, source: str, again: str) -> Tuple[List[str], Optional[str]]:
+async def _cross_to(
+    target_tiles, goal: str, source: str, again: str, on_the_way: Optional[List[str]] = None,
+) -> Tuple[List[str], Optional[str]]:
     """Before a walk to target_tiles (this map, in the walking tools' coordinates): when
     none is on the part of the map the player can walk to but game_tools.tile_route knows
     a way there through warps (holes, geysers, doors within the map), take it one
     go_to_exit at a time (_walk_along: wild battles are run from, a trainer battle or a
     question stops it). Returns (maps entered on the way, why it stopped short or None);
     ([], None) when no crossing is needed or none is known (the walk then says why).
+    on_the_way, when given, collects the floor switches pressed and what each step did
+    besides walking (_walk_along).
 
     Seen live: talk_to(13,9) for Flannery in LAVARIDGE TOWN GYM 1F answered "Could not
     reach a tile next to (13,9): No path found from (9, 9) to (12, 9)".
@@ -8933,7 +8970,7 @@ async def _cross_to(target_tiles, goal: str, source: str, again: str) -> Tuple[L
 
     logger.info(f"{source}: {goal} is through {' → '.join(name for _, name in route)}")
     with _turbo():
-        return await _walk_along(next_route, arrived, goal, source, again, GO_TO_MAX_MAPS)
+        return await _walk_along(next_route, arrived, goal, source, again, GO_TO_MAX_MAPS, on_the_way)
 
 
 # Floor switch presses one walk may make (_walk_along); MOSSDEEP CITY GYM's way from
@@ -9080,6 +9117,17 @@ async def mcp_go_to(request: dict = None):
     position = (snap.x, snap.y) if snap is not None else None
     if game_tools.arrived_at(start, position, target):
         return {"success": True, "status": "ARRIVED", "summary": f"You are already on {start} ({target})."}
+    # A name no map has is unknown, not out of reach. Seen live: go_to("MOSSDEEP CITY
+    # HOUSE 3") answered "can't be reached on foot or by Surf" from four maps in a row,
+    # Mossdeep among them; the map is MOSSDEEP CITY HOUSE3.
+    closest = await run_in_threadpool(game_tools.unknown_place, target)
+    if closest is not None:
+        return _refusal(
+            f'Unknown place "{target}": no map has that name (this says nothing about whether a '
+            f"place can be reached). Closest place names: {'; '.join(closest)}.",
+            status="UNKNOWN_PLACE",
+            suggestions=closest,
+        )
     # The gym level gate, before any walk or flight: refused at the start, not at the gym's
     # door after the trip. The route is only planned here while some gym is closed.
     closed = [gym for gym in _gym_min_levels() if _gym_under_level(gym)]

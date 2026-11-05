@@ -19,6 +19,7 @@ so the decisions can be unit-tested with plain snapshots.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -528,8 +529,13 @@ EDGE_UNWALKABLE = {"#", "X", "W"}
 
 
 def normalize_name(text: str) -> str:
-    """'Professor Birch's Lab' -> 'PROFESSORBIRCHSLAB'; spacing/punctuation-insensitive."""
-    return "".join(ch for ch in str(text).upper() if ch.isalnum())
+    """'Professor Birch's Lab' -> 'PROFESSORBIRCHSLAB'; spacing/punctuation-insensitive.
+
+    Accents dropped as game_tools._squash_name drops them: exit names are plain ASCII
+    (POKEMON CENTER), and 'É'.isalnum() is True, so "Pokémon Center" kept its 'É' and
+    could never match one."""
+    decomposed = unicodedata.normalize("NFKD", str(text).upper())
+    return "".join(ch for ch in decomposed if ch.isalnum() and not unicodedata.combining(ch))
 
 
 def _integers_in(text: str) -> List[int]:

@@ -672,6 +672,70 @@ def test_loose_target_names_match_their_map():
     assert briney.endswith("takes the first step.") and "ROUTE 104 MR BRINEYS HOUSE" in briney, briney
 
 
+MOSSDEEP_SHORE = HERE / "test_mossdeep_west_shore.state"  # MOSSDEEP CITY (16,6)
+
+
+def test_place_names_match_spaces_case_and_punctuation_aside():
+    """Seen live: go_to("MOSSDEEP CITY HOUSE 3") answered "can't be reached on foot or by
+    Surf", standing in Mossdeep; the map is MOSSDEEP CITY HOUSE3. Every resolver of place
+    names (go_to's place_route, objectives' arrived_at, way_to_place, fly_to's town,
+    go_to_exit's exit names) reads them spaces, case and punctuation aside."""
+    from server.field_control import match_exits
+    from server.game_tools import (
+        FlyDestination,
+        arrived_at,
+        fly_destination_named,
+        place_route,
+        unknown_place,
+        way_to_place,
+    )
+
+    for spelling in ("MOSSDEEP CITY HOUSE 3", "mossdeep city house3", "Mossdeep-City House #3", "MOSSDEEPCITYHOUSE3"):
+        assert unknown_place(spelling) is None, spelling
+        assert arrived_at("MOSSDEEP CITY HOUSE3", None, spelling), spelling
+        route = place_route("MOSSDEEP CITY", (16, 6), spelling)
+        assert route and route[-1][1] == "MOSSDEEP CITY HOUSE3", (spelling, route)
+    assert not arrived_at("MOSSDEEP CITY HOUSE2", None, "MOSSDEEP CITY HOUSE 3")
+    assert "MOSSDEEP CITY HOUSE3" in way_to_place("MOSSDEEP CITY", (16, 6), "Mossdeep City House 3")
+    # A route number written together, and the other way round.
+    assert unknown_place("Route104") is None and arrived_at("ROUTE 104", None, "Route104")
+    # fly_to's towns and go_to_exit's exits, spaces and accents aside.
+    lilycove = FlyDestination(mapsec=5, town="LILYCOVE CITY", cell=(0, 0), landing_map="LILYCOVE CITY",
+                              landing=(24, 15), visited=True)
+    assert fly_destination_named([lilycove], "lily cove city") is lilycove
+    exits = [{"kind": "warp", "label": "door/warp at (24, 14) -> LILYCOVE CITY POKEMON CENTER 1F",
+              "name": "LILYCOVE CITY POKEMON CENTER 1F", "x": 24, "y": 14}]
+    assert match_exits(exits, "Lilycove City Pokémon Center") == exits
+
+
+def test_go_to_a_name_written_with_a_space_walks_there():
+    """The live case: go_to("MOSSDEEP CITY HOUSE 3") from MOSSDEEP CITY's west shore."""
+    s = server()
+    s.load(MOSSDEEP_SHORE, wild_encounters=False)
+    r = s.call("mcp_go_to", {"place": "MOSSDEEP CITY HOUSE 3", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] is True and _location(s) == "MOSSDEEP CITY HOUSE3", (r, _location(s))
+
+
+def test_go_to_an_unknown_name_says_unknown_and_names_the_closest():
+    """A name no map has is answered "unknown" with the closest real names (difflib),
+    never "can't be reached", and nothing is walked."""
+    s = server()
+    s.load(MOSSDEEP_SHORE, wild_encounters=False)
+    r = s.call("mcp_go_to", {"place": "Flarbington Zqx Tower", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] is False and r["status"] == "UNKNOWN_PLACE", r
+    assert "Unknown place" in r["error"] and "can't be reached" not in r["error"], r
+    assert len(r["suggestions"]) == 3 and all(name in r["error"] for name in r["suggestions"]), r
+    snap = s.snapshot()
+    assert _location(s) == "MOSSDEEP CITY" and (snap.x, snap.y) == (16, 6), snap
+    # Close to real names: those are the ones suggested.
+    r = s.call("mcp_go_to", {"place": "MOSSDEEP CITY HOUSE 9", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["status"] == "UNKNOWN_PLACE", r
+    assert all(name.startswith("MOSSDEEP CITY HOUSE") for name in r["suggestions"]), r["suggestions"]
+
+
 def test_exit_list_says_when_an_edge_cannot_be_walked():
     """Seen live: Route 104's "south edge of the map -> ROUTE 105" (all sea) sent the
     model south from the very spot where its objective was already done."""
@@ -723,6 +787,12 @@ def test_navigate_to_toward_a_map_further_away_names_the_first_exit():
     twenty minutes of one-tile walks. Route 102 is reached north via Route 101 and Oldale."""
     from server.game_tools import exit_hint_for_text
 
+    # The hints read whether the party can Surf from the save loaded in the server, so this
+    # test loads one whose party can't: it ran after whichever test came before it, and
+    # once that was a Lilycove one (AZUMARILL with SURF) the Oldale → Lilycove hint below
+    # offered a way over the sea.
+    server().load(ROUTE101, wild_encounters=False)
+
     hint = exit_hint_for_text("LITTLEROOT TOWN", "travel west through Route 102 to Petalburg City")
     print("   ", hint)
     assert 'go_to_exit("north")' in hint, hint
@@ -753,6 +823,90 @@ def test_navigate_to_walkable_target_reports_arrival():
     assert r["success"] is True and r["summary"].startswith("Reached (9,0)."), r
     snap = s.snapshot()
     assert (snap.x, snap.y) == (9, 0), snap
+
+
+# LILYCOVE CITY (24,15), outside the POKéMON CENTER, just after a Fly from Mossdeep
+# (made from test_mossdeep_west_shore.state with fly_to("LILYCOVE CITY")).
+LILYCOVE = HERE / "test_lilycove_pokecenter.state"
+# pret LilycoveCity layout: rows 9-20, x 45-52 is the raised plateau east of the Center,
+# ringed by one-way ledges (MB_JUMP_*); (49,14) is a cliff tile (metatile 0x6F, MB_NORMAL
+# with collision), no ledge.
+LILYCOVE_PLATEAU = (range(45, 53), range(9, 21))
+JUMP_SYMBOLS = {"JUMP_SOUTH": "↓", "JUMP_NORTH": "↑", "JUMP_WEST": "←", "JUMP_EAST": "→"}
+
+
+def test_go_to_exit_east_from_lilycove_jumps_each_ledge_with_one_press():
+    """Seen live in LILYCOVE CITY: go_to_exit("east") from (24,15) climbed the plateau and
+    stopped at "BLOCKED moving DOWN at (49,13): (49,14) is not walkable". The plan had one
+    press per tile, two for each ledge (onto it, onto the landing), but the game jumps
+    both tiles on one press (pret field_player_avatar.c PlayerJumpLedge): after the east
+    ledge (47,10) every press was a tile east of the path."""
+    from server import game_tools
+
+    s = server()
+    s.load(LILYCOVE, wild_encounters=False)
+    snap = s.snapshot()
+    assert _location(s) == "LILYCOVE CITY" and (snap.x, snap.y) == (24, 15), snap
+    # The presses over the plateau: one RIGHT for the east ledge (47,10) and one DOWN for
+    # the south ledge (48,11), as walked by hand from (45,10).
+    with s.srv.memory_lock:
+        state, _, _ = game_tools.load_pathfinding_state(s.srv.env)
+    tiles = state["map"]["porymap"]["raw_tiles"]
+    planned = ["RIGHT", "RIGHT", "RIGHT", "DOWN", "DOWN", "DOWN"]  # (45,10) to (48,13), a tile a press
+    assert game_tools.jump_presses((45, 10), planned, tiles) == ["RIGHT", "RIGHT", "DOWN", "DOWN"]
+    r = s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] is True and _location(s) == "ROUTE 124", (r, _location(s))
+    assert "BLOCKED" not in r["summary"], r
+
+
+def test_navigate_to_over_lilycove_ledges_ends_on_the_target():
+    """navigate_to (48,13) from (45,10): over the east ledge (47,10) and the south ledge
+    (48,11). With a press per tile it ended a tile off."""
+    s = server()
+    s.load(LILYCOVE, wild_encounters=False)
+    r = s.call("mcp_navigate_to", {"x": 45, "y": 10, "variance": "none", "reason": "test"})
+    assert r["success"] is True, r
+    r = s.call("mcp_navigate_to", {"x": 48, "y": 13, "variance": "none", "reason": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    snap = s.snapshot()
+    assert r["success"] is True and (snap.x, snap.y) == (48, 13), (r, snap)
+
+
+def test_lilycove_ascii_draws_ledges_only_where_pret_has_them():
+    """The ASCII the model reads draws a ledge arrow on a plateau tile exactly where pret's
+    layout has a ledge the game jumps (MB_JUMP_SOUTH/NORTH/WEST/EAST; event_object_movement.c
+    GetLedgeJumpDirection), pointing its way. The ledge corners (49,17) and (46,20) are a
+    diagonal MB_JUMP_* with collision, never jumped, and were drawn '↓' ("SOUTH" is in
+    "JUMP_SOUTHWEST"), so walks were planned over them. (49,14), reported live as a '↓', is
+    a cliff tile and was drawn '#' already. LilycoveCity has no ASCII override
+    (ascii_map_loader.MAP_OVERRIDES): the drawing comes from the layout."""
+    from utils.mapping.ascii_map_loader import MAP_OVERRIDES
+    from utils.mapping.pathfinding import tile_behavior_name
+    from utils.mapping.porymap_state import _format_porymap_info, layout_tiles
+
+    assert "LilycoveCity" not in MAP_OVERRIDES
+    s = server()
+    s.load(LILYCOVE, wild_encounters=False)
+    with s.srv.memory_lock:
+        parts = _format_porymap_info("LILYCOVE CITY", (24, 15), 6, s.srv.env.memory_reader).context_parts
+    rows = parts[parts.index("\nASCII Map:") + 1].split("\n")
+    tiles = layout_tiles("LilycoveCity")
+    xs, ys = LILYCOVE_PLATEAU
+    for y in ys:
+        for x in xs:
+            want = JUMP_SYMBOLS.get(tile_behavior_name(tiles[y][x]))
+            drawn = rows[y][x]
+            assert (drawn == want) if want else drawn not in JUMP_SYMBOLS.values(), ((x, y), drawn, want)
+    assert rows[14][49] == "#" and rows[14][48] == "↓", rows[14][44:52]
+    assert rows[17][49] == "#" and rows[20][46] == "#", (rows[17][44:53], rows[20][44:53])
+    # The planner reads the same grid: no walk steps onto a corner.
+    from server import game_tools
+
+    with s.srv.memory_lock:
+        state, _, _ = game_tools.load_pathfinding_state(s.srv.env)
+    grid = state["map"]["porymap"]["grid"]
+    assert grid[17][49] == "#" and grid[20][46] == "#", (grid[17][44:53], grid[20][44:53])
 
 
 def _run_all():
