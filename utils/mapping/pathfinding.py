@@ -48,6 +48,12 @@ BRIDGE_ELEVATION = 15
 # Grid symbols whose tiles are crossed though their collision bit is set: ledges, doors,
 # warps and the cycling road (_get_blocked_positions).
 PASSABLE_WITH_COLLISION = frozenset({"D", "S", "&", "←", "→", "↑", "↓", "↗", "↖", "↘", "↙"})
+# Grid symbols of ledges (and the slides drawn like them): jumped over, whatever the
+# elevations on either side (_elevation_allows).
+LEDGE_SYMBOLS = frozenset({"←", "→", "↑", "↓", "↗", "↖", "↘", "↙"})
+# Behavior-name words of warp tiles (doors, stairs, ladders, arrow warps): a step onto one
+# ends the walk, so no elevation rule applies to it (_elevation_allows).
+WARP_BEHAVIOR_WORDS = ("LADDER", "STAIRS", "DOOR", "WARP")
 
 # Surf. Seen live (twice): with SURF on AZUMARILL and the Balance Badge, go_to("Route 119")
 # from ROUTE 118 said it "can't be reached on foot" and the AI stalled at the river at
@@ -129,6 +135,133 @@ def is_surf_start(tile) -> bool:
 def is_shore(tile) -> bool:
     """Land a surfer can step off onto, and Surf can start from: elevation 3, no collision."""
     return bool(tile) and len(tile) > 3 and tile[3] == SHORE_ELEVATION and not tile[2] and not is_surf_water(tile)
+
+
+def elevation_step(walker: Optional[int], there: Optional[int]) -> Optional[int]:
+    """The walker's elevation after a step onto a tile at elevation `there`, or None when
+    the game refuses the step for an elevation mismatch. None for walker or there means
+    unknown: the step is allowed, and an unknown walker stays unknown across a bridge.
+
+    pret src/event_object_movement.c IsElevationMismatchAt(walker's currentElevation):
+    no mismatch for a walker at 0 (ELEVATION_TRANSITION), nor onto a tile at 0 or 15
+    (ELEVATION_MULTI_LEVEL); any other difference is COLLISION_ELEVATION_MISMATCH in
+    GetCollisionAtCoords. ObjectEventUpdateElevation then gives the walker the new tile's
+    elevation, except on a tile at 15, where it keeps its own (it also keeps it while the
+    tile it came from is 15, but only until the step ends: DoGroundEffects_OnFinishStep
+    runs it again with both coords on the new tile). So a tile at 0 joins every floor next
+    to it, and a bridge carries each floor across at its own height.
+    """
+    if there is None:
+        return walker
+    if walker not in (None, 0) and there not in (0, BRIDGE_ELEVATION) and there != walker:
+        return None
+    return walker if there == BRIDGE_ELEVATION else there
+
+
+def elevation_allows(here, there, from_symbol: str, dest_symbol: str, walker: Optional[int]) -> bool:
+    """Whether the walker, at elevation `walker` on tile `here` (None: here's own, or
+    unknown on a bridge), passes the game's elevation check stepping onto tile `there`
+    (layout tuples; from_symbol/dest_symbol their grid symbols).
+
+    elevation_step decides, with two exceptions. A ledge is jumped over whatever the
+    elevations: pret CheckForObjectEventCollision tests ShouldJumpLedge after
+    GetCollisionAtCoords and returns COLLISION_LEDGE_JUMP even on a mismatch, and the
+    walker lands with the landing tile's elevation. A warp tile ends the walk on the
+    step: doors fire from the tile before (pret TryDoorWarp; warp_events at elevation 0
+    match any walker, GetWarpEventAtPosition), and the walk goes to no other warp
+    (find_path blocks them).
+    """
+    if here is None or there is None or len(here) < 4 or len(there) < 4:
+        return True
+    if from_symbol in LEDGE_SYMBOLS or dest_symbol in LEDGE_SYMBOLS:
+        return True
+    if dest_symbol in ("S", "D") or any(word in tile_behavior_name(there) for word in WARP_BEHAVIOR_WORDS):
+        return True
+    if walker is None and here[3] != BRIDGE_ELEVATION:
+        walker = here[3]
+    return elevation_step(walker, there[3]) is not None
+
+
+def walk_steps(tiles, grid, x: int, y: int, walker: Optional[int], surf: bool, walls):
+    """(nx, ny, the walker's elevation there) for each tile a walker at elevation `walker`
+    on (x, y) can step onto: the tile planner's rules (_can_move_to with the blocked set's
+    collision rule) for the floods that don't plan a walk, the route areas
+    (game_tools._walk_areas_without) and the ASCII map's reachable floor (porymap_state).
+
+    tiles are the layout tuples, grid the symbols by row; walls are symbols never entered
+    (water among them is still entered where water_step allows it). Ledge directions are
+    the caller's: a ledge tile is entered from any side here.
+    """
+    here = tiles[y][x] if 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
+    if walker is None and here is not None and len(here) > 3 and here[3] != BRIDGE_ELEVATION:
+        walker = here[3]
+    from_symbol = grid[y][x]
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        nx, ny = x + dx, y + dy
+        if not (0 <= ny < len(grid) and 0 <= nx < len(grid[ny])):
+            continue
+        there = tiles[ny][nx] if ny < len(tiles) and nx < len(tiles[ny]) else None
+        symbol = grid[ny][nx]
+        wet = water_step(here, there, symbol, walker, surf)
+        if wet is False:
+            continue
+        if wet is None:
+            if symbol in walls:
+                continue
+            # pret MapGridGetCollisionAt (as _get_blocked_positions).
+            if there is not None and len(there) > 2 and there[2] and symbol not in PASSABLE_WITH_COLLISION:
+                continue
+            if not elevation_allows(here, there, from_symbol, symbol, walker):
+                continue
+        if there is None or len(there) < 4:
+            yield nx, ny, walker
+        else:
+            yield nx, ny, walker if there[3] == BRIDGE_ELEVATION else there[3]
+
+
+def arrival_elevation(tile_elevation: Optional[int]) -> Optional[int]:
+    """The player's elevation on the tile a warp lands on: pret InitPlayerAvatar spawns the
+    player at ELEVATION_TRANSITION (0) and ObjectEventUpdateElevation then takes the tile's,
+    except on a tile at 15, where it returns early and 0 stays."""
+    if tile_elevation is None:
+        return None
+    return 0 if tile_elevation == BRIDGE_ELEVATION else tile_elevation
+
+
+def elevations_compatible(a: Optional[int], b: Optional[int]) -> bool:
+    """pret AreElevationsCompatible: two objects collide only at the same elevation, or when
+    either is at 0 (DoesObjectCollideWithObjectAt). Unknown counts as compatible."""
+    return a is None or b is None or a == 0 or b == 0 or a == b
+
+
+def water_step(here, there, there_symbol: str, walker: Optional[int], surf: bool) -> Optional[bool]:
+    """Whether a step from tile `here` to tile `there` (layout tuples) into, on or out of
+    Surf water is possible; None for a step that has nothing to do with water (the
+    elevation rule decides, elevation_step).
+
+    pret src/field_player_avatar.c: Surf starts only facing surfable water from
+    elevation 3 (IsPlayerFacingSurfableFishableWater); a surfer (elevation 1, the
+    water's) moves over water and, like any walker, under a bridge (elevation 15 keeps
+    its elevation, ObjectEventUpdateElevation); stepping onto an elevation-3 tile
+    ends Surf (CanStopSurfing). Any other step between water and land is refused,
+    though the game might allow some (an elevation-0 tile next to water): a missing
+    way is better than a walk that ends in the water's edge.
+    """
+    if here is None or there is None or len(here) < 4 or len(there) < 4:
+        return None
+    from_water, to_water = is_surf_water(here), is_surf_water(there)
+    # Under a bridge the surfer keeps the water's elevation (walker). Only a party that can
+    # Surf is ever there: ROUTE 110's and 120's elevation-1 bridge ends (BRIDGE_OVER_*)
+    # are land at the water's elevation, and from them a walker on foot is no surfer.
+    surfing = from_water or (here[3] == BRIDGE_ELEVATION and walker == WATER_ELEVATION and bool(surf))
+    if surfing:
+        if to_water or there[3] in (BRIDGE_ELEVATION, SHORE_ELEVATION):
+            return True
+        # A door in the water (MB_WATER_DOOR, MB_WATER_SOUTH_ARROW_WARP: Scorched Slab).
+        return there_symbol in ("D", "S") and "WATER" in tile_behavior_name(there)
+    if not to_water:
+        return None
+    return bool(surf) and is_shore(here) and is_surf_start(there)
 
 
 @dataclass
@@ -548,6 +681,10 @@ class Pathfinder:
                     # (game_tools.load_pathfinding_state): pushes join the search.
                     "boulders": porymap.get("boulders") or [],
                     "strength": bool(porymap.get("strength")),
+                    # The player's tile and live elevation (game_tools.load_pathfinding_state):
+                    # the walker's elevation at the start of a walk from there.
+                    "start_position": tuple(porymap["player_position"]) if porymap.get("player_position") else None,
+                    "start_elevation": porymap.get("player_elevation"),
                 }
 
                 # Include raw tiles with elevation if available
@@ -695,7 +832,7 @@ class Pathfinder:
                     # Block cycling road tiles if at a different elevation from start
                     # UNLESS there's a walkable path underneath (. & & & . pattern)
                     # OR it's a ladder connecting different elevations (check adjacent tiles)
-                    elif cell == "&" and start_elevation is not None and raw_tiles:
+                    elif cell == "&" and start_elevation is not None and raw_tiles and game_type.upper() == "RED":
                         if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]):
                             tile = raw_tiles[y][x]
                             if tile and len(tile) >= 4:
@@ -809,7 +946,7 @@ class Pathfinder:
                     # Block cycling road tiles if at a different elevation from start
                     # UNLESS there's a walkable path underneath (. & & & . pattern)
                     # OR it's a ladder connecting different elevations (check adjacent tiles)
-                    elif cell == "&" and start_elevation is not None and raw_tiles:
+                    elif cell == "&" and start_elevation is not None and raw_tiles and game_type.upper() == "RED":
                         if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]):
                             tile = raw_tiles[y][x]
                             if tile and len(tile) >= 4:
@@ -906,6 +1043,24 @@ class Pathfinder:
                     if tile and len(tile) > 2 and tile[2]:
                         blocked.add((x, y))
 
+        # People on a bridge (a tile at BRIDGE_ELEVATION) stand at their own elevation there,
+        # and pret DoesObjectCollideWithObjectAt stops only a walker whose elevation is
+        # compatible with theirs (AreElevationsCompatible): someone on the bridge does not
+        # stop a surfer under it. Those are kept per tile for _astar, which knows the
+        # walker's elevation; everywhere else a person's elevation is their tile's, and any
+        # step the elevation check lets onto that tile meets them.
+        bridge_people: Dict[Tuple[int, int], Set[int]] = {}
+        map_data["bridge_people"] = bridge_people
+
+        def block_person(pos, elevation):
+            x, y = pos
+            tile = raw_tiles[y][x] if raw_tiles and 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]) else None
+            on_bridge = tile is not None and len(tile) > 3 and tile[3] == BRIDGE_ELEVATION
+            if on_bridge and elevation is not None and game_type.upper() != "RED":
+                bridge_people.setdefault(pos, set()).add(int(elevation))
+            else:
+                blocked.add(pos)
+
         # Add NPC/object positions as blocked.
         # Prefer runtime object_events (live positions); fall back to static porymap objects.
         if consider_npcs:
@@ -919,7 +1074,7 @@ class Pathfinder:
                     obj_pos = (obj_x, obj_y)
                     if goal_pos and obj_pos == goal_pos:
                         continue
-                    blocked.add(obj_pos)
+                    block_person(obj_pos, obj.get("elevation"))
             # The map file's objects too: live positions only cover objects near the
             # camera, so a far-off trainer would otherwise vanish from the plan.
             if "objects" in map_data:
@@ -945,7 +1100,7 @@ class Pathfinder:
                         obj_pos = (obj_x, obj_y)
                         if goal_pos and obj_pos == goal_pos:
                             continue
-                        blocked.add(obj_pos)
+                        block_person(obj_pos, obj.get("elevation"))
 
         # Add out-of-bounds positions
         for x in range(-1, width + 1):
@@ -1037,17 +1192,7 @@ class Pathfinder:
         map_data: Dict,
         carried_elevation: Optional[int] = None,
     ) -> Optional[bool]:
-        """Whether a step into, on or out of Surf water is possible; None for a step that
-        has nothing to do with water (the usual checks decide).
-
-        pret src/field_player_avatar.c: Surf starts only facing surfable water from
-        elevation 3 (IsPlayerFacingSurfableFishableWater); a surfer (elevation 1, the
-        water's) moves over water and, like any walker, under a bridge (elevation 15 keeps
-        its elevation, ObjectEventUpdateElevation); stepping onto an elevation-3 tile
-        ends Surf (CanStopSurfing). Any other step between water and land is refused,
-        though the game might allow some (an elevation-0 tile next to water): a missing
-        way is better than a walk that ends in the water's edge.
-        """
+        """water_step for two tiles of map_data (the walker's elevation is carried_elevation)."""
         raw_tiles = map_data.get("raw_tiles")
         if not raw_tiles:
             return None
@@ -1062,20 +1207,31 @@ class Pathfinder:
         here, there = tile(from_pos), tile(to_pos)
         if here is None or there is None:
             return None
-        from_water, to_water = is_surf_water(here), is_surf_water(there)
-        # Under a bridge the surfer keeps the water's elevation (carried_elevation).
-        surfing = from_water or (
-            here[3] == BRIDGE_ELEVATION and carried_elevation is not None and carried_elevation == WATER_ELEVATION
-        )
-        if surfing:
-            if to_water or there[3] in (BRIDGE_ELEVATION, SHORE_ELEVATION):
-                return True
-            # A door in the water (MB_WATER_DOOR, MB_WATER_SOUTH_ARROW_WARP: Scorched Slab).
-            dest_symbol = map_data["grid"][to_pos[1]][to_pos[0]]
-            return dest_symbol in ("D", "S") and "WATER" in tile_behavior_name(there)
-        if not to_water:
+        return water_step(here, there, map_data["grid"][to_pos[1]][to_pos[0]], carried_elevation, map_data.get("surf"))
+
+    def _elevation_allows(
+        self,
+        from_pos: Tuple[int, int],
+        to_pos: Tuple[int, int],
+        map_data: Dict,
+        carried_elevation: Optional[int] = None,
+    ) -> bool:
+        """elevation_allows for two tiles of map_data, the walker at carried_elevation."""
+        raw_tiles = map_data.get("raw_tiles") or []
+        grid = map_data["grid"]
+
+        def tile(pos):
+            x, y = pos
+            if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]):
+                found = raw_tiles[y][x]
+                return found if found and len(found) > 3 else None
             return None
-        return bool(map_data.get("surf")) and is_shore(here) and is_surf_start(there)
+
+        here, there = tile(from_pos), tile(to_pos)
+        if here is None or there is None:
+            return True
+        from_symbol, dest_symbol = grid[from_pos[1]][from_pos[0]], grid[to_pos[1]][to_pos[0]]
+        return elevation_allows(here, there, from_symbol, dest_symbol, carried_elevation)
 
     def _can_move_to(
         self,
@@ -1128,6 +1284,16 @@ class Pathfinder:
         if water_step is not None:
             return water_step
 
+        # Emerald: the game's own elevation rule (elevation_step) with the walker's
+        # elevation carried in the search state. The connector guesses below stay for Red.
+        # Seen live: on MOSSDEEP CITY go_to walked DOWN from the west shore (16,6) (elevation
+        # 3) into (16,7) (elevation 5) again and again; FORTREE CITY's heal walk stepped
+        # from (20,13) (3) onto the treetop walkway (20,14) (4). Both refused by the game.
+        game_is_red = os.environ.get("GAME_TYPE", "emerald").upper() == "RED"
+        if not game_is_red and "raw_tiles" in map_data:
+            if not self._elevation_allows(from_pos, to_pos, map_data, carried_elevation):
+                return False
+
         # ========================================================================
         # Elevation Checking Logic
         # ========================================================================
@@ -1143,7 +1309,7 @@ class Pathfinder:
         # Check elevation differences and only allow transitions through valid
         # connectors (E0 tiles, stairs, doors, ladders, ledges).
         # ========================================================================
-        if "raw_tiles" in map_data:
+        if "raw_tiles" in map_data and game_is_red:
             raw_tiles = map_data["raw_tiles"]
             try:
                 # Get elevation from raw tiles
@@ -1301,7 +1467,7 @@ class Pathfinder:
         #   - Allow vertical movement ONLY if there's a ground path pattern (. & & & .)
         #     (indicating you're on the ground path underneath, not trying to climb onto the bridge)
         # When on the same elevation (e.g., both on bridge), allow all directions
-        if (from_symbol == "&" or dest_symbol == "&") and "raw_tiles" in map_data:
+        if (from_symbol == "&" or dest_symbol == "&") and "raw_tiles" in map_data and game_is_red:
             raw_tiles = map_data["raw_tiles"]
             try:
                 from_tile = (
@@ -1475,6 +1641,12 @@ class Pathfinder:
             here = elevation(pos)
             return carried if here == BRIDGE_ELEVATION else here
 
+        # People standing on bridges, with their elevations (_get_blocked_positions).
+        bridge_people = map_data.get("bridge_people") or {}
+
+        def person_stops(carried, pos):
+            return any(elevations_compatible(carried, theirs) for theirs in bridge_people.get(pos, ()))
+
         # Rotating gates: which tiles join which depends on the gates' orientations and
         # each push turns a gate, so the same tile with the gates turned otherwise is
         # another search state (rotating_gates.py). Their check runs only for a step onto a
@@ -1507,7 +1679,11 @@ class Pathfinder:
             # differently, so it is a different search state.
             return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None, gates, boulders)
 
-        start_carried = carried_after(None, start)
+        # The player's own elevation where the walk starts from their tile (pret
+        # gObjectEvents[player].currentElevation, game_tools.load_pathfinding_state): on a
+        # bridge it is the floor they came from, which the tile can't tell.
+        live = map_data.get("start_elevation")
+        start_carried = carried_after(live if start == map_data.get("start_position") else None, start)
         start_node = Node(
             start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried, gates=start_gates,
             boulders=start_boulders,
@@ -1587,6 +1763,8 @@ class Pathfinder:
                 carried = carried_after(current.carried, neighbor_pos)
                 # Check if this move is valid (handles ledge directions)
                 if not self._can_move_to((current.x, current.y), neighbor_pos, map_data, current.carried):
+                    continue
+                if bridge_people and person_stops(current.carried, neighbor_pos):
                     continue
                 gates = gates_after(current.gates, (current.x, current.y), neighbor_pos)
                 if puzzle is not None and gates is None:
@@ -1963,10 +2141,20 @@ class Pathfinder:
         directions = [(0, -1), (0, 1), (-1, 0), (1, 0)]
         results: List[List[Tuple[int, int]]] = []
         seen_paths: Set[Tuple[Tuple[int, int], ...]] = set()
-        stack = [(start, [start])]
+        raw_tiles = map_data.get("raw_tiles") or []
+
+        def tile_elevation(pos):
+            x, y = pos
+            tile = raw_tiles[y][x] if 0 <= y < len(raw_tiles) and 0 <= x < len(raw_tiles[y]) else None
+            return tile[3] if tile and len(tile) > 3 else None
+
+        # The walker's elevation goes along each prefix, as in _astar (elevation_step).
+        live = map_data.get("start_elevation") if start == map_data.get("start_position") else None
+        start_walker = live if tile_elevation(start) == BRIDGE_ELEVATION else tile_elevation(start)
+        stack = [(start, [start], start_walker)]
 
         while stack and len(results) < max_prefixes:
-            current_pos, positions = stack.pop()
+            current_pos, positions, walker = stack.pop()
             steps_taken = len(positions) - 1
 
             if steps_taken == steps_required:
@@ -1985,10 +2173,11 @@ class Pathfinder:
                 if next_pos in positions:
                     continue
 
-                if not self._can_move_to(current_pos, next_pos, map_data):
+                if not self._can_move_to(current_pos, next_pos, map_data, walker):
                     continue
 
-                stack.append((next_pos, positions + [next_pos]))
+                there = tile_elevation(next_pos)
+                stack.append((next_pos, positions + [next_pos], walker if there == BRIDGE_ELEVATION else there))
 
         return results
 

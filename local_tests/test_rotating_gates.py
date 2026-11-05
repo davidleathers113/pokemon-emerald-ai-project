@@ -414,7 +414,9 @@ def test_people_are_taken_where_they_stand_not_at_their_map_file_tile():
     state = _plan_state(s)
     porymap = state["map"]["porymap"]
     assert (4, 14) not in {(o.get("x"), o.get("y")) for o in porymap["objects"]}, porymap["objects"]
-    assert {"current_x": 4, "current_y": 16} in porymap["runtime_objects"], porymap["runtime_objects"]
+    # Each live person also carries their elevation now (who they stop on a bridge).
+    live = {(o.get("current_x"), o.get("current_y")) for o in porymap["runtime_objects"]}
+    assert (4, 16) in live, porymap["runtime_objects"]
     assert _route(state, (2, 19), (4, 15))[0] is None  # only through him
     r = s.call("mcp_talk_to", {"x": 4, "y": 14, "reasoning": "test"})
     print("   ", r.get("summary") or r.get("error"))

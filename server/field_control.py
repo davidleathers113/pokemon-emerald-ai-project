@@ -174,6 +174,34 @@ def npc_positions(reader) -> List[Tuple[int, int]]:
     return spots
 
 
+def _current_elevation(reader, base: int) -> int:
+    """pret struct ObjectEvent +0x0B: currentElevation in the low nibble (previousElevation
+    in the high one). currentElevation is the one GetCollisionAtCoords checks
+    (IsElevationMismatchAt) and DoesObjectCollideWithObjectAt compares."""
+    return reader._read_u8(base + 0x0B) & 0xF
+
+
+def player_elevation(reader) -> int:
+    """The player's currentElevation: what the game's elevation check uses for the next step."""
+    return _current_elevation(reader, _player_object_base(reader))
+
+
+def npc_elevations(reader) -> Dict[Tuple[int, int], int]:
+    """{tile: currentElevation} for the objects npc_positions lists."""
+    player_base = _player_object_base(reader)
+    out = {}
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        if base == player_base:
+            continue
+        flags = reader._read_u8(base) | (reader._read_u8(base + 1) << 8)
+        if not flags & 0x1 or flags & (1 << 13):
+            continue
+        tile = (reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET)
+        out[tile] = _current_elevation(reader, base)
+    return out
+
+
 def npc_at(reader, x: int, y: int) -> bool:
     """True if a visible object event other than the player stands on (x, y)."""
     return (x, y) in npc_positions(reader)

@@ -35,7 +35,49 @@ def tile_to_symbol(tile_tuple: Tuple[int, Any, int, int], location_name: str = "
     return format_tile_to_symbol(tile_tuple, location_name=location_name)
 
 
-def build_json_map(map_name: str, pokeemerald_root: Path, 
+def override_walk_tiles(override_tiles, override_ascii: str, layout_tiles) -> Optional[List[List[tuple]]]:
+    """The tiles to plan walks on for a map drawn by an ASCII override
+    (ascii_map_loader.MAP_OVERRIDES), or None when the decomp's layout isn't the same size.
+
+    An override draws walls and floor only: every tile it makes is elevation 3 with no
+    collision. The game checks the layout's tiles (pret GetCollisionAtCoords:
+    MapGridGetCollisionAt and IsElevationMismatchAt), so walks use those: the layout tile
+    everywhere, except where the override draws a door or warp or the layout has one,
+    which is what the overrides were made to fix (a gym door drawn a tile off). There the
+    override's tile is kept with the layout's elevation.
+
+    Seen live: on MOSSDEEP CITY the override's elevation 3 everywhere joined the west shore
+    (16,6) (elevation 3) to (16,7) (elevation 5), and go_to walked into the cliff again and
+    again; its water was floor ('W' becomes '.' in ascii_to_metatiles) and its cliff edges,
+    collision 1 in the layout, were open. FORTREE CITY's treetop walkway (elevation 4) was
+    joined to the ground (3) beside it.
+    """
+    lines = [line.strip() for line in override_ascii.strip().split("\n") if line.strip()]
+    if (
+        not layout_tiles
+        or len(layout_tiles) != len(override_tiles)
+        or len(lines) != len(override_tiles)
+        or any(len(a) != len(b) or len(a) != len(c) for a, b, c in zip(layout_tiles, override_tiles, lines))
+    ):
+        return None
+    from utils.mapping.pathfinding import WARP_BEHAVIOR_WORDS, tile_behavior_name
+
+    tiles = []
+    for game_row, drawn_row, line in zip(layout_tiles, override_tiles, lines):
+        row = []
+        for game, drawn, symbol in zip(game_row, drawn_row, line):
+            game = tuple(game)
+            if len(game) < 4:
+                row.append(tuple(drawn))
+            elif symbol in ("D", "S") or any(word in tile_behavior_name(game) for word in WARP_BEHAVIOR_WORDS):
+                row.append((drawn[0], drawn[1], drawn[2], game[3]))
+            else:
+                row.append(game)
+        tiles.append(row)
+    return tiles
+
+
+def build_json_map(map_name: str, pokeemerald_root: Path,
                    include_grid: bool = True,
                    include_ascii: bool = True,
                    badge_count: int = 0) -> Optional[Dict[str, Any]]:
@@ -91,11 +133,17 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
     
     # Load base metatiles from porymap (or override ASCII if provided)
     metatiles = None
+    # The tiles walks are planned on ("raw_tiles"); the override's own unless replaced below.
+    walk_tiles = None
     if override and 'ascii' in override:
         # Use override ASCII - convert to metatiles
         metatiles = ascii_to_metatiles(override['ascii'], effective_map_name)
         if metatiles:
             dimensions = {"width": len(metatiles[0]), "height": len(metatiles)}
+            if layout_name:
+                walk_tiles = override_walk_tiles(
+                    metatiles, override['ascii'], layout_parser.get_metatiles_with_behavior(layout_name)
+                )
     
     # Fall back to binary map.bin files if no ASCII override
     if metatiles is None and layout_name:
@@ -538,7 +586,7 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
     
     # Include raw tiles with elevation for pathfinding elevation checks
     if metatiles:
-        json_map["raw_tiles"] = metatiles
+        json_map["raw_tiles"] = walk_tiles or metatiles
     
     return json_map
 

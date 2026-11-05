@@ -298,8 +298,8 @@ def load_pathfinding_state(env) -> tuple:
                             if len(player_tile) >= 4:
                                 player_elevation = player_tile[3]
                                 logger.info(
-                                    f"Skipping elevation filtering - pathfinding handles elevation "
-                                    f"via E0 connectors (player at elevation {player_elevation})"
+                                    f"Skipping elevation filtering - pathfinding carries the walker's "
+                                    f"elevation (player's tile at elevation {player_elevation})"
                                 )
 
                         if "map" not in state:
@@ -313,10 +313,13 @@ def load_pathfinding_state(env) -> tuple:
                         # Seen live: on ROUTE 117 someone stood at (47,4) on the way to
                         # the grass, and every train call was stopped there in 1 s.
                         try:
-                            from server.field_control import npc_positions
+                            from server.field_control import npc_elevations
 
+                            # With each one's elevation: on a bridge it decides whom they
+                            # stop (pathfinding _get_blocked_positions).
                             state["map"]["porymap"]["runtime_objects"] = [
-                                {"current_x": px, "current_y": py} for px, py in npc_positions(env.memory_reader)
+                                {"current_x": nx, "current_y": ny, "elevation": elevation}
+                                for (nx, ny), elevation in npc_elevations(env.memory_reader).items()
                             ]
                         except Exception as e:  # positions are a refinement; the static list remains
                             logger.debug(f"live object positions unavailable: {e}")
@@ -380,6 +383,17 @@ def load_pathfinding_state(env) -> tuple:
                         # _start_surf).
                         state["map"]["porymap"]["surf"] = can_surf()
                         state["map"]["porymap"]["raw_tiles"] = raw_tiles
+                        # The player's tile and elevation now: a walk from there starts at
+                        # it (pathfinding _astar). On a bridge (elevation 15) the tile can't
+                        # tell which floor the player walks on.
+                        try:
+                            from server.field_control import player_elevation
+
+                            ox, oy = coord_offset or (0, 0)
+                            state["map"]["porymap"]["player_position"] = (px - ox, py - oy)
+                            state["map"]["porymap"]["player_elevation"] = player_elevation(env.memory_reader)
+                        except Exception as e:  # unread: the start tile's elevation is used
+                            logger.debug(f"player elevation unavailable: {e}")
 
                         # For selected dynamic maps (e.g. Mauville Gym), replace static
                         # porymap tiles with the current live map buffer state.
@@ -1427,44 +1441,31 @@ def _route_areas(map_dir: str) -> dict:
     ladder, where the door can only be seen.
 
     When the party can Surf (can_surf), water is part of the areas too: it joins the
-    shores it can be surfed from and landed on (_surf_layout).
+    shores it can be surfed from and landed on (pathfinding.water_step).
     """
     return _walk_areas_without(map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True, can_surf())
-
-
-@lru_cache(maxsize=None)
-def _surf_layout(map_dir: str) -> tuple:
-    """(water, start, shore, elevation) from the map's layout (porymap_state.layout_tiles):
-    the tiles a surfer moves on (pathfinding.is_surf_water), those of them Surf can be
-    started onto (is_surf_start), the land it starts from and lands on (is_shore), and
-    each tile's elevation. Empty sets when the layout can't be read or isn't the size of
-    the map's grid (an ASCII override)."""
-    from utils.mapping.pathfinding import is_shore, is_surf_start, is_surf_water
-    from utils.mapping.porymap_state import _static_grid, layout_tiles
-
-    tiles = layout_tiles(map_dir) if map_dir else ()
-    grid = _static_grid(map_dir) if map_dir else None
-    if not tiles or not grid or len(tiles) != len(grid) or any(len(a) != len(b) for a, b in zip(tiles, grid)):
-        return frozenset(), frozenset(), frozenset(), {}
-    cells = [((x, y), tile) for y, row in enumerate(tiles) for x, tile in enumerate(row)]
-    return (
-        frozenset(pos for pos, tile in cells if is_surf_water(tile)),
-        frozenset(pos for pos, tile in cells if is_surf_start(tile)),
-        frozenset(pos for pos, tile in cells if is_shore(tile)),
-        {pos: tile[3] for pos, tile in cells if len(tile) > 3},
-    )
 
 
 @lru_cache(maxsize=None)
 def _walk_areas_without(
     map_dir: str, obstacles: frozenset, ledges_are_walls: bool = False, surf: bool = False
 ) -> dict:
-    """surf: water joins the areas, with the steps pathfinding._water_step allows: from
-    a shore onto water Surf can start on and back, water to water, and straight under a
-    bridge (elevation 15) to the water beyond it. The bridge's own tiles stay with the
-    land at its ends: a surfer passes under it and can't climb onto it."""
-    from utils.mapping.pathfinding import BRIDGE_ELEVATION
-    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid
+    """The areas are flooded with the tile planner's own steps (pathfinding.walk_steps):
+    collision bits, and the walker's elevation carried from tile to tile (pret
+    IsElevationMismatchAt, ObjectEventUpdateElevation), so floors at different elevations
+    are different areas unless a tile at elevation 0 (stairs, a ramp) or a bridge joins
+    them. Seen live: FORTREE CITY's heal walk was routed from the gym door down onto the
+    treetop walkway at (20,14), elevation 4, from the ground beside it, elevation 3.
+
+    surf: water joins the areas, with the steps pathfinding.water_step allows: from a
+    shore onto water Surf can start on and back, water to water, and under a bridge
+    (elevation 15, which keeps the surfer's elevation). A bridge tile is labelled with the
+    land it carries when a walker reaches it; a surfer passes under it in the water's area.
+    """
+    from utils.mapping.pathfinding import (
+        BRIDGE_ELEVATION, PASSABLE_WITH_COLLISION, WATER_ELEVATION, is_surf_water, walk_steps,
+    )
+    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid, _static_tiles
 
     grid = _static_grid(map_dir) if map_dir else None
     if not grid:
@@ -1473,52 +1474,62 @@ def _walk_areas_without(
         "".join("#" if (x, y) in obstacles else cell for x, cell in enumerate(row))
         for y, row in enumerate(grid)
     ] if obstacles else grid
-    blocked = set(_EDGE_BLOCKED) | (set(_LEDGE_STEPS) if ledges_are_walls else set())
-    water, start, shore, elevation = _surf_layout(map_dir) if surf else (frozenset(), frozenset(), frozenset(), {})
+    walls = set(_EDGE_BLOCKED) | (set(_LEDGE_STEPS) if ledges_are_walls else set())
+    tiles = _static_tiles(map_dir)
+    if len(tiles) != len(grid) or any(len(a) != len(b) for a, b in zip(tiles, grid)):
+        tiles = ()  # no tiles to check: walls by symbol only, no elevation
 
-    def inside(x: int, y: int) -> bool:
-        return 0 <= y < len(grid) and 0 <= x < len(grid[y])
+    def tile(x: int, y: int):
+        return tiles[y][x] if tiles else None
 
-    def open_tile(x: int, y: int) -> bool:
-        return (x, y) in water or grid[y][x] not in blocked
-
-    def steps(x: int, y: int):
-        here_water = (x, y) in water
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nx, ny = x + dx, y + dy
-            if not inside(nx, ny):
-                continue
-            there_water = (nx, ny) in water
-            if here_water and not there_water and elevation.get((nx, ny)) == BRIDGE_ELEVATION:
-                while inside(nx, ny) and elevation.get((nx, ny)) == BRIDGE_ELEVATION:
-                    nx, ny = nx + dx, ny + dy
-                if (nx, ny) in water:
-                    yield nx, ny
-                continue
-            if not open_tile(nx, ny):
-                continue
-            if here_water != there_water:
-                land, sea = ((nx, ny), (x, y)) if here_water else ((x, y), (nx, ny))
-                if land not in shore or sea not in start:
-                    continue
-            yield nx, ny
+    def standable(x: int, y: int) -> bool:
+        """A tile someone can stand on: the walk_steps rules for the tile itself."""
+        here = tile(x, y)
+        if here is not None and is_surf_water(here):
+            return surf
+        if grid[y][x] in walls:
+            return False
+        return here is None or len(here) < 3 or not here[2] or grid[y][x] in PASSABLE_WITH_COLLISION
 
     area: dict = {}
+    states: dict = {}
+    by_surfer = set()  # bridge tiles labelled only from under them so far
+
+    def label(x: int, y: int, walker, number: int) -> None:
+        here = tile(x, y)
+        bridge = here is not None and len(here) > 3 and here[3] == BRIDGE_ELEVATION
+        if (x, y) not in area or ((x, y) in by_surfer and walker != WATER_ELEVATION):
+            area[(x, y)] = number
+            if bridge and walker == WATER_ELEVATION:
+                by_surfer.add((x, y))
+            else:
+                by_surfer.discard((x, y))
+
+    def flood(x0: int, y0: int, walker, number: int) -> None:
+        states[(x0, y0, walker)] = number
+        label(x0, y0, walker, number)
+        stack = [(x0, y0, walker)]
+        while stack:
+            x, y, here = stack.pop()
+            for nx, ny, there in walk_steps(tiles, grid, x, y, here, surf, walls):
+                if (nx, ny, there) in states:
+                    continue
+                states[(nx, ny, there)] = number
+                label(nx, ny, there, number)
+                stack.append((nx, ny, there))
+
     number = -1
-    for y0, row in enumerate(grid):
-        for x0, cell in enumerate(row):
-            if not open_tile(x0, y0) or (x0, y0) in area:
-                continue
-            number += 1
-            stack = [(x0, y0)]
-            area[(x0, y0)] = number
-            while stack:
-                x, y = stack.pop()
-                for nxt in steps(x, y):
-                    if nxt in area:
-                        continue
-                    area[nxt] = number
-                    stack.append(nxt)
+    # Bridges last: whoever stands on one carries the elevation of the floor they came
+    # from, so a bridge is reached from its ends; one no end reaches is flooded unknown.
+    for bridges in (False, True):
+        for y0, row in enumerate(grid):
+            for x0, cell in enumerate(row):
+                here = tile(x0, y0)
+                elevation = here[3] if here is not None and len(here) > 3 else None
+                if (x0, y0) in area or (elevation == BRIDGE_ELEVATION) != bridges or not standable(x0, y0):
+                    continue
+                number += 1
+                flood(x0, y0, None if bridges else elevation, number)
     return area
 
 

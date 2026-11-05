@@ -611,13 +611,16 @@ def _register_every_map() -> None:
 
 
 @lru_cache(maxsize=64)
-def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
-    """A map's collision grid from the decomp, one string per row."""
+def _static_build(map_dir: str) -> tuple:
+    """(grid, tiles) of a map from the decomp: the collision grid, one string per row, and
+    the tiles walks are planned on, (tile id, behavior, collision, elevation) per cell by
+    row (porymap_json_builder raw_tiles: the layout's, also under an ASCII override of the
+    same size). (None, ()) when it can't be built."""
     from utils.mapping.porymap_json_builder import build_json_map
 
     root = _get_pokeemerald_root()
     if not root:
-        return None
+        return None, ()
     try:
         # Every badge: the map's own layout, never a badge-dependent variant
         # (ascii_map_loader CONDITIONAL_SELECTORS). With none, PetalburgCity_Gym came back
@@ -626,11 +629,22 @@ def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
         built = build_json_map(map_dir, root, include_grid=True, include_ascii=False, badge_count=8)
     except Exception as e:  # a broken neighbour must not take the prompt down with it
         logger.warning(f"Porymap: could not build grid for {map_dir}: {e}")
-        return None
+        return None, ()
     grid = (built or {}).get("grid")
     if not grid:
-        return None
-    return tuple("".join(str(cell) for cell in row) for row in grid)
+        return None, ()
+    tiles = tuple(tuple(tuple(tile) for tile in row) for row in (built.get("raw_tiles") or ()))
+    return tuple("".join(str(cell) for cell in row) for row in grid), tiles
+
+
+def _static_grid(map_dir: str) -> Optional[Tuple[str, ...]]:
+    """A map's collision grid from the decomp, one string per row."""
+    return _static_build(map_dir)[0]
+
+
+def _static_tiles(map_dir: str) -> Tuple[Tuple[tuple, ...], ...]:
+    """The tiles walks on a map are planned on (_static_build), () when unknown."""
+    return _static_build(map_dir)[1]
 
 
 @lru_cache(maxsize=None)
@@ -1157,14 +1171,15 @@ def _format_porymap_info(
                         height = len(grid)
                         width = len(grid[0]) if height > 0 else 0
 
-                        # Flood-fill from player position to find all reachable tiles.
-                        # Only crosses elevation boundaries through valid connectors:
-                        #   - E0 tiles (invisible stairs/ramps in Pokemon)
-                        #   - S/D tiles (stairs/doors/warps)
-                        #   - Ledge arrows (one-way, but reachable side is still visible)
-                        #   - & tiles (ladders/bridges)
-                        #   - Tiles with LADDER/STAIRS/WARP behavior
+                        # Flood-fill from the player over (tile, the walker's elevation
+                        # there) by the walks' own step rules (pathfinding.walk_steps: pret
+                        # IsElevationMismatchAt and ObjectEventUpdateElevation, collision,
+                        # Surf). Ledges are entered from any side: the far side stays drawn.
+                        # Seen live on MOSSDEEP CITY: (16,7), elevation 5, was drawn '.'
+                        # beside the player on the west shore (16,6), elevation 3, and the
+                        # walk into it was refused every time.
                         from collections import deque
+                        from utils.mapping.pathfinding import WATER_ELEVATION, walk_steps
 
                         def _get_elev(tx, ty):
                             if 0 <= ty < len(raw_tiles) and 0 <= tx < len(raw_tiles[ty]):
@@ -1172,89 +1187,45 @@ def _format_porymap_info(
                                 return t[3] if len(t) >= 4 else None
                             return None
 
-                        def _is_connector(cx, cy):
-                            """Check if a tile is an elevation connector (E0, stair, door, ladder)."""
-                            ch = grid[cy][cx] if 0 <= cy < height and 0 <= cx < width else '#'
-                            if ch in ['S', 'D', '&']:
-                                return True
-                            e = _get_elev(cx, cy)
-                            if e == 0:
-                                return True
-                            if 0 <= cy < len(raw_tiles) and 0 <= cx < len(raw_tiles[cy]):
-                                t = raw_tiles[cy][cx]
-                                if len(t) >= 2:
-                                    try:
-                                        from pokemon_env.enums import MetatileBehavior
-                                        bname = MetatileBehavior(t[1]).name if isinstance(t[1], int) else ""
-                                    except (ValueError, KeyError):
-                                        bname = ""
-                                    if any(kw in bname for kw in ("LADDER", "STAIRS", "WARP", "DOOR")):
-                                        return True
-                            return False
-
                         walkable_chars = {'.', '~', 'S', 'D', '&', 'W', '←', '→', '↑', '↓'}
-                        reachable = set()
-                        queue = deque()
-                        queue.append((px, py))
-                        reachable.add((px, py))
+                        walls = {ch for row in grid for ch in row} - walkable_chars
+                        player_char = grid[py][px] if 0 <= py < height and 0 <= px < width else '.'
+                        surf = player_char == 'W' or _party_can_surf()
+                        # The player's own elevation (on a bridge the tile can't tell it).
+                        start_elevation = player_elevation if player_elevation != 15 else None
+                        if memory_reader is not None:
+                            try:
+                                from server.field_control import player_elevation as live_elevation
 
+                                live = live_elevation(memory_reader)
+                                start_elevation = live if player_elevation == 15 else player_elevation
+                            except Exception:
+                                pass  # the tile's elevation stands in
+                        reachable = {(px, py)}
+                        seen = {(px, py, start_elevation)}
+                        queue = deque([(px, py, start_elevation)])
                         while queue:
-                            cx, cy = queue.popleft()
-                            c_elev = _get_elev(cx, cy)
-                            c_char = grid[cy][cx] if 0 <= cy < height and 0 <= cx < width else '#'
-
-                            for ddx, ddy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
-                                nx, ny = cx + ddx, cy + ddy
-                                if (nx, ny) in reachable:
+                            cx, cy, walker = queue.popleft()
+                            for nx, ny, after in walk_steps(raw_tiles, grid, cx, cy, walker, surf, walls):
+                                if (nx, ny, after) in seen:
                                     continue
-                                if not (0 <= ny < height and 0 <= nx < width):
-                                    continue
+                                seen.add((nx, ny, after))
+                                reachable.add((nx, ny))
+                                queue.append((nx, ny, after))
 
-                                n_char = grid[ny][nx]
-                                if n_char not in walkable_chars:
-                                    continue
+                        def _other_floor(x, y):
+                            """Floor the player can't step onto from their own: another
+                            elevation by pret IsElevationMismatchAt (a tile at 0 or 15
+                            matches any). Not while surfing: the shore is landed on."""
+                            here = start_elevation
+                            there = _get_elev(x, y)
+                            if here in (None, 0, WATER_ELEVATION) or there is None:
+                                return False
+                            return there not in (0, 15) and there != here
 
-                                n_elev = _get_elev(nx, ny)
-                                if n_elev is None or c_elev is None:
-                                    reachable.add((nx, ny))
-                                    queue.append((nx, ny))
-                                    continue
-
-                                if n_elev == c_elev:
-                                    reachable.add((nx, ny))
-                                    queue.append((nx, ny))
-                                    continue
-
-                                # Elevation differs — only allow through connectors
-                                if _is_connector(cx, cy) or _is_connector(nx, ny):
-                                    reachable.add((nx, ny))
-                                    queue.append((nx, ny))
-                                    continue
-
-                                # Ledge tiles allow one-way elevation change *onto* the ledge
-                                if n_char in ['←', '→', '↑', '↓']:
-                                    reachable.add((nx, ny))
-                                    queue.append((nx, ny))
-                                    continue
-
-                                # Not a valid transition — skip
-
-                        # Also mark tiles adjacent to reachable warps/doors as reachable
-                        # so the pathfinder can step onto the landing tile after a warp
-                        extra = set()
-                        for rx, ry in reachable:
-                            if grid[ry][rx] in ['S', 'D']:
-                                for ddx, ddy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
-                                    ax, ay = rx + ddx, ry + ddy
-                                    if (ax, ay) not in reachable and 0 <= ay < height and 0 <= ax < width:
-                                        ac = grid[ay][ax]
-                                        if ac in walkable_chars:
-                                            extra.add((ax, ay))
-                        reachable |= extra
-
-                        # Build filtered grid: walkable tiles at a different elevation become '^'
-                        # '^' is functionally equivalent to '.' but visually signals
-                        # "this ground is at another elevation — use a ramp/connector"
+                        # Build filtered grid: floor the walk can't reach from here, or
+                        # can't step onto from the player's floor (another elevation, joined
+                        # only by stairs, a ladder or a ramp at elevation 0), becomes '^'.
                         filtered_grid = []
                         for y in range(height):
                             filtered_row = []
@@ -1266,6 +1237,8 @@ def _format_porymap_info(
                                     filtered_row.append(original_char)
                                 elif original_char == '#':
                                     filtered_row.append('#')
+                                elif (x, y) in reachable and original_char in ('.', '~', '&') and _other_floor(x, y):
+                                    filtered_row.append('^')
                                 elif (x, y) in reachable:
                                     # Handle bridge tiles: if player is under a bridge, show as walkable ground
                                     if original_char == '&':
@@ -1300,6 +1273,20 @@ def _format_porymap_info(
                         if not json_map.get('ascii_from_override'):
                             ascii_lines = [''.join(row) for row in filtered_grid]
                             json_map['ascii'] = '\n'.join(ascii_lines)
+                        elif json_map.get('ascii'):
+                            # Override ASCII keeps its own letters; only its floor that is
+                            # '^' above (another floor, or out of reach) is redrawn, as on
+                            # any other map (FORTREE CITY's treetops from the ground,
+                            # MOSSDEEP CITY's upper town from the west shore).
+                            drawn = json_map['ascii'].split('\n')
+                            if len(drawn) == height and all(len(line) == width for line in drawn):
+                                json_map['ascii'] = '\n'.join(
+                                    ''.join(
+                                        '^' if ch in ('.', '~', '&') and filtered_grid[y][x] == '^' else ch
+                                        for x, ch in enumerate(line)
+                                    )
+                                    for y, line in enumerate(drawn)
+                                )
 
                         # Count how many tiles were blocked by elevation filtering
                         blocked_count = sum(1 for row in filtered_grid for cell in row if cell == '#')
@@ -1541,7 +1528,7 @@ def _format_porymap_info(
                 "'R' = boulder (your party can use STRENGTH: navigate_to and go_to push it)"
                 if _party_can_push_boulders() else "'R' = boulder (STRENGTH pushes it)"
             )
-            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = walkable (different elevation), 'N' = NPC, 'I' = item, 'O' = other object, {boulder}, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
+            context_parts.append(f"(Legend: 'P' = Player, '.' = walkable, '#' = blocked, '^' = floor at another elevation or cut off from you (no direct step onto it; navigate_to and go_to take the stairs, ladder or ramp when there is one), 'N' = NPC, 'I' = item, 'O' = other object, {boulder}, '~' = tall grass, {water}, 'X' = out of bounds, 'T' = TV, 'K' = Clock, 'S' = Stairs/Warp, 'D' = Door)")
 
             exits = _format_exits(json_map, ascii_lines, surf)
             if exits:
