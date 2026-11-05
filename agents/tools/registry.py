@@ -805,6 +805,40 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "required": ["pokemon", "reasoning"],
         },
     },
+    # David (2026-11-04): swap party members at a Pokémon Center PC (live: deposit
+    # CAMERUPT, withdraw the TROPIUS a full party sent to the PC).
+    {
+        "name": "deposit_pokemon",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Inside a Pokemon Center: put a party Pokemon in a PC box, in one call (it walks "
+            "to the PC and closes it again). Not your last Pokemon that can fight."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "pokemon": {"type_": "STRING", "description": "Party Pokemon name or slot 1-6, e.g. 'CAMERUPT'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why store it."},
+            },
+            "required": ["pokemon", "reasoning"],
+        },
+    },
+    {
+        "name": "withdraw_pokemon",
+        "scaffolds": GUIDE_SCAFFOLDS,
+        "description": (
+            "Inside a Pokemon Center: take a Pokemon out of the PC boxes into your party, in "
+            "one call (it finds it in any box). Needs a free party slot: deposit_pokemon one first."
+        ),
+        "parameters": {
+            "type_": "OBJECT",
+            "properties": {
+                "pokemon": {"type_": "STRING", "description": "Species or nickname of the boxed Pokemon, e.g. 'TROPIUS'."},
+                "reasoning": {"type_": "STRING", "description": "One short sentence: why take it."},
+            },
+            "required": ["pokemon", "reasoning"],
+        },
+    },
     # Seen live: switch-training cost ~3 model decisions per wild battle (walk into the
     # grass, switch_pokemon, use_move); train runs the whole loop server-side.
     {

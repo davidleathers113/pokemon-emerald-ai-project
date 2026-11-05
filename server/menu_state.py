@@ -526,6 +526,168 @@ def replace_move_cursor(reader) -> Optional[Tuple[int, int]]:
 
 
 # ---------------------------------------------------------------------------
+# Pokémon Center PC: the Pokémon Storage System (deposit_pokemon / withdraw_pokemon).
+# pret data/scripts/pc.inc (EventScript_PC), src/script_menu.c (the "Which PC should be
+# accessed?" multichoice), src/pokemon_storage_system.c (the main menu task and the box
+# screen). US .sym addresses; each was watched in memory on
+# test_lavaridge_pokecenter.state while the macros ran.
+# ---------------------------------------------------------------------------
+
+# struct PokemonStorage (include/pokemon_storage_system.h): +0 currentBox,
+# +4 boxes[14][30] (80-byte struct BoxPokemon, encrypted like a party Pokémon's first
+# 80 bytes), +0x8344 boxNames[14][9].
+G_POKEMON_STORAGE_PTR = 0x03005D94
+TOTAL_BOXES_COUNT = 14
+IN_BOX_COUNT = 30
+IN_BOX_COLUMNS = 6
+BOX_MON_SIZE = 80
+STORAGE_BOXES = 4
+STORAGE_BOX_NAMES = 0x8344
+BOX_NAME_SIZE = 9
+# sProcessInputDelay: Task_HandleMultichoiceInput ignores input while it is nonzero
+# (InitMultichoiceCheckWrap sets 2), so an A sent at once is lost.
+S_PROCESS_INPUT_DELAY = 0x02039F90
+TASK_MULTICHOICE = 0x080E2058            # Task_HandleMultichoiceInput (SOMEONE'S PC / ... / LOG OFF)
+TASK_PC_MAIN_MENU = 0x080C7268           # Task_PCMainMenu (WITHDRAW / DEPOSIT / MOVE / ... / SEE YA!)
+# Task_PCMainMenu's tState (data[0]): STATE_HANDLE_INPUT reads the cursor; STATE_ERROR_MSG
+# shows "Your party is full!" or "Can't deposit your last POKéMON!" until a key.
+PC_MAIN_MENU_HANDLE_INPUT = 2
+PC_MAIN_MENU_WITHDRAW, PC_MAIN_MENU_DEPOSIT = 0, 1   # OPTION_WITHDRAW, OPTION_DEPOSIT
+CB2_POKE_STORAGE = 0x080C7D54            # CB2_PokeStorage: the box screen runs
+# The box screen is one task whose func SetPokeStorageTask swaps; sStorage (a pointer to
+# struct PokemonStorageSystemData) has its u8 state at +0, which each func steps through.
+S_STORAGE = 0x02039D08
+TASK_POKE_STORAGE_MAIN = 0x080C82AC      # Task_PokeStorageMain: state 0 (MSTATE_HANDLE_INPUT) reads input
+TASK_ON_SELECTED_MON = 0x080C8864        # Task_OnSelectedMon: state 2 is its menu (STORE/WITHDRAW first)
+TASK_DEPOSIT_MENU = 0x080C8D78           # Task_DepositMenu: state 1 is "Deposit in which BOX?"
+STORAGE_MAIN_HANDLE_INPUT = 0
+SELECTED_MON_MENU = 2
+DEPOSIT_MENU_CHOOSE_BOX = 1
+# sChooseBoxMenu (pointer to struct ChooseBoxMenu): curBox (u8) at +0x244, the box the
+# "Deposit in which BOX?" popup shows (4+16+12+8+0x214+4+2+2 bytes before it).
+S_CHOOSE_BOX_MENU = 0x02039D04
+CHOOSE_BOX_CUR_BOX = 0x244
+# sCursorArea / sCursorPosition: where the box screen's hand is. Areas (enum in
+# pokemon_storage_system.c): 0 in the box (position 0-29, row-major, 6 per row), 1 the
+# party (0-5, 6 = CANCEL), 2 the box title (LEFT/RIGHT scroll boxes), 3 the buttons.
+S_CURSOR_AREA = 0x02039D78
+S_CURSOR_POSITION = 0x02039D79
+CURSOR_AREA_IN_BOX, CURSOR_AREA_IN_PARTY, CURSOR_AREA_BOX_TITLE = 0, 1, 2
+
+
+@dataclass
+class BoxedMon:
+    box: int        # 0-13 (the game shows BOX1-BOX14 by default)
+    slot: int       # 0-29, row-major
+    personality: int
+    species_id: int
+    nickname: str
+    is_egg: bool
+
+
+def storage_base(reader) -> int:
+    return reader._read_u32(G_POKEMON_STORAGE_PTR)
+
+
+def storage_current_box(reader) -> int:
+    return reader._read_u8(storage_base(reader))
+
+
+def box_name(reader, box: int) -> str:
+    raw = reader._read_bytes(storage_base(reader) + STORAGE_BOX_NAMES + BOX_NAME_SIZE * box, BOX_NAME_SIZE)
+    return decode_field_message(raw).strip() or f"BOX{box + 1}"
+
+
+def boxed_mons(reader) -> List[BoxedMon]:
+    """Every Pokémon in the PC boxes, decrypted like a party Pokémon (emerald_utils
+    parse_box_pokemon). An empty slot is all zeros (pret ZeroBoxMonData)."""
+    from pokemon_env.emerald_utils import parse_box_pokemon
+
+    base = storage_base(reader) + STORAGE_BOXES
+    data = bytes(reader.read_memory(base, TOTAL_BOXES_COUNT * IN_BOX_COUNT * BOX_MON_SIZE))
+    found = []
+    for index in range(TOTAL_BOXES_COUNT * IN_BOX_COUNT):
+        raw = data[index * BOX_MON_SIZE:(index + 1) * BOX_MON_SIZE]
+        mon = parse_box_pokemon(raw) if len(raw) == BOX_MON_SIZE else None
+        if mon is None or not mon["substructs"][0]["species"]:
+            continue
+        box, slot = divmod(index, IN_BOX_COUNT)
+        found.append(
+            BoxedMon(
+                box=box,
+                slot=slot,
+                personality=mon["personality"],
+                species_id=mon["substructs"][0]["species"],
+                nickname=str(mon["nickname"] or ""),
+                is_egg=bool(mon["substructs"][3]["isEgg"]),
+            )
+        )
+    return found
+
+
+def party_slot_personalities(reader) -> List[int]:
+    """Personalities in all six gPlayerParty slots (0 = empty), whatever gPlayerPartyCount
+    says. The box screen only recounts the party when it closes (Task_OnBPressed:
+    gPlayerPartyCount = CalculatePlayerPartyCount()). Seen while building withdraw: waiting
+    for the Pokémon in the counted party timed out on the box screen, though it was in the
+    party once the PC closed."""
+    return [reader._read_u32(G_PLAYER_PARTY + i * PARTY_MON_SIZE) for i in range(6)]
+
+
+def multichoice_ready(reader) -> bool:
+    return task_running(reader, TASK_MULTICHOICE) and reader._read_u8(S_PROCESS_INPUT_DELAY) == 0
+
+
+def pc_main_menu_ready(reader) -> bool:
+    task = find_task(reader, TASK_PC_MAIN_MENU)
+    return task is not None and task_data(reader, task, 0) == PC_MAIN_MENU_HANDLE_INPUT and not fade_active(reader)
+
+
+def storage_task_state(reader, func: int) -> Optional[int]:
+    """sStorage->state while the box screen's task runs `func`, else None."""
+    if not callback2_is(reader, CB2_POKE_STORAGE) or not task_running(reader, func):
+        return None
+    pointer = reader._read_u32(S_STORAGE)
+    return reader._read_u8(pointer) if pointer else None
+
+
+def storage_ready(reader) -> bool:
+    """The box screen reads the D-pad and A/B (no scroll, cursor glide or fade running)."""
+    return storage_task_state(reader, TASK_POKE_STORAGE_MAIN) == STORAGE_MAIN_HANDLE_INPUT and not fade_active(reader)
+
+
+def storage_cursor(reader) -> Tuple[int, int]:
+    return reader._read_u8(S_CURSOR_AREA), reader._read_u8(S_CURSOR_POSITION)
+
+
+def choose_box_cursor(reader) -> Optional[int]:
+    if storage_task_state(reader, TASK_DEPOSIT_MENU) != DEPOSIT_MENU_CHOOSE_BOX:
+        return None
+    pointer = reader._read_u32(S_CHOOSE_BOX_MENU)
+    return reader._read_u8(pointer + CHOOSE_BOX_CUR_BOX) if pointer else None
+
+
+def box_step(current: int, goal: int) -> Optional[str]:
+    """RIGHT or LEFT toward goal, the short way round (boxes wrap 14 → 1); None there."""
+    if current == goal:
+        return None
+    right = (goal - current) % TOTAL_BOXES_COUNT
+    return "RIGHT" if right <= TOTAL_BOXES_COUNT - right else "LEFT"
+
+
+def in_box_step(position: int, goal: int) -> Optional[str]:
+    """One press toward a box slot: rows first (UP/DOWN), then columns, never past an
+    edge (UP off row 0 goes to the box title; LEFT/RIGHT off an edge wrap)."""
+    row, col = divmod(position, IN_BOX_COLUMNS)
+    goal_row, goal_col = divmod(goal, IN_BOX_COLUMNS)
+    if row != goal_row:
+        return "DOWN" if goal_row > row else "UP"
+    if col != goal_col:
+        return "RIGHT" if goal_col > col else "LEFT"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Mart
 # ---------------------------------------------------------------------------
 

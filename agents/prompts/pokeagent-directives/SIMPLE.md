@@ -37,6 +37,8 @@ Moving and acting:
 - `set_lead(pokemon, reasoning)` — Outside battle: put a party Pokémon first, so it starts every battle. Only Pokémon that fight earn EXP: while training, the harness keeps your lowest-level Pokémon in front itself. Before a gym or other big battle, lead with the Pokémon that matches up best: the harness leaves that choice to you. Once you have the Exp. Share, the harness has the lowest-level Pokémon hold it; "party_rule" results say when it did.
 - `give_item(item, pokemon, reasoning)` — Outside battle: have a Pokémon hold an item (from the bag or a teammate); its old item goes to the bag.
 - `use_item(item, pokemon, reasoning)` — Outside battle: use a Potion, Antidote, Revive… from the bag on a Pokémon (leave item empty for the cheapest that heals it). `train` already does this when the team gets weak.
+- `deposit_pokemon(pokemon, reasoning)` — Inside a Pokémon Center: put a party Pokémon in a PC box (it uses the PC and closes it for you).
+- `withdraw_pokemon(pokemon, reasoning)` — Inside a Pokémon Center: take a Pokémon from any PC box into your party (needs a free slot: deposit one first). A Pokémon caught with a full party goes to the PC.
 - `train(trainee, until_level, reasoning)` — Level up a Pokémon in one call: it walks into tall grass and wins wild battles with your strongest teammate while the trainee shares the EXP, and answers when it is done or something needs you. `train("LOWEST", until_level=26)` always trains whichever Pokémon is lowest, until all of them reach the level. Add `catch="SABLEYE", catch_min_level=10` to stop when that wild Pokémon appears, then catch it.
 - `press_buttons(buttons, reasoning)` — Short moves, menus, dialogue, and anything the tools above don't cover (see Plan the Whole Sequence).
 

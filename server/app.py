@@ -9296,6 +9296,403 @@ async def mcp_use_item(request: dict = None):
     return {"success": True, "status": "USED", "summary": f"Used {line}; {_left_text([item_id])}."}
 
 
+# -- the Pokémon Center PC: deposit_pokemon / withdraw_pokemon ------------------------
+#
+# David (2026-11-04): swap party members at a Pokémon Center PC in one call each (live:
+# deposit CAMERUPT, withdraw the TROPIUS a full party sent to the PC, teach it HM02 Fly).
+# By hand: face the PC → A → "X booted up the PC." → "Which PC should be accessed?"
+# SOMEONE'S PC (LANETTE'S PC once met; always the first entry, pret CreatePCMultichoice)
+# → "Accessed SOMEONE'S PC." → "POKéMON Storage System opened." → WITHDRAW POKéMON /
+# DEPOSIT POKéMON / ... → the box screen; out again with B (pret Task_OnBPressed: B on its
+# "Continue BOX operations?" YES/NO means NO), B on the PC menu and B on the PC list
+# (EventScript_TurnOffPC). Every press waits for its screen, read from memory
+# (server/menu_state.py, "Pokémon Center PC").
+
+# Presses _leave_pc allows on its way out (each B waited for; the most needed is 4: the
+# box screen, its YES/NO, the PC menu, the PC list).
+PC_LEAVE_PRESSES = 12
+
+
+def _species_name(species_id: int) -> str:
+    with memory_lock:
+        return env.memory_reader._battle_species_name(species_id).upper()
+
+
+def _pc_spot() -> Tuple[Optional[Tuple[int, int]], str]:
+    """(tile to stand on, button to face the PC) for the nearest Pokémon Storage PC on
+    this map, or (None, "") when there is none. A Pokémon Center's PC is a metatile
+    (MB_PC), not a person: pret GetInteractedMetatileScript runs EventScript_PC for A
+    pressed at it from any side, so any open tile next to it will do."""
+    from pokemon_env.enums import MetatileBehavior
+    from server.field_control import DIRECTION_DELTAS, MAP_OFFSET
+
+    with memory_lock:
+        reader = env.memory_reader
+        reader.read_map_around_player(radius=7)  # re-finds the map buffer after a warp
+        grid = reader.read_map_metatiles() or []
+        px, py = reader.read_coordinates()
+    spots = []
+    for y, row in enumerate(grid):
+        for x, tile in enumerate(row):
+            if tile[1] != MetatileBehavior.PC:
+                continue
+            for face in ("UP", "LEFT", "RIGHT", "DOWN"):
+                dx, dy = DIRECTION_DELTAS[face]
+                sx, sy = x - dx, y - dy
+                if 0 <= sy < len(grid) and 0 <= sx < len(grid[sy]) and grid[sy][sx][2] == 0:
+                    stand = (sx - MAP_OFFSET, sy - MAP_OFFSET)
+                    spots.append((abs(stand[0] - px) + abs(stand[1] - py), stand, face))
+    if not spots:
+        return None, ""
+    _, stand, face = min(spots)
+    return stand, face
+
+
+def _pc_refusal(tool: str) -> Optional[Dict[str, Any]]:
+    """Refuse outside a Pokémon Center (or in battle, or with a screen open)."""
+    refused = _field_refusal(tool)
+    if refused:
+        return refused
+    location = _location_name()
+    if "POKEMON CENTER" not in location.upper() or _pc_spot()[0] is None:
+        hint = _exit_hint("POKEMON CENTER")
+        how = f" ({hint} enters the one here)" if hint else " (heal_at_pokecenter walks to the nearest one)"
+        return _refusal(f"{tool} works at the PC in a Pokémon Center, and you are on {location}. Go into a Pokémon Center first{how}.")
+    return None
+
+
+def _pc_screen(r) -> Tuple[int, Tuple[int, ...], Optional[int]]:
+    """What the PC shows, to wait for a press to change it: gMain.callback2, the active
+    tasks, and the box screen's sStorage->state while it runs."""
+    from server import menu_state as ms
+    from server.field_control import G_MAIN_CALLBACK2
+
+    state = None
+    if ms.callback2_is(r, ms.CB2_POKE_STORAGE):
+        pointer = r._read_u32(ms.S_STORAGE)
+        state = r._read_u8(pointer) if pointer else None
+    return r._read_u32(G_MAIN_CALLBACK2), tuple(ms.active_task_funcs(r)), state
+
+
+async def _leave_pc(source: str) -> bool:
+    """B out of whatever the PC shows until the player can walk; True once they can.
+
+    B never changes the boxes: on the box screen it asks "Continue BOX operations?" and B
+    there means NO (pret Task_OnBPressed); on a Pokémon's menu or "Deposit in which BOX?"
+    it cancels; on the PC menu and the PC list it logs off (EventScript_TurnOffPC); on a
+    message it closes it. A is never pressed here."""
+    for _ in range(PC_LEAVE_PRESSES):
+        if _player_can_walk():
+            return True
+        before = _mem(_pc_screen)
+        await _macro_press(["B"], source)
+        await _await_game(lambda before=before: _player_can_walk() or _mem(_pc_screen) != before, MACRO_MENU_FRAMES)
+    return await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+
+
+async def _open_storage(option: int, source: str) -> Optional[str]:
+    """Walk to the PC and open the box screen for WITHDRAW or DEPOSIT; None when it is
+    up and reads input, else why not (the PC is then closed again)."""
+    from server import menu_state as ms
+
+    stand, face = _pc_spot()
+    if stand is None:
+        return "there is no PC on this map"
+    snap = _field_snapshot()
+    if snap is None or (snap.x, snap.y) != stand:
+        walk = await mcp_navigate_to(
+            {"x": stand[0], "y": stand[1], "variance": "none", "reason": f"{source}: walk to the PC", "consider_npcs": True}
+        )
+        snap = _field_snapshot()
+        if snap is None or (snap.x, snap.y) != stand:
+            return f"could not walk to ({stand[0]},{stand[1]}) in front of the PC: {walk.get('summary') or walk.get('error')}"
+    if snap.facing != face:
+        # The PC blocks that way, so this press only turns the player.
+        await _macro_press([face], source)
+        snap = _field_snapshot()
+        if snap is None or snap.facing != face:
+            return f"could not face the PC from ({stand[0]},{stand[1]})"
+    await _macro_press(["A"], source)
+    listed, texts = await _talk_until(lambda: _mem(ms.multichoice_ready))
+    if not listed:
+        await _leave_pc(source)
+        return f"pressed A at the PC but its list of PCs did not come up ({_quote(texts) or 'nothing was said'})"
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, 0, source):
+        await _leave_pc(source)
+        return "could not put the cursor on SOMEONE'S PC"
+    await _macro_press(["A"], source)
+    opened, more = await _talk_until(lambda: _mem(ms.pc_main_menu_ready))
+    if not opened:
+        await _leave_pc(source)
+        return f"chose SOMEONE'S PC but the storage menu did not come up ({_quote(texts + more) or 'nothing was said'})"
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, option, source):
+        await _leave_pc(source)
+        return "could not put the storage menu cursor on " + ("DEPOSIT" if option == ms.PC_MAIN_MENU_DEPOSIT else "WITHDRAW")
+    await _macro_press(["A"], source)
+    # The screen fades to black, CB2_PokeStorage builds the boxes and fades back in.
+    if not await _await_game(lambda: _mem(ms.storage_ready), MACRO_MENU_FRAMES * 3):
+        await _leave_pc(source)
+        return "chose " + ("DEPOSIT" if option == ms.PC_MAIN_MENU_DEPOSIT else "WITHDRAW") + " but the box screen did not open"
+    return None
+
+
+async def _storage_press(button: str, done, source: str, frames: int = MACRO_MENU_FRAMES) -> bool:
+    """Press one button on the box screen and wait until done(reader). One press at a
+    time: the cursor glides, and the boxes scroll, for several frames, and input is only
+    read again once Task_PokeStorageMain is back in MSTATE_HANDLE_INPUT."""
+    await _macro_press([button], source)
+    return bool(await _await_game(lambda: _mem(done), frames))
+
+
+async def _storage_choose_first_action(source: str) -> Optional[str]:
+    """A on the Pokémon under the hand, then A on its menu's first entry: STORE on the
+    deposit screen, WITHDRAW on the withdraw screen (pret SetMenuTexts_Mon)."""
+    from server import menu_state as ms
+
+    if not await _storage_press("A", lambda r: ms.storage_task_state(r, ms.TASK_ON_SELECTED_MON) == ms.SELECTED_MON_MENU, source):
+        return "pressed A on it but its menu did not open"
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, 0, source):
+        return "could not put its menu cursor on the first entry"
+    await _macro_press(["A"], source)
+    return None
+
+
+def _party_listing() -> str:
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    return ", ".join(f"{i + 1}. {p.species_name.upper()}" for i, p in enumerate(party)) or "empty"
+
+
+@app.post("/mcp/deposit_pokemon")
+async def mcp_deposit_pokemon(request: dict = None):
+    """MCP Tool: inside a Pokémon Center, put a party Pokémon in a PC box, in one call.
+
+    The box is the one "Deposit in which BOX?" offers first (the last one deposited in,
+    pret sDepositBoxId), or the next box with room when that one is full; the game puts the
+    Pokémon in the box's first free slot (GetFirstFreeBoxSpot). The game won't take the
+    last Pokémon that can fight (IsRemovingLastPartyMon: no other party member alive and
+    not an egg), so that is refused before the PC is touched. The result is checked by
+    personality: gone from the party, found in the box.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import menu_state as ms
+
+    source = "deposit_pokemon"
+    request = request or {}
+    wanted = request.get("pokemon")
+    if wanted is None or str(wanted).strip() == "":
+        return _refusal('pokemon is required: the party Pokémon to put in the PC, e.g. deposit_pokemon("CAMERUPT").')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+        personalities = ms.party_personalities(env.memory_reader)
+    index = _train_member([(0, p) for p in party], wanted)
+    if index is None:
+        return _refusal(f"{wanted} is not in your party ({_party_listing()}).")
+    name = party[index].species_name.upper()
+    others_can_fight = any(not p.is_egg and p.current_hp > 0 for i, p in enumerate(party) if i != index)
+    if not others_can_fight:
+        return _refusal(
+            f"{name} is the last Pokémon in your party that can fight, and the PC won't take it "
+            "(\"That's your last POKéMON!\"). Heal or withdraw another Pokémon first."
+        )
+    refused = _pc_refusal(source)
+    if refused:
+        return refused
+    personality = personalities[index]
+    with _turbo():
+        why = await _open_storage(ms.PC_MAIN_MENU_DEPOSIT, source)
+        if why is None:
+            why = await _deposit_on_screen(index, personality, name, source)
+        closed = await _leave_pc(source)
+    walk = "" if closed else " The PC is still open: look at the screen."
+    if why:
+        return _refusal(f"Did not deposit {name}: {why}.{walk}{_screen_note() if not closed else ''}")
+    stored = next((m for m in _mem(ms.boxed_mons) if m.personality == personality), None)
+    in_party = personality in _mem(ms.party_personalities)
+    if stored is None or in_party:
+        return _refusal(f"{name} is not in a PC box afterwards (party: {_party_listing()}).{walk}")
+    box = _mem(ms.box_name, stored.box)
+    return {
+        "success": True,
+        "status": "DEPOSITED",
+        "summary": f"{name} deposited in {box} (slot {stored.slot + 1}). Party: {_party_listing()}.{walk}",
+        "box": box,
+        "slot": stored.slot + 1,
+    }
+
+
+async def _deposit_on_screen(index: int, personality: int, name: str, source: str) -> Optional[str]:
+    """On the deposit screen (the hand starts on party slot 1, pret InitCursor): the
+    Pokémon → STORE → the box → A. None when it left the party, else why not."""
+    from server import menu_state as ms
+
+    for _ in range(8):
+        area, at = _mem(ms.storage_cursor)
+        if area != ms.CURSOR_AREA_IN_PARTY:
+            return "the hand is not on the party"
+        if at == index:
+            break
+        await _storage_press(
+            ms.list_presses(at, index)[0], lambda r, at=at: ms.storage_ready(r) and ms.storage_cursor(r)[1] != at, source
+        )
+    if _mem(ms.storage_cursor) != (ms.CURSOR_AREA_IN_PARTY, index):
+        return f"could not put the hand on party slot {index + 1}"
+    if _mem(ms.party_personalities)[index] != personality:
+        return f"the party changed; {name} is not in slot {index + 1}"
+    why = await _storage_choose_first_action(source)
+    if why:
+        return why
+    if not await _await_game(lambda: _mem(ms.choose_box_cursor) is not None, MACRO_MENU_FRAMES):
+        return 'chose STORE but "Deposit in which BOX?" did not come up'
+    counts = [0] * ms.TOTAL_BOXES_COUNT
+    for mon in _mem(ms.boxed_mons):
+        counts[mon.box] += 1
+    first = _mem(ms.choose_box_cursor)
+    order = [(first + i) % ms.TOTAL_BOXES_COUNT for i in range(ms.TOTAL_BOXES_COUNT)]
+    goal = next((b for b in order if counts[b] < ms.IN_BOX_COUNT), None)
+    if goal is None:
+        return "every PC box is full"
+    for _ in range(ms.TOTAL_BOXES_COUNT):
+        at = _mem(ms.choose_box_cursor)
+        step = ms.box_step(at, goal) if at is not None else None
+        if step is None:
+            break
+        await _storage_press(step, lambda r, at=at: ms.choose_box_cursor(r) != at, source)
+    if _mem(ms.choose_box_cursor) != goal:
+        return f"could not choose {_mem(ms.box_name, goal)} in \"Deposit in which BOX?\""
+    await _macro_press(["A"], source)
+    # The party slides together (CompactPartySlots) before the screen takes input again.
+    if not await _await_game(
+        lambda: _mem(lambda r: ms.storage_ready(r) and personality not in ms.party_slot_personalities(r)), MACRO_MENU_FRAMES * 2
+    ):
+        return f"chose {_mem(ms.box_name, goal)} but {name} is still in the party"
+    return None
+
+
+@app.post("/mcp/withdraw_pokemon")
+async def mcp_withdraw_pokemon(request: dict = None):
+    """MCP Tool: inside a Pokémon Center, take a Pokémon out of a PC box into the party,
+    in one call.
+
+    It is found by species or nickname in every box from memory (gPokemonStoragePtr,
+    decrypted like a party Pokémon), the box screen is scrolled to its box (the hand on the
+    box title, LEFT/RIGHT) and the hand put on its slot, both read back from memory
+    (sCursorArea, sCursorPosition, currentBox), then A → WITHDRAW. A full party (6) is
+    refused before the PC is touched, as the game would (Task_PCMainMenu: "Your party is
+    full!"). The result is checked by personality: in the party, gone from the box.
+    """
+    if env is None:
+        return {"success": False, "error": "Emulator not initialized"}
+    from server import menu_state as ms
+
+    source = "withdraw_pokemon"
+    request = request or {}
+    wanted = request.get("pokemon")
+    if wanted is None or str(wanted).strip() == "":
+        return _refusal('pokemon is required: the Pokémon to take out of the PC, e.g. withdraw_pokemon("TROPIUS").')
+    refused = _field_refusal(source)
+    if refused:
+        return refused
+    boxed = _mem(ms.boxed_mons)
+    key = ms.name_key(wanted)
+    found = [m for m in boxed if key in (ms.name_key(_species_name(m.species_id)), ms.name_key(m.nickname)) and not m.is_egg]
+    if not found:
+        listing = ", ".join(
+            f"{_species_name(m.species_id) if not m.is_egg else 'EGG'} ({_mem(ms.box_name, m.box)})" for m in boxed[:12]
+        )
+        more = f" and {len(boxed) - 12} more" if len(boxed) > 12 else ""
+        return _refusal(f"There is no {wanted} in the PC boxes (in the PC: {listing + more if boxed else 'nothing'}).")
+    # Its current box first: no scrolling.
+    current = _mem(ms.storage_current_box)
+    target = min(found, key=lambda m: (m.box != current, m.box, m.slot))
+    name = _species_name(target.species_id)
+    box = _mem(ms.box_name, target.box)
+    if len(_mem(ms.party_personalities)) >= 6:
+        return _refusal(
+            f"{name} is in {box} (slot {target.slot + 1}), but your party is full (6): "
+            f"deposit_pokemon one of them first ({_party_listing()})."
+        )
+    refused = _pc_refusal(source)
+    if refused:
+        return refused
+    with _turbo():
+        why = await _open_storage(ms.PC_MAIN_MENU_WITHDRAW, source)
+        if why is None:
+            why = await _withdraw_on_screen(target, name, source)
+        closed = await _leave_pc(source)
+    walk = "" if closed else " The PC is still open: look at the screen."
+    if why:
+        return _refusal(f"Did not withdraw {name}: {why}.{walk}{_screen_note() if not closed else ''}")
+    party = _mem(ms.party_personalities)
+    still_boxed = any(m.personality == target.personality for m in _mem(ms.boxed_mons))
+    if target.personality not in party or still_boxed:
+        return _refusal(f"{name} is not in your party afterwards (party: {_party_listing()}).{walk}")
+    return {
+        "success": True,
+        "status": "WITHDRAWN",
+        "summary": f"{name} withdrawn from {box}, slot {target.slot + 1}. Party: {_party_listing()}.{walk}",
+        "box": box,
+        "slot": target.slot + 1,
+    }
+
+
+async def _withdraw_on_screen(target, name: str, source: str) -> Optional[str]:
+    """On the withdraw screen (the hand starts on slot 1 of the current box, pret
+    InitCursor): scroll to the box, put the hand on the slot, A → WITHDRAW. None when the
+    Pokémon joined the party, else why not."""
+    from server import menu_state as ms
+
+    if _mem(ms.storage_current_box) != target.box:
+        # UP from the top row puts the hand on the box title (InBoxInput_Normal); there
+        # LEFT/RIGHT scroll the boxes (HandleInput_OnBox).
+        for _ in range(ms.IN_BOX_COUNT // ms.IN_BOX_COLUMNS + 1):
+            area, at = _mem(ms.storage_cursor)
+            if area == ms.CURSOR_AREA_BOX_TITLE:
+                break
+            was = (area, at)
+            await _storage_press("UP", lambda r, was=was: ms.storage_ready(r) and ms.storage_cursor(r) != was, source)
+        if _mem(ms.storage_cursor)[0] != ms.CURSOR_AREA_BOX_TITLE:
+            return "could not put the hand on the box title"
+        for _ in range(ms.TOTAL_BOXES_COUNT):
+            now = _mem(ms.storage_current_box)
+            step = ms.box_step(now, target.box)
+            if step is None:
+                break
+            # The scroll runs for a few dozen frames (MSTATE_SCROLL_BOX); currentBox
+            # changes when it ends (SetCurrentBox).
+            await _storage_press(step, lambda r, now=now: ms.storage_ready(r) and ms.storage_current_box(r) != now, source)
+        if _mem(ms.storage_current_box) != target.box:
+            return f"could not scroll to {_mem(ms.box_name, target.box)}"
+        # DOWN from the title lands on slot 3 of the top row (HandleInput_OnBox).
+        await _storage_press("DOWN", lambda r: ms.storage_ready(r) and ms.storage_cursor(r)[0] == ms.CURSOR_AREA_IN_BOX, source)
+    for _ in range(ms.IN_BOX_COUNT):
+        area, at = _mem(ms.storage_cursor)
+        if area != ms.CURSOR_AREA_IN_BOX:
+            return "the hand is not in the box"
+        step = ms.in_box_step(at, target.slot)
+        if step is None:
+            break
+        await _storage_press(step, lambda r, at=at: ms.storage_ready(r) and ms.storage_cursor(r)[1] != at, source)
+    if _mem(ms.storage_cursor) != (ms.CURSOR_AREA_IN_BOX, target.slot):
+        return f"could not put the hand on slot {target.slot + 1}"
+    under = next((m for m in _mem(ms.boxed_mons) if (m.box, m.slot) == (target.box, target.slot)), None)
+    if under is None or under.personality != target.personality:
+        return f"the PC changed; {name} is not in slot {target.slot + 1}"
+    why = await _storage_choose_first_action(source)
+    if why:
+        return why
+    # The icon flies to the party, which slides in and out again (Task_WithdrawMon).
+    if not await _await_game(
+        lambda: _mem(lambda r: ms.storage_ready(r) and target.personality in ms.party_slot_personalities(r)), MACRO_MENU_FRAMES * 3
+    ):
+        return f"chose WITHDRAW but {name} did not join the party"
+    return None
+
+
 @app.post("/mcp/buy_item")
 async def mcp_buy_item(request: dict = None):
     """MCP Tool: in a Poké Mart, buy `count` of an item from the clerk; confirmed from
