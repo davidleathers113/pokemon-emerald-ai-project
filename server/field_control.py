@@ -523,7 +523,12 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
     # An EXITS line copied whole ("door/warp at (6, 12) -> ROUTE 112", "west edge ->
     # ROUTE 113"). Seen live in ROUTE 112 CABLE CAR STATION: that exact line answered "No
     # exit … matches", and the model sent it again and again.
-    labelled = [e for e in exits if normalize_name(e.get("label", "")) == wanted]
+    # A warp's EXITS line ends with its note on how it fires ("how", e.g. "(stand on it
+    # and press DOWN)"), so the line copied whole is the label and the note.
+    labelled = [
+        e for e in exits
+        if wanted in (normalize_name(e.get("label", "")), normalize_name(e.get("label", "") + e.get("how", "")))
+    ]
     if labelled:
         return labelled
     text = query.strip()
@@ -533,7 +538,7 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
         if len(parts) == 2 and all(p.lstrip("-").isdigit() for p in parts):
             coords = (int(parts[0]), int(parts[1]))
             named = match_exits(exits, text[:open_at])
-            at = [e for e in named if e["kind"] == "warp" and coords in (e.get("listed_xy"), (e["x"], e["y"]))]
+            at = [e for e in named if e["kind"] == "warp" and coords == (e["x"], e["y"])]
             if at:
                 return at
     stripped = wanted
@@ -554,7 +559,7 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
     numbers = _integers_in(query)
     if len(numbers) == 2:
         coords = tuple(numbers)
-        return [e for e in exits if e["kind"] == "warp" and coords in (e.get("listed_xy"), (e["x"], e["y"]))]
+        return [e for e in exits if e["kind"] == "warp" and coords == (e["x"], e["y"])]
     return []
 
 
@@ -587,8 +592,8 @@ def warp_push_directions(
     Exit mats in houses and cave mouths are arrow warps (e.g. MB_SOUTH_ARROW_WARP):
     they fire when the player walks *off* them toward the arrow. The tile's metatile
     behavior names that direction; otherwise try directions whose neighbour is not a
-    real map tile or is unwalkable. The ASCII grid alone is not enough: it draws a
-    display-only door marker below a house's exit mats.
+    real map tile or is unwalkable. The grid alone is not enough: it draws the mat
+    itself as a door ('D'), which says nothing of the way out.
     """
     out: List[str] = []
     tile = None

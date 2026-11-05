@@ -14,6 +14,10 @@ Fixtures:
   test_lavaridge_after_chimney.state  LAVARIDGE TOWN (6,7) after Mt. Chimney, Flannery
                                       not beaten
   test_movement_route101.state        ROUTE 101 (13,2); the route sign stands at (5,9)
+  test_aqua_hideout_b2f.state         AQUA HIDEOUT B2F (31,17), off the pad from (8,8),
+                                      MATT's side (live save of 2026-11-05)
+  test_mossdeep_gym_statue.state      MOSSDEEP CITY GYM (3,20) (live checkpoint of
+                                      2026-11-05)
 
 No savestate inside PETALBURG CITY GYM exists, so its sign doors and same-map arrival are
 tested on the data and the arrival rule only; the Lavaridge crossing proves the live
@@ -36,6 +40,9 @@ GYM_1F, GYM_B1F = "LavaridgeTown_Gym_1F", "LavaridgeTown_Gym_B1F"
 FLANNERY = (13, 9)
 # pret LavaridgeTown warp 1 → LavaridgeTown_Gym_1F warp 0: where the player walks in.
 GYM_DOOR = (13, 18)
+AQUA_B2F_STATE = HERE / "test_aqua_hideout_b2f.state"
+MOSSDEEP_GYM_STATE = HERE / "test_mossdeep_gym_statue.state"
+AQUA_B2F, AQUA_B1F, MOSSDEEP_GYM = "AquaHideout_B2F", "AquaHideout_B1F", "MossdeepCity_Gym"
 
 
 def _beside(x, y):
@@ -200,6 +207,154 @@ def test_exits_prompt_leaves_out_landing_spots():
     lines = _format_exits(json_map, json_map["ascii"].split("\n"))
     assert len(lines) == 26 - 3, lines
     assert not any("(3, 6)" in line for line in lines), lines
+
+
+def _pret_warps(map_dir):
+    from server import game_tools
+
+    return [(int(w["x"]), int(w["y"])) for w in game_tools._raw_map_json(map_dir).get("warp_events") or []]
+
+
+def test_every_map_lists_its_warps_on_pret_tiles():
+    """Seen live: AQUA HIDEOUT B2F's pad (5,8) was listed at (6,8), a wall, and MOSSDEEP
+    CITY GYM's (7,18) at (6,17): the builder moved a warp one tile toward any row or
+    column of wall beside it, and off a map's last row into rows it added. 901 of the
+    1289 warps on 372 maps were moved, and 206 maps' grids came out a row or column
+    bigger than their tiles. Every map's listed warps are now its warp_events (pret
+    src/field_control_avatar.c GetWarpEventAtMapPosition: a warp fires on its own tile)."""
+    from pokemon_env.porymap_paths import get_porymap_root
+    from utils.mapping.porymap_json_builder import build_json_map
+
+    root = get_porymap_root()
+    moved, sized, built_maps = [], [], 0
+    for map_file in sorted((Path(root) / "data" / "maps").glob("*/map.json")):
+        map_dir = map_file.parent.name
+        try:
+            built = build_json_map(map_dir, root, include_grid=True, include_ascii=True, badge_count=8)
+        except ValueError:
+            continue  # a tileset the parser does not know (SecretBase_*): no grid either way
+        if not built:
+            continue
+        built_maps += 1
+        listed = [(w["x"], w["y"]) for w in built["warps"]]
+        if listed != _pret_warps(map_dir):
+            moved.append(map_dir)
+        tiles, grid = built.get("raw_tiles") or [], built.get("grid") or []
+        if tiles and (len(grid) != len(tiles) or len(grid[0]) != len(tiles[0])):
+            sized.append(map_dir)
+    print(f"    {built_maps} maps; moved warps on {len(moved)}, resized grids on {len(sized)}")
+    assert built_maps > 450, built_maps
+    assert not moved, moved[:20]
+    assert not sized, sized[:20]
+
+
+def test_exits_lines_say_where_the_warp_is_and_how_it_fires():
+    """The EXITS line names the warp's own tile; an exit mat (arrow warp, pret TryArrowWarp)
+    is stood on and walked off, a door (MB_ANIMATED_DOOR, TryDoorWarp) is walked into from
+    the tile below; pads fire on the step and need no note."""
+    from pokemon_env.porymap_paths import get_porymap_root
+    from utils.mapping.porymap_json_builder import build_json_map_for_llm
+    from utils.mapping.porymap_state import _format_exits
+
+    def lines(map_dir):
+        json_map = build_json_map_for_llm(map_dir, get_porymap_root(), badge_count=8)
+        return _format_exits(json_map, json_map["ascii"].split("\n"))
+
+    b2f = lines(AQUA_B2F)
+    for line in ("- door/warp at (5, 8) -> AQUA HIDEOUT B2F", "- door/warp at (31, 17) -> AQUA HIDEOUT B2F",
+                 "- door/warp at (32, 20) -> AQUA HIDEOUT B1F", "- door/warp at (3, 3) -> AQUA HIDEOUT B1F"):
+        assert line in b2f, (line, b2f)
+    assert not any("(6, 8)" in line or "(33, 19)" in line for line in b2f), b2f
+    gym = lines(MOSSDEEP_GYM)
+    for x, y in ((7, 18), (3, 28), (1, 23), (23, 20)):
+        assert f"- door/warp at ({x}, {y}) -> MOSSDEEP CITY GYM" in gym, (x, y, gym)
+    assert "- door/warp at (6, 35) -> MOSSDEEP CITY (stand on it and press DOWN)" in gym, gym
+    # pret OldaleTown warp_events[2]: the POKEMON CENTER's door.
+    (x, y) = _pret_warps("OldaleTown")[2]
+    door = f"- door/warp at ({x}, {y}) -> OLDALE TOWN POKEMON CENTER 1F (from ({x}, {y + 1}) press UP into it)"
+    assert door in lines("OldaleTown"), (door, lines("OldaleTown"))
+
+
+def test_aqua_hideout_route_to_matt_goes_up_to_b1f_and_back_down():
+    """Seen live: from B2F's left room the planner found no way to MATT. pret's way: B1F
+    (3,3), B1F's (12,1) back down to B2F's middle room, its pad (8,8) to (31,17). The
+    moved warps had drawn the pad (5,8) as a door at (6,8) in the wall, which joined the
+    left room to the middle one, so the route was a single pad from a room it can't be
+    walked to from."""
+    from server import game_tools
+
+    beside_matt = [(24, 19), (22, 19), (23, 20), (23, 18)]
+    route = game_tools.tile_route(AQUA_B2F, (3, 5), beside_matt)
+    assert route == [
+        ("AQUA HIDEOUT B1F (3, 3)", "AQUA HIDEOUT B1F"),
+        ("AQUA HIDEOUT B2F (12, 1)", "AQUA HIDEOUT B2F"),
+        ("AQUA HIDEOUT B2F (8, 8)", "AQUA HIDEOUT B2F"),
+    ], route
+    areas = game_tools._route_areas(AQUA_B2F)
+    assert areas[(5, 7)] != areas[(7, 8)] and (6, 8) not in areas, (areas.get((5, 7)), areas.get((7, 8)))
+
+
+def test_mossdeep_gym_route_to_tate_and_liza_is_pret_s_pads():
+    """pret's way across MOSSDEEP CITY GYM: (3,28)→(1,23), (7,18)→(8,12), (11,3)→(11,35),
+    (13,32)→(21,10), then the walk to (23,8) below TATE AND LIZA (23,7)."""
+    from server import game_tools
+
+    route = game_tools.tile_route(MOSSDEEP_GYM, (7, 34), [(23, 8)])
+    assert [step for step, _ in route] == [
+        "MOSSDEEP CITY GYM (3, 28)", "MOSSDEEP CITY GYM (7, 18)", "MOSSDEEP CITY GYM (11, 3)", "MOSSDEEP CITY GYM (13, 32)",
+    ], route
+
+
+def _live_exits(s):
+    from server import game_tools
+    from utils.mapping.porymap_state import _format_exits
+
+    with s.srv.memory_lock:
+        _, offset, source = game_tools.load_pathfinding_state(s.srv.env)
+    json_map = source["json_map"]
+    exits = game_tools.list_map_exits(json_map, source.get("porymap_map_name"), offset)
+    return exits, _format_exits(json_map, json_map["ascii"].split("\n"))
+
+
+def test_live_aqua_hideout_exits_and_the_pad_up_to_b1f():
+    """On the live save at AQUA HIDEOUT B2F (31,17): the EXITS lines and go_to_exit's
+    labels name pret's tiles, and go_to_exit takes the pad (32,20) up to B1F.
+
+    Every way off this side passes (28,16) or (28,17), pret's AquaHideout_B2F coord
+    events that start MATT's scene while VAR_TEMP_1 is 0. The scene is not what this tests,
+    so VAR_TEMP_1 (0x4001, a SaveBlock1 var) is set to 1 in RAM, as the scene itself does."""
+    s = server()
+    s.load(AQUA_B2F_STATE, wild_encounters=False)
+    assert s.srv._location_name() == "AQUA HIDEOUT B2F", s.srv._location_name()
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        sb1 = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR)
+        s.srv.env.core.memory.u16[sb1 + reader.addresses.SAVE_BLOCK1_VARS_OFFSET + (0x4001 - 0x4000) * 2] = 1
+        reader._invalidate_mem_cache()
+    exits, lines = _live_exits(s)
+    labels = [e["label"] for e in exits]
+    print("   ", labels)
+    assert "door/warp at (32, 20) -> AQUA HIDEOUT B1F" in labels, labels
+    assert "door/warp at (5, 8) -> AQUA HIDEOUT B2F" in labels, labels
+    assert "- door/warp at (32, 20) -> AQUA HIDEOUT B1F" in lines, lines
+    r = s.call("mcp_go_to_exit", {"exit": "door/warp at (32, 20) -> AQUA HIDEOUT B1F", "reasoning": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] and s.srv._location_name() == "AQUA HIDEOUT B1F", r
+    assert "(32, 20)" in r["summary"], r
+
+
+def test_live_mossdeep_gym_exits_are_pret_s_pads():
+    """Seen live at MOSSDEEP CITY GYM (3,20): EXITS gave (6,17), (3,27), (0,24), (24,19)
+    for pret's (7,18), (3,28), (1,23), (23,20), and the walk to (6,17) failed."""
+    s = server()
+    s.load(MOSSDEEP_GYM_STATE, wild_encounters=False)
+    assert s.srv._location_name() == "MOSSDEEP CITY GYM", s.srv._location_name()
+    exits, lines = _live_exits(s)
+    tiles = {(e["x"], e["y"]) for e in exits if e["kind"] == "warp"}
+    print("   ", lines)
+    assert {(7, 18), (3, 28), (1, 23), (23, 20), (8, 12), (11, 3), (13, 32), (21, 10)} <= tiles, tiles
+    assert not tiles & {(6, 17), (3, 27), (0, 24), (24, 19)}, tiles
+    assert "- door/warp at (7, 18) -> MOSSDEEP CITY GYM" in lines, lines
 
 
 # --- live ------------------------------------------------------------------------------

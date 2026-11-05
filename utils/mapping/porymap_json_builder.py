@@ -225,144 +225,21 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
                     ascii_map = override_ascii
                     ascii_from_override = True
     
-    # Extract warps
+    # Extract warps, each on its own tile (pret warp_events): the game warps from the
+    # tile the event is on (src/field_control_avatar.c GetWarpEventAtMapPosition), so
+    # the listed tile is that one. Which tile to step in from and the press that fires it
+    # is the tile's behavior's business (porymap_state.warp_entry), not a move of the
+    # warp. Seen live: the builder used to move a warp one tile toward any wall row
+    # beside it, and off the map's last row into added rows: AQUA HIDEOUT B2F's pad
+    # (5,8) was listed at (6,8), a wall the planner then tried to walk into, and every
+    # MOSSDEEP CITY GYM pad was a tile or two off ((7,18) listed at (6,17)). The added
+    # rows also left the grid a row or column bigger than the map's tiles.
     warps = []
     warp_positions = set()  # Track warp positions for grid overlay
-    needs_north_extension = False  # Track if we need to extend the grid north
-    needs_south_extension = False  # Track if we need to extend the grid south
-    needs_east_extension = False  # Track if we need to extend the grid east
-    needs_west_extension = False  # Track if we need to extend the grid west
-    max_warp_y = 0  # Track the maximum warp Y position
-    max_warp_x = 0  # Track the maximum warp X position
-    min_warp_x = float('inf')  # Track the minimum warp X position
-    min_warp_y = float('inf')  # Track the minimum warp Y position
 
     for warp in map_data.get("warp_events", []):
-        original_warp_x = warp.get("x", 0)
-        original_warp_y = warp.get("y", 0)
-        warp_x = original_warp_x
-        warp_y = original_warp_y
-
-        # Adjust warps that are AT map edges (detected by blocked tiles beyond them)
-        # Map edge warps need offset since players transition from adjacent maps
-        # BUT: Skip adjustment for override maps since coordinates are already exact
-        if layout_name and metatiles and include_grid and grid and not override:
-            height = len(grid)
-            width = len(grid[0]) if height > 0 else 0
-
-            # Check if north of warp is blocked (edge warp going north)
-            # Bounds check: ensure warp_x is valid for the row above
-            north_blocked = False
-            if warp_y - 1 < 0:
-                north_blocked = True  # Out of bounds (top edge)
-            elif warp_y - 1 < len(grid) and warp_x < len(grid[warp_y - 1]):
-                north_blocked = grid[warp_y - 1][warp_x] == '#'
-            else:
-                north_blocked = True  # Out of bounds (row width)
-
-            if north_blocked:
-                # Check if entire row north is blocked
-                is_north_edge = True
-                if warp_y - 1 >= 0:
-                    # Check surrounding tiles to confirm it's a map edge
-                    for check_x in range(max(0, warp_x - 2), min(width, warp_x + 3)):
-                        if warp_y - 1 >= 0 and warp_y - 1 < len(grid) and check_x < len(grid[warp_y - 1]):
-                            if grid[warp_y - 1][check_x] != '#':
-                                is_north_edge = False
-                                break
-
-                if is_north_edge:
-                    warp_y -= 1
-                    if warp_y < 0:
-                        needs_north_extension = True
-
-            # Check if south of warp is blocked (edge warp going south)
-            south_blocked = False
-            if warp_y + 1 >= height:
-                south_blocked = True  # Out of bounds (bottom edge)
-            elif warp_y + 1 < len(grid) and warp_x < len(grid[warp_y + 1]):
-                south_blocked = grid[warp_y + 1][warp_x] == '#'
-            else:
-                south_blocked = True  # Out of bounds (row width)
-
-            if south_blocked:
-                # Check if entire row south is blocked
-                is_south_edge = True
-                if warp_y + 1 < height:
-                    # Check surrounding tiles to confirm it's a map edge
-                    for check_x in range(max(0, warp_x - 2), min(width, warp_x + 3)):
-                        if warp_y + 1 < height and warp_y + 1 < len(grid) and check_x < len(grid[warp_y + 1]):
-                            if grid[warp_y + 1][check_x] != '#':
-                                is_south_edge = False
-                                break
-
-                if is_south_edge:
-                    warp_y += 1
-                    if warp_y >= height:
-                        needs_south_extension = True
-
-            # Check if east of warp is blocked (edge warp going east)
-            east_blocked = False
-            if warp_x + 1 >= width:
-                east_blocked = True  # Out of bounds (right edge)
-            elif warp_y < len(grid) and warp_x + 1 < len(grid[warp_y]):
-                east_blocked = grid[warp_y][warp_x + 1] == '#'
-            else:
-                east_blocked = True  # Out of bounds (row width)
-
-            if east_blocked:
-                # Check if entire column east is blocked
-                is_east_edge = True
-                if warp_x + 1 < width:
-                    for check_y in range(max(0, warp_y - 2), min(height, warp_y + 3)):
-                        if check_y < len(grid) and warp_x + 1 < len(grid[check_y]):
-                            if grid[check_y][warp_x + 1] != '#':
-                                is_east_edge = False
-                                break
-
-                if is_east_edge:
-                    warp_x += 1
-                    if warp_x >= width:
-                        needs_east_extension = True
-
-            # Check if west of warp is blocked (edge warp going west)
-            west_blocked = False
-            if warp_x - 1 < 0:
-                west_blocked = True  # Out of bounds (left edge)
-            elif warp_y < len(grid) and warp_x - 1 < len(grid[warp_y]):
-                west_blocked = grid[warp_y][warp_x - 1] == '#'
-            else:
-                west_blocked = True  # Out of bounds (row width)
-
-            if west_blocked:
-                # Check if entire column west is blocked
-                is_west_edge = True
-                if warp_x - 1 >= 0:
-                    for check_y in range(max(0, warp_y - 2), min(height, warp_y + 3)):
-                        if check_y < len(grid) and warp_x - 1 < len(grid[check_y]):
-                            if grid[check_y][warp_x - 1] != '#':
-                                is_west_edge = False
-                                break
-
-                if is_west_edge:
-                    warp_x -= 1
-                    if warp_x < 0:
-                        needs_west_extension = True
-
-            # Clear the original door marker if we adjusted the position
-            if (warp_x != original_warp_x or warp_y != original_warp_y) and include_ascii and ascii_map:
-                ascii_lines = ascii_map.split('\n')
-                if 0 <= original_warp_y < len(ascii_lines) and 0 <= original_warp_x < len(ascii_lines[0]):
-                    ascii_grid = [list(line) for line in ascii_lines]
-                    if ascii_grid[original_warp_y][original_warp_x] in ['D', 'S']:
-                        ascii_grid[original_warp_y][original_warp_x] = '.'
-                    ascii_map = '\n'.join([''.join(row) for row in ascii_grid])
-
-        max_warp_y = max(max_warp_y, warp_y)
-        max_warp_x = max(max_warp_x, warp_x)
-        min_warp_x = min(min_warp_x, warp_x)
-        min_warp_y = min(min_warp_y, warp_y)
-
+        warp_x = warp.get("x", 0)
+        warp_y = warp.get("y", 0)
         warps.append({
             "x": warp_x,
             "y": warp_y,
@@ -373,92 +250,6 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
 
         # Track warp position for grid overlay
         warp_positions.add((warp_x, warp_y))
-
-    # Extend grid and ASCII if warps go out of bounds
-    if layout_name and metatiles:
-        # North extension (prepend rows)
-        if needs_north_extension:
-            extra_rows_needed = abs(min_warp_y)
-
-            if include_grid and grid:
-                # Prepend blocked rows at the top
-                for _ in range(extra_rows_needed):
-                    grid.insert(0, ['#'] * len(grid[0]))
-
-            if include_ascii and ascii_map:
-                ascii_lines = ascii_map.split('\n')
-                # Prepend blocked rows at the top
-                for _ in range(extra_rows_needed):
-                    ascii_lines.insert(0, '#' * len(ascii_lines[0]))
-                ascii_map = '\n'.join(ascii_lines)
-
-            # Adjust all warp Y positions to account for the prepended rows
-            for w in warps:
-                w["y"] += extra_rows_needed
-
-            # Also update warp_positions set with adjusted coordinates
-            warp_positions = {(x, y + extra_rows_needed) for x, y in warp_positions}
-
-            height = len(metatiles) + extra_rows_needed
-            dimensions["height"] = height
-
-        # South extension
-        if needs_south_extension:
-            extra_rows_needed = max_warp_y - len(metatiles) + 1
-
-            if include_grid and grid:
-                for _ in range(extra_rows_needed):
-                    grid.append(['#'] * len(grid[0]))
-
-            if include_ascii and ascii_map:
-                ascii_lines = ascii_map.split('\n')
-                for _ in range(extra_rows_needed):
-                    ascii_lines.append('#' * len(ascii_lines[0]))
-                ascii_map = '\n'.join(ascii_lines)
-
-            height = len(metatiles) + extra_rows_needed
-            dimensions["height"] = height
-
-        # East extension
-        if needs_east_extension:
-            extra_cols_needed = max_warp_x - len(metatiles[0]) + 1
-
-            if include_grid and grid:
-                for row in grid:
-                    row.extend(['#'] * extra_cols_needed)
-
-            if include_ascii and ascii_map:
-                ascii_lines = ascii_map.split('\n')
-                ascii_lines = [line + '#' * extra_cols_needed for line in ascii_lines]
-                ascii_map = '\n'.join(ascii_lines)
-
-            width = len(metatiles[0]) + extra_cols_needed
-            dimensions["width"] = width
-
-        # West extension (prepend columns)
-        if needs_west_extension:
-            extra_cols_needed = abs(min_warp_x)
-
-            if include_grid and grid:
-                for row in grid:
-                    # Prepend blocked tiles to the left
-                    for _ in range(extra_cols_needed):
-                        row.insert(0, '#')
-
-            if include_ascii and ascii_map:
-                ascii_lines = ascii_map.split('\n')
-                ascii_lines = ['#' * extra_cols_needed + line for line in ascii_lines]
-                ascii_map = '\n'.join(ascii_lines)
-
-            # Adjust all warp X positions to account for the prepended columns
-            for w in warps:
-                w["x"] += extra_cols_needed
-
-            # Also update warp_positions set with adjusted coordinates
-            warp_positions = {(x + extra_cols_needed, y) for x, y in warp_positions}
-
-            width = len(metatiles[0]) + extra_cols_needed
-            dimensions["width"] = width
 
     # CRITICAL: Overlay warp symbols on grid and ASCII after extracting warp positions
     # This ensures warps are always marked as walkable, even if the underlying tile

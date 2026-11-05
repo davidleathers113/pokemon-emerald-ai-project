@@ -361,9 +361,9 @@ def load_pathfinding_state(env) -> tuple:
                             ]
                         state["map"]["porymap"]["dimensions"] = json_map.get("dimensions", {})
                         state["map"]["porymap"]["warps"] = json_map.get("warps", [])
-                        # The tiles that really warp (map.json warp_events): the builder
-                        # moves its "warps" next to the door, so these are kept apart.
-                        # Spots warps only land on are plain floor (arrival_only_warps).
+                        # The tiles that really warp (map.json warp_events), kept apart
+                        # from "warps": an override map's are its own copies, and spots
+                        # warps only land on are plain floor (arrival_only_warps).
                         from utils.mapping.porymap_state import arrival_only_warps
 
                         landing = arrival_only_warps(porymap_map_name)
@@ -734,9 +734,10 @@ def navigate_to_direct(
 def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, live_tile=None) -> list:
     """Every exit the EXITS prompt line lists, with the coordinates go_to_exit needs.
 
-    Warp coordinates come from the map's raw warp_events: the json_map copies are
-    nudged toward the map edge for display (a house's exit mats at y=8 are listed at
-    y=9), and walking to the listed tile would miss the warp.
+    Warp coordinates come from the map's raw warp_events (an override map's json_map has
+    its own few). Each warp's "how" is the EXITS note on how it fires when stepping on it
+    is not enough (porymap_state.warp_entry: an exit mat is stood on and walked off, a
+    door is walked into from below), and "entry" that (tile to stand on, button), or None.
 
     Warps that only mark a landing spot (porymap_state.arrival_only_warps) are left out,
     unless live_tile(x, y), the tile in the game's map buffer now, shows a warp behavior
@@ -752,6 +753,8 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, liv
         arrival_only_warps,
         connection_open_span,
         sign_door_warps,
+        warp_entry,
+        warp_entry_text,
     )
 
     exits = []
@@ -780,7 +783,6 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, liv
                 raw_warps = _json.load(fh).get("warp_events", []) or []
         except (OSError, ValueError) as e:
             logger.warning(f"go_to_exit: could not read warps from {map_file}: {e}")
-    listed = json_map.get("warps", []) or []
     ox, oy = coord_offset or (0, 0)
     arrival_only = arrival_only_warps(porymap_map_name or "")
     sign_doors = sign_door_warps(porymap_map_name or "")
@@ -788,15 +790,16 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, liv
         if i in arrival_only and not _fires_now(live_tile, warp):
             continue  # a spot warps land on: stepping on it goes nowhere
         name = _readable_map_name(warp.get("dest_map", "?"))
-        shown = listed[i] if i < len(listed) else warp
-        listed_xy = (shown.get("x"), shown.get("y"))
+        wx, wy = int(warp.get("x", 0)), int(warp.get("y", 0))
+        entry = warp_entry(porymap_map_name or "", i, wx, wy)
         exits.append({
             "kind": "warp",
-            "x": int(warp.get("x", 0)) - ox,
-            "y": int(warp.get("y", 0)) - oy,
-            "listed_xy": listed_xy,
+            "x": wx - ox,
+            "y": wy - oy,
             "name": name,
-            "label": f"door/warp at ({listed_xy[0]}, {listed_xy[1]}) -> {name}",
+            "label": f"door/warp at ({wx - ox}, {wy - oy}) -> {name}",
+            "how": warp_entry_text(entry, wx, wy, (ox, oy)),
+            "entry": ((entry[0][0] - ox, entry[0][1] - oy), entry[1]) if entry else None,
             "dest_map": str(warp.get("dest_map", "")),
             "arrival": warp_arrival(warp),
             # Read from the tile in front, not stepped on (porymap_state.sign_door_warps).

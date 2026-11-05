@@ -433,14 +433,9 @@ class Pathfinder:
             blocked.discard(warp_pos)  # Warps are always walkable
             if was_blocked:
                 logger.info(f"🚪 Unblocked warp at {warp_pos} (was blocked)")
-            # Emerald-only: unblock tile ABOVE warp (porymap_json_builder shifts warp coords down by 1)
-            if game_type == "EMERALD":
-                above_pos = (warp_pos[0], warp_pos[1] - 1)
-                if above_pos[1] >= 0:  # Check it's not out of bounds
-                    was_above_blocked = above_pos in blocked
-                    blocked.discard(above_pos)
-                    if was_above_blocked:
-                        logger.info(f"🚪 Unblocked position above warp: {above_pos} (warp at {warp_pos}, was blocked)")
+            # The tile above a warp is no longer opened: that was for the builder's warps
+            # moved a row down off a house's exit mat, and the builder now lists each warp
+            # on its own tile (pret warp_events). Above a town door it opened the wall.
 
         # SAFEGUARD: Explicitly unblock all 'D' (door) and 'S' (stairs) tiles in the grid
         # Red: skip — D/S are intentionally blocked (stepping on them warps the player)
@@ -461,11 +456,11 @@ class Pathfinder:
         # player away. Seen live: from ROUTE 110 (16,89) the way north ran through the
         # Cycling Road gate's door at (16,88), and every walk north ended inside the gate.
         # The tiles are map.json's warp_events ("raw_warps"): the grid's 'D' marks whole
-        # floors in places (MAUVILLE CITY BIKE SHOP), and the builder's "warps" are moved
-        # next to their door. When the goal is a warp (raw or the builder's moved copy), the
-        # raw warp within one tile of it is the one being walked to. A goal that is not a
-        # warp opens no door: seen in a test, train's walk to grass beside ROUTE 117's Day
-        # Care door stepped on the door.
+        # floors in places (MAUVILLE CITY BIKE SHOP). When the goal is a warp, the raw warp
+        # within one tile of it stays open too: a two-tile doormat is two warps to one
+        # place, and an override map's warps (PetalburgCity_Gym_Lobby) are its own copies.
+        # A goal that is not a warp opens no door: seen in a test, train's walk to grass
+        # beside ROUTE 117's Day Care door stepped on the door.
         goal_is_warp = goal in {
             (w.get("x"), w.get("y")) for w in map_data.get("warps") or [] if isinstance(w, dict)
         } or goal in {tuple(p) for p in map_data.get("raw_warps") or []}
@@ -514,8 +509,8 @@ class Pathfinder:
                         f"🚪 Goal {goal} is on door/stairs tile '{goal_cell}' - ensuring walkable (was blocked: {was_blocked_before})"
                     )
 
-        # CRITICAL: Always unblock the goal if it's a warp position, regardless of tile type
-        # This handles cases where warps were adjusted (e.g., moved down 1 tile)
+        # A warp goal is walkable whatever its tile is drawn as (Petalburg Gym's doors are
+        # NORMAL tiles with collision in the layout).
         if goal in warps:
             was_blocked_before = goal in blocked
             blocked.discard(goal)

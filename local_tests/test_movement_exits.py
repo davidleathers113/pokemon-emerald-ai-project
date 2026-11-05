@@ -443,10 +443,16 @@ def test_people_hidden_by_the_story_do_not_block_walks():
     assert path, "the way north to the rival must be found"
 
 
-def test_navigate_to_across_an_exit_mat_reports_the_new_map():
+def test_navigate_to_below_an_exit_mat_names_go_to_exit():
     """Seen live: in the Oldale Mart, navigate_to(4,8) from (3,7) stepped on the exit mat
     and the warp cut the walk short. The result said "STOPPED ... on OLDALE TOWN MART: an
-    event is running" although the player was already outside."""
+    event is running" although the player was already outside.
+
+    Superseded: (4,8) was a row the map builder added below the mats, where it listed the
+    mats' warps; this test walked there and expected to arrive outside. pret's OLDALE TOWN
+    MART is 11x8 and its warps are the mats (3,7) and (4,7), which EXITS now lists with
+    "stand on it and press DOWN" (test_warp_routes). A tile below the map is answered as
+    outside it, naming go_to_exit, which does take the mat."""
     s = server()
     s.load(ROUTE101, wild_encounters=False)
     assert s.call("mcp_go_to_exit", {"exit": "north", "reasoning": ""})["success"]
@@ -455,9 +461,10 @@ def test_navigate_to_across_an_exit_mat_reports_the_new_map():
     start = s.snapshot()
     r = s.call("mcp_navigate_to", {"x": start.x + 1, "y": start.y + 1, "variance": "none", "reason": "leave"})
     print("   ", r)
-    assert _location(s) == "OLDALE TOWN", _location(s)
-    assert r.get("status") != "STOPPED", r
-    assert r["summary"].startswith("Went through a door/warp: now at") and "OLDALE TOWN" in r["summary"], r
+    assert r["success"] is False and r.get("reason") == "out_of_map" and "go_to_exit" in r["error"], r
+    r = s.call("mcp_go_to_exit", {"exit": "door/warp at (4, 7) -> OLDALE TOWN", "reasoning": "leave"})
+    print("   ", r.get("summary") or r.get("error"))
+    assert r["success"] and _location(s) == "OLDALE TOWN", (r, _location(s))
 
 
 def test_navigate_to_toward_a_neighbouring_map_names_the_exit_call():

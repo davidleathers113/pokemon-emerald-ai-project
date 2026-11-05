@@ -740,6 +740,51 @@ _WARP_BEHAVIORS = frozenset({
 })
 
 
+# The press that fires an arrow warp, by behavior (pret src/metatile_behavior.c
+# MetatileBehavior_Is{North,South,West,East}ArrowWarp).
+_ARROW_WARP_PRESS = {
+    "NORTH_ARROW_WARP": "UP", "STAIRS_OUTSIDE_ABANDONED_SHIP": "UP",
+    "SOUTH_ARROW_WARP": "DOWN", "WATER_SOUTH_ARROW_WARP": "DOWN", "SHOAL_CAVE_ENTRANCE": "DOWN",
+    "WEST_ARROW_WARP": "LEFT", "EAST_ARROW_WARP": "RIGHT",
+}
+
+
+def warp_entry(map_dir: str, index: int, x: int, y: int) -> Optional[Tuple[Tuple[int, int], str]]:
+    """How warp_events[index] (on tile (x, y)) fires when stepping onto it does not:
+    (the tile to stand on, the button to press there); None for a warp that fires on the
+    step onto its tile, or whose tile can't be read.
+
+    pret src/field_control_avatar.c ProcessPlayerFieldInput: an arrow warp (TryArrowWarp)
+    fires when the player standing on it presses toward its arrow, so a house's exit mat
+    is stood on and walked off; an animated door (TryDoorWarp, MetatileBehavior_IsWarpDoor:
+    MB_ANIMATED_DOOR) fires when the player on the tile below it presses UP. Every other
+    warp (TryStartWarpEventScript: ladders, holes, the Aqua Hideout and Mossdeep Gym pads)
+    fires on the step onto its tile.
+    """
+    tiles = _warp_tiles(map_dir)
+    if not 0 <= index < len(tiles) or tiles[index][0] is None:
+        return None
+    behavior = str(getattr(tiles[index][0][1], "name", tiles[index][0][1]))
+    if behavior in _ARROW_WARP_PRESS:
+        return (x, y), _ARROW_WARP_PRESS[behavior]
+    if behavior == "ANIMATED_DOOR":
+        return (x, y + 1), "UP"
+    return None
+
+
+def warp_entry_text(entry: Optional[Tuple[Tuple[int, int], str]], x: int, y: int, offset=(0, 0)) -> str:
+    """The EXITS note for a warp_entry: " (stand on it and press DOWN)" or
+    " (from (7, 9) press UP into it)", in the walking tools' coordinates (local = map -
+    offset), with (x, y) the warp's tile in map coordinates; "" when stepping on the
+    warp's tile is enough."""
+    if entry is None:
+        return ""
+    (sx, sy), button = entry
+    if (sx, sy) == (x, y):
+        return f" (stand on it and press {button})"
+    return f" (from ({sx - offset[0]}, {sy - offset[1]}) press {button} into it)"
+
+
 @lru_cache(maxsize=None)
 def sign_door_warps(map_dir: str) -> frozenset:
     """Indexes in the map's warp_events of doors gone through by reading them: the warp's
@@ -1006,14 +1051,14 @@ def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str], surf: bool =
         lines.append(f"- {edge} edge of the map{how} -> {_readable_map_name(conn.get('map', '?'))}")
     # Warps in the map's own order (an override with its own warps has no map.json of
     # that name, so none are left out there).
-    arrival_only = arrival_only_warps(str(json_map.get("name") or ""))
+    map_dir = str(json_map.get("name") or "")
+    arrival_only = arrival_only_warps(map_dir)
     for i, warp in enumerate(json_map.get("warps", [])):
         if i in arrival_only:
             continue  # only where a warp from elsewhere lands; stepping on it does nothing
-        lines.append(
-            f"- door/warp at ({warp.get('x', '?')}, {warp.get('y', '?')}) -> "
-            f"{_readable_map_name(warp.get('dest_map', '?'))}"
-        )
+        x, y = warp.get("x", "?"), warp.get("y", "?")
+        how = warp_entry_text(warp_entry(map_dir, i, x, y), x, y) if isinstance(x, int) and isinstance(y, int) else ""
+        lines.append(f"- door/warp at ({x}, {y}) -> {_readable_map_name(warp.get('dest_map', '?'))}{how}")
     return lines
 
 
