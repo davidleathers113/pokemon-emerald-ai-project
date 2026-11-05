@@ -192,6 +192,29 @@ def test_the_same_call_four_times_is_a_stall():
     assert stall_reason(rows) == ""
 
 
+def test_an_operator_s_presses_are_not_the_ai_s_stall():
+    """Seen live (19:49): four operator presses clearing a Match Call (reasoning
+    "operator: …") paused the agent as "REPEAT: press_buttons(['A']) 4 times"."""
+    import json
+    import tempfile
+
+    import stall_watch
+
+    run = Path(tempfile.mkdtemp()) / ".pokeagent_cache" / "20261104_x_ai-local-1"
+    run.mkdir(parents=True)
+    operator = {**_row("press_buttons", {"buttons": ["A"]}, xy=(9, 7)), "reasoning": "operator: clear the call"}
+    rows = [{**operator, "timestamp": f"2026-11-04T19:49:0{i}"} for i in range(4)]
+    (run / "trajectory_history.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    real = stall_watch.REPO
+    stall_watch.REPO = run.parent.parent
+    try:
+        assert stall_watch._latest_decisions() == [], "an operator's presses are not the AI's decisions"
+    finally:
+        stall_watch.REPO = real
+    # The AI's own four A presses still are a stall.
+    assert stall_reason([_row("press_buttons", {"buttons": ["A"]}, xy=(9, 7)) for _ in range(4)]).startswith("REPEAT")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("test_")):

@@ -59,10 +59,26 @@ def _latest_decisions(limit: int = 30) -> list:
     rows = []
     for line in runs[-1].read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]:
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
         except ValueError:
             continue
+        if not _is_operator(row):
+            rows.append(row)
     return rows
+
+
+def _is_operator(row: dict) -> bool:
+    """A press an operator made by hand (its reasoning starts "operator"), not the AI's.
+
+    Seen live (19:49): the watcher paused the agent for "REPEAT: press_buttons(['A']) 4
+    times"; those were an operator's presses clearing a Match Call while the agent was
+    paused, and the pause was too short for a poll to see it (rows_after's unpause reset).
+    """
+    if str(row.get("reasoning") or "").strip().lower().startswith("operator"):
+        return True
+    calls = (row.get("action") or {}).get("tool_calls") or []
+    reasons = [str((c.get("args") or {}).get("reasoning") or "") for c in calls]
+    return bool(reasons) and all(r.strip().lower().startswith("operator") for r in reasons)
 
 
 def _call(row: dict):
