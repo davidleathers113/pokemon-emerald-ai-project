@@ -9248,24 +9248,27 @@ def _hm_carrier_swap(party: List[Any]) -> Optional[Tuple[int, str]]:
     """(party index, why) of the Pokémon to lead instead of an HM carrier that isn't a
     fighter (pokemon_env/hm_carriers.py), or None when the lead is fine or nobody can.
 
-    Outside a battle no foe is known yet, so there is no match-up to pick by: the
-    highest-level Pokémon able to battle that isn't such a carrier leads (party order on
-    a tie). It is the safest against whatever comes, a trainer who spots the player
-    included. A wrong pick costs nothing lasting: in a battle the DANGER switch
-    (_danger_switch_rule) and the model still choose who fights.
+    Outside a battle no foe is known yet, so there is no match-up to pick by. The lowest-
+    level Pokémon able to battle that isn't such a carrier leads: the party rule's own
+    pick (_party_rule_target), minus carriers. David (2026-11-04, via emerald-new): not
+    the highest level, which made BRELOOM (Lv42) the default lead; he doesn't want it
+    used for everything ("diversify"). In a battle the DANGER switch (_danger_switch_rule)
+    covers a bad match-up.
     """
     from pokemon_env import hm_carriers
 
     if len(party) < 2 or not hm_carriers.sits_out(party[0].species_name):
         return None
     able = [
-        (i, p) for i, p in enumerate(party)
+        i for i, p in enumerate(party)
         if i > 0 and not p.is_egg and p.current_hp > 0 and not hm_carriers.sits_out(p.species_name)
     ]
     if not able:
         return None
-    index = max(able, key=lambda ip: (ip[1].level, -ip[0]))[0]
-    return index, "the highest level able to battle"
+    pick = _party_rule_target([party[i] for i in able])
+    if pick is None:
+        return None
+    return able[pick], "the lowest level able to battle"
 
 
 @app.post("/maintain_party")

@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_movement_feedback import server
-from test_party_rule import PARTY, _names, _write
+from test_party_rule import PARTY, _names, _party, _write
 
 HERE = Path(__file__).resolve().parent
 WILD = HERE / "test_wild_shroomish.state"
@@ -286,14 +286,22 @@ def _tropius_leads(s):
 def test_an_hm_carrier_that_doesnt_fight_is_moved_off_the_lead():
     s = _fresh(CENTER, wild_encounters=False)
     _tropius_leads(s)
+    # The lowest-level fighter takes the lead, not the highest (this first asserted
+    # BRELOOM Lv38; David doesn't want BRELOOM used for everything: "diversify").
+    party = _party(s)
+    lowest = min((p for p in party if p.species_name.upper() != "TROPIUS" and p.current_hp > 0), key=lambda p: p.level)
+    want = lowest.species_name.upper()
+    assert want != "BRELOOM", want
     r = _step(s)
     assert r["rule"] == "party_rule" and r["changed"] is True, r
-    assert r["summary"].startswith("Lead set to BRELOOM (Lv38, the highest level able to battle): TROPIUS carries FLY, CUT, FLASH"), r
-    assert _names(s)[0] == "BRELOOM" and "TROPIUS" in _names(s), _names(s)
+    assert r["summary"].startswith(
+        f"Lead set to {want} (Lv{lowest.level}, the lowest level able to battle): TROPIUS carries FLY, CUT, FLASH"
+    ), r
+    assert _names(s)[0] == want and "TROPIUS" in _names(s), _names(s)
     assert s.srv._pause_events[-1]["kind"] == "party"
     r = _step(s)  # the next step: nothing more to do about it
     assert r["changed"] is False and not r["summary"], r
-    assert _names(s)[0] == "BRELOOM"
+    assert _names(s)[0] == want
 
 
 def test_while_training_the_carrier_may_lead():
