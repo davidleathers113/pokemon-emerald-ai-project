@@ -8523,10 +8523,28 @@ async def mcp_teach_move(request: dict = None):
         return _mem(lambda r: bool(check(r)))
 
     async def leave(message: str) -> Dict[str, Any]:
-        for _ in range(6):  # B backs out of every screen here
+        # B backs out of every screen here, except one: B on the forget-a-move list asks
+        # "Stop trying to teach X?", where B again answers NO and reopens the list. Seen
+        # live (WALLY'S HOUSE, 2026-11-04): a cursor miss left the list open, the model
+        # mashed A/DOWN/B, and SURF went in over BUBBLE BEAM. That question gets A (YES).
+        def stop_question_up(r) -> bool:
+            # The YES/NO (pret party_menu.c StopLearningMovePrompt: a two-row menu, the text
+            # done, no arrow); never the move list, the party chooser or the bag, where A
+            # would forget a move, or pick a Pokémon and start teaching again.
+            if ms.replace_move_cursor(r) is not None or _party_ready(r) or _bag_ready(r):
+                return False
+            if ms.task_running(r, ms.TASK_FIELD_YES_NO):
+                return True
+            return ms.read_menu_cursor(r).max_cursor == 1 and not ms.text_waiting_for_button(r)
+
+        for _ in range(12):
             if _player_can_walk():
                 break
-            await _macro_press(["B"], source)
+            if _mem(stop_question_up):
+                await _await_game(lambda: _mem(ms.yes_no_ready), 30)
+                await _macro_press(["A"], source)  # YES: stop teaching; nothing is forgotten
+            else:
+                await _macro_press(["B"], source)
             await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
         return _refusal(message + ("" if _player_can_walk() else " Could not close every menu: look at the screen."))
 
@@ -8594,7 +8612,9 @@ async def mcp_teach_move(request: dict = None):
             cursor = _mem(ms.replace_move_cursor)
             if cursor is None or cursor[1] != new_move:
                 return await leave(f"The forget-a-move screen did not open for {new_name}.")
-            await _macro_press(ms.list_presses(cursor[0], forget_index), source)
+            # One press at a time, each waited for: presses sent while the list scrolls are
+            # dropped. Seen in test runs under load: the cursor stopped short of LEECH SEED.
+            await _step_cursor(lambda r: (ms.replace_move_cursor(r) or (-1, 0))[0], forget_index, source)
             cursor = _mem(ms.replace_move_cursor)
             if cursor is None or cursor[0] != forget_index:
                 return await leave(f"Could not put the forget cursor on {known[forget_index].replace('_', ' ')}; nothing was forgotten.")

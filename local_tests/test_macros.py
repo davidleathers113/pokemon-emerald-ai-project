@@ -645,6 +645,37 @@ def test_teach_move_teaches_an_hm_and_forgets_the_named_move():
     assert r["success"] is False and "not in your TMs & HMs pocket" in r["error"], r
 
 
+def test_teach_move_backs_out_cleanly_when_the_forget_cursor_misses():
+    """Seen live (WALLY'S HOUSE, 2026-11-04): teach_move("HM03", AZUMARILL, forget DEFENSE
+    CURL) answered "Could not put the forget cursor…; Could not close every menu" and left
+    the forget list open; the model mashed A/DOWN/B and SURF went in over BUBBLE BEAM. B on
+    that list asks "Stop trying to teach…?", where B answers NO and reopens it. Here the
+    cursor step is made to miss (the forget step's _step_cursor does nothing): the macro
+    must answer YES to stop, close every menu, and forget nothing."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(HERE / "test_marill_in_party.state", wild_encounters=False)
+    _give_hm06(s)
+    _write(s, 8, ms.G_PARTY_MENU + 9, 1)
+    before = _read(s, lambda rd: [p.moves for p in rd.read_party_pokemon()])
+
+    async def stuck(read, goal, source):
+        return False
+
+    real = s.srv._step_cursor
+    s.srv._step_cursor = stuck
+    try:
+        r = s.call("mcp_teach_move", {"item": "HM06", "pokemon": "BRELOOM", "forget": "LEECH SEED", "reasoning": "test"})
+    finally:
+        s.srv._step_cursor = real
+    print("   ", r)
+    assert r["success"] is False and "nothing was forgotten" in r["error"], r
+    assert "Could not close every menu" not in r["error"], r
+    assert s.srv._player_can_walk(), "a menu was left open"
+    assert _read(s, lambda rd: [p.moves for p in rd.read_party_pokemon()]) == before, "a move was forgotten"
+
+
 def _run_all():
     import test_movement_feedback as harness
 
