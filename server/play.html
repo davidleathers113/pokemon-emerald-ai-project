@@ -5,176 +5,359 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Emerald Controller</title>
 <style>
+  /* One viewport, no page scroll on a laptop screen (David, 2026-11-04: the feed, party
+     and progress panels sat below the fold): party rail | game stage (screen, current
+     objectives, controls) | activity rail. Green means the AI has control, amber that
+     you do, red a failure; depth comes from layered grays and 1px lines, not shadows. */
   :root {
-    --bg: #111418; --panel: #1b2027; --text: #e8edf2; --muted: #9aa6b2;
-    --accent: #3ddc84; --warn: #ffb020; --key: #2a313b; --key-active: #3ddc84;
-    --bad: #ff6b5e; --mid: #f2c94c; --line: #2a313b; --inset: #151a20;
+    --canvas: #07080a; --surface: #101215; --raised: #171a1e; --sunken: #0b0c0e;
+    --line: #22262c; --line-strong: #323840;
+    --text: #eceef0; --text-2: #b4b9c0; --muted: #7c838c;
+    --ai: #3ddc84; --ai-deep: #12301f; --on-ai: #04140a;
+    --human: #ffb020; --human-deep: #352406; --on-human: #1d1200;
+    --bad: #ff7a70; --mid: #f2c94c;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --r: 6px; --r-lg: 10px; --gap: 10px;
+    /* Fixed chrome heights let the stage column be exactly as wide as a 3:2 screen at
+       full height, so no width is lost beside the picture; the activity rail gets it. */
+    --top-h: 50px; --strip-h: 86px; --dock-h: 80px;
+    --stage-w: calc((100dvh - var(--top-h) - var(--strip-h) - var(--dock-h) - 4 * var(--gap)) * 1.5);
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
-      --bg: #f3f5f7; --panel: #ffffff; --text: #14181d; --muted: #5b6672;
-      --accent: #12924f; --warn: #b26a00; --key: #e3e8ee; --key-active: #12924f;
-      --bad: #c62828; --mid: #c79100; --line: #e3e8ee; --inset: #f6f8fa;
+      --canvas: #eef0f3; --surface: #ffffff; --raised: #f5f6f8; --sunken: #e6e9ed;
+      --line: #e1e4e8; --line-strong: #cdd2d8;
+      --text: #14181d; --text-2: #3d4650; --muted: #66707b;
+      --ai: #0f8a4a; --ai-deep: #dcf3e6; --on-ai: #ffffff;
+      --human: #a86200; --human-deep: #fbecd2; --on-human: #ffffff;
+      --bad: #c62828; --mid: #a87a00;
     }
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    display: flex; flex-direction: column; align-items: center; min-height: 100vh;
-    padding: 16px;
+    margin: 0; background: var(--canvas); color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100dvh; overflow: hidden;
   }
-  header { width: 100%; max-width: 980px; display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-  header h1 { font-size: 18px; margin: 0; flex: 1; }
-  #mode { padding: 8px 14px; border-radius: 8px; border: 0; font-weight: 600; cursor: pointer; font-size: 14px; }
-  #mode.ai { background: var(--accent); color: #04140a; }
-  #mode.human { background: var(--warn); color: #1d1200; }
-  main { width: 100%; max-width: 980px; display: grid; grid-template-columns: 1fr 260px; gap: 16px; }
-  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
-  .screen { background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 3 / 2; }
+  button { font: inherit; color: inherit; }
+  button:focus-visible { outline: 2px solid var(--ai); outline-offset: 2px; }
+  .mono, .t, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--muted); padding: 12px; }
+
+  /* ---------- Top bar ---------- */
+  .topbar {
+    display: flex; align-items: center; gap: 14px; padding: 0 12px; height: var(--top-h);
+    border-bottom: 1px solid var(--line); background: var(--surface); min-width: 0;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; white-space: nowrap; margin: 0; font-size: 13px; }
+  .brand-mark { width: 10px; height: 10px; rotate: 45deg; background: var(--ai); border-radius: 2px; }
+  .brand small { font-weight: 400; color: var(--muted); }
+  .facts { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; overflow: hidden; }
+  .fact {
+    display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px;
+    border: 1px solid var(--line); border-radius: var(--r); white-space: nowrap; color: var(--text-2);
+  }
+  .fact b { color: var(--text); font-weight: 600; }
+  .fact.loc { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .badges { display: inline-flex; gap: 3px; }
+  .badge { width: 9px; height: 9px; border-radius: 50%; border: 1px solid var(--line-strong); }
+  .badge.earned { background: var(--ai); border-color: var(--ai); }
+  .conn { width: 8px; height: 8px; border-radius: 50%; background: var(--ai); flex: none; }
+  .conn.off { background: var(--bad); }
+  /* Two visible states, so whose turn it is is never ambiguous. */
+  .switch {
+    display: inline-flex; padding: 3px; gap: 2px; border-radius: var(--r-lg); cursor: pointer;
+    background: var(--sunken); border: 1px solid var(--line); flex: none;
+  }
+  .switch span { padding: 4px 12px; border-radius: 7px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+  .switch[aria-pressed="false"] .s-ai { background: var(--ai); color: var(--on-ai); }
+  .switch[aria-pressed="true"] .s-you { background: var(--human); color: var(--on-human); }
+  .switch:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* ---------- Main grid ---------- */
+  main {
+    display: grid; gap: var(--gap); padding: var(--gap); min-height: 0;
+    grid-template-columns: clamp(240px, 19vw, 300px) minmax(0, var(--stage-w)) minmax(320px, 1fr);
+    grid-template-areas: "party stage feed";
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
+    min-height: 0; min-width: 0; display: flex; flex-direction: column;
+  }
+  .card-head {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--line); margin: 0;
+    font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+  }
+  .card-head .right { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 400; font-family: var(--mono); }
+  .panel-body { overflow-y: auto; min-height: 0; flex: 1; overscroll-behavior: contain; position: relative; overflow-wrap: anywhere; }
+
+  /* ---------- Party rail ---------- */
+  .party { grid-area: party; }
+  .mons { display: flex; flex-direction: column; gap: 6px; padding: 8px; flex: 1; min-height: 0; overflow-y: auto; }
+  .mon {
+    flex: 1 0 auto; display: flex; flex-direction: column; justify-content: center; gap: 5px;
+    background: var(--raised); border: 1px solid var(--line); border-radius: var(--r); padding: 7px 9px;
+  }
+  .mon.lead { border-color: color-mix(in srgb, var(--ai) 45%, var(--line)); }
+  .mon.fainted { opacity: .55; }
+  .mon.egg { flex-grow: 0; }
+  .mon-head { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+  .species { font-weight: 650; letter-spacing: .01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag.lead { font-size: 10px; font-weight: 700; color: var(--ai); letter-spacing: .05em; }
+  .lv { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .hp-row { display: flex; align-items: center; gap: 8px; }
+  .hpbar { flex: 1; height: 5px; background: var(--sunken); border-radius: 3px; overflow: hidden; }
+  .hp-fill { height: 100%; border-radius: 3px; }
+  .hp-high { background: var(--ai); } .hp-mid { background: var(--mid); }
+  .hp-low { background: var(--bad); } .hp-zero { background: var(--muted); }
+  .hp-text { font-family: var(--mono); font-size: 11px; color: var(--text-2); white-space: nowrap; }
+  .status { color: var(--bad); font-weight: 700; font-size: 10px; text-transform: uppercase; }
+  .moves { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin: 0; padding: 0; list-style: none; font-size: 11px; }
+  .move { display: flex; gap: 4px; min-width: 0; color: var(--text-2); }
+  .move .mv { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .move .pp { margin-left: auto; font-family: var(--mono); color: var(--muted); }
+  .move.no-pp .pp, .move.no-pp .mv { color: var(--bad); }
+  .warn-strip { background: var(--human-deep); color: var(--human); border-radius: var(--r); padding: 6px 8px; font-size: 12px; }
+
+  /* ---------- Stage ---------- */
+  .stage { grid-area: stage; display: flex; flex-direction: column; gap: var(--gap); min-height: 0; min-width: 0; }
+  .screen-wrap { flex: 1; min-height: 0; position: relative; container-type: size; display: grid; place-items: center; }
+  /* The largest 3:2 box that fits both ways: the GBA picture never crops or letterboxes. */
+  .screen {
+    width: min(100cqw, 150cqh); aspect-ratio: 3 / 2; background: #000; position: relative;
+    border-radius: var(--r-lg); overflow: hidden; border: 1px solid var(--line);
+  }
   .screen img { width: 100%; height: 100%; display: block; image-rendering: pixelated; }
-  aside { background: var(--panel); border-radius: 10px; padding: 14px; }
-  aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
-  table { border-collapse: collapse; width: 100%; margin-bottom: 14px; }
-  td { padding: 3px 0; }
-  td:first-child { color: var(--muted); }
-  kbd { background: var(--key); border-radius: 4px; padding: 1px 6px; font: 12px ui-monospace, monospace; }
-  .pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 6px; justify-content: center; margin: 8px 0 14px; }
-  .pad button, .face button, .sys button {
-    background: var(--key); color: var(--text); border: 0; border-radius: 8px;
-    height: 44px; font-weight: 600; cursor: pointer;
+  .screen.stale img { opacity: .35; filter: grayscale(1); }
+  .live {
+    position: absolute; top: 10px; left: 10px; display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(0, 0, 0, .62); color: #fff; font-size: 11px; font-weight: 600; padding: 3px 8px;
+    border-radius: 999px; backdrop-filter: blur(6px);
   }
-  .pad button:active, .face button:active, .sys button:active, .pressed { background: var(--key-active) !important; color: #04140a !important; }
-  .face, .sys { display: flex; gap: 8px; justify-content: center; margin-bottom: 10px; }
-  .face button { width: 56px; border-radius: 50%; height: 56px; }
-  .sys button { padding: 0 14px; font-size: 12px; }
-  #status { color: var(--muted); font-size: 13px; min-height: 1.4em; }
-  #saved { color: var(--muted); font-size: 12px; min-height: 1.2em; }
-  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--ai); }
+  .live.human i { background: var(--human); }
+  /* Over the frozen picture rather than above it, so the layout doesn't jump. */
   #offline {
-    display: none; width: 100%; max-width: 980px; margin-bottom: 12px; padding: 10px 14px;
-    border-radius: 8px; background: #b3261e; color: #fff; font-weight: 600;
+    position: absolute; inset: auto 12px 12px 12px; display: none; background: #b3261e; color: #fff;
+    border-radius: var(--r); padding: 9px 12px; font-weight: 600;
   }
   #offline.show { display: block; }
-  .screen.stale img { opacity: .35; filter: grayscale(1); }
+  #offline code { font-family: var(--mono); font-weight: 400; }
 
-  /* Live panels: three columns on wide windows, stacked below ~900px. */
-  .panels {
-    width: 100%; max-width: 1400px; margin-top: 16px; display: grid; gap: 16px;
-    grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start;
+  .objstrip { display: grid; grid-template-columns: 1fr 1fr; flex: none; height: var(--strip-h); overflow: hidden; }
+  .obj-cell { padding: 9px 12px; min-width: 0; display: grid; gap: 4px; align-content: start; }
+  .obj-cell + .obj-cell { border-left: 1px solid var(--line); }
+  .obj-top { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); }
+  .obj-top .label { font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+  .meter { flex: 1; height: 3px; background: var(--sunken); border-radius: 2px; overflow: hidden; max-width: 120px; }
+  .meter i { display: block; height: 100%; background: var(--ai); }
+  .obj-top .num { margin-left: auto; }
+  .obj-desc {
+    font-weight: 550; color: var(--text); overflow: hidden; display: -webkit-box;
+    -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
   }
-  @media (max-width: 900px) { .panels { grid-template-columns: minmax(0, 1fr); } }
-  .panel { background: var(--panel); border-radius: 10px; padding: 14px; min-width: 0; overflow-wrap: anywhere; }
-  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
-  .panel-body { max-height: 70vh; overflow-y: auto; position: relative; font-size: 13px; }
-  .empty { color: var(--muted); }
-  .t, .n, .dur, .when, .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .obj-target { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .obj-target b { color: var(--text-2); font-weight: 500; }
+  .linkish { background: none; border: 0; padding: 0; color: var(--text-2); cursor: pointer; font-size: 11px; }
+  .linkish:hover { color: var(--text); text-decoration: underline; }
 
-  .feed-paused { background: var(--warn); color: #1d1200; border-radius: 6px; padding: 4px 8px; margin-bottom: 8px; font-weight: 600; }
-  .step, .event { border-bottom: 1px solid var(--line); padding: 7px 0; }
+  .dock { flex: none; display: flex; flex-direction: row; align-items: center; gap: 18px; padding: 0 14px; height: var(--dock-h); }
+  .dock.locked .pad, .dock.locked .face, .dock.locked .sys { opacity: .45; }
+  .pad { display: grid; grid-template-columns: repeat(3, 28px); grid-template-rows: repeat(3, 22px); gap: 3px; }
+  .key {
+    background: var(--raised); border: 1px solid var(--line-strong); border-radius: 5px; cursor: pointer;
+    display: grid; place-items: center; font-weight: 600; font-size: 11px; color: var(--text-2); padding: 0;
+  }
+  .key:hover { border-color: var(--muted); color: var(--text); }
+  .key:active, .key.pressed { background: var(--human); border-color: var(--human); color: var(--on-human); }
+  .pad .up { grid-area: 1 / 2; } .pad .left { grid-area: 2 / 1; }
+  .pad .right { grid-area: 2 / 3; } .pad .down { grid-area: 3 / 2; }
+  .face { display: flex; gap: 8px; align-items: center; }
+  .face .key { width: 40px; height: 40px; border-radius: 50%; font-size: 14px; position: relative; }
+  .face .b { translate: 0 6px; }
+  /* The keyboard key printed on each button replaces the old keyboard table. */
+  .cap {
+    position: absolute; bottom: -6px; right: -6px; font: 600 9px/1 var(--mono); padding: 2px 3px;
+    background: var(--sunken); border: 1px solid var(--line-strong); border-radius: 3px; color: var(--muted);
+  }
+  .sys { display: flex; gap: 6px; }
+  .sys .key { height: 26px; padding: 0 10px; border-radius: 999px; font-size: 10px; letter-spacing: .06em; gap: 6px; display: inline-flex; }
+  .sys .cap { position: static; }
+  .dock-msg { margin-left: auto; text-align: right; min-width: 0; font-size: 12px; display: grid; gap: 2px; }
+  #lockline, #status { color: var(--text-2); }
+  #saved { color: var(--muted); font-size: 11px; }
+
+  /* ---------- Activity rail ---------- */
+  .feed { grid-area: feed; }
+  .tabs { display: flex; gap: 2px; padding: 6px 6px 0; border-bottom: 1px solid var(--line); }
+  .tab {
+    background: none; border: 0; border-bottom: 2px solid transparent; padding: 6px 10px 8px; cursor: pointer;
+    color: var(--muted); font-weight: 600; display: inline-flex; gap: 6px; align-items: center;
+  }
+  .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--text); }
+  .tab .count { font-family: var(--mono); font-weight: 400; font-size: 11px; color: var(--muted); }
+  .tabpanel { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .tabpanel[hidden] { display: none; }
+
+  .strip-wrap { padding: 10px 12px 8px; border-bottom: 1px solid var(--line); display: grid; gap: 6px; }
+  .strip { display: flex; align-items: flex-end; gap: 3px; height: 30px; }
+  .bar { flex: 1; min-height: 3px; border-radius: 2px; background: color-mix(in srgb, var(--ai) 70%, transparent); }
+  .bar.fail { background: var(--bad); }
+  .bar.pending { background: var(--ai); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .bar.pending { animation: none; } }
+  .strip-legend { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+  .inflight {
+    margin: 10px 12px 0; padding: 8px 10px; border-radius: var(--r); background: var(--raised);
+    border: 1px dashed var(--line-strong); display: flex; gap: 8px; align-items: baseline;
+  }
+  .inflight .model { margin-left: auto; }
+  .thinking { color: var(--ai); font-weight: 600; }
+  .feed-paused { margin: 10px 12px 0; background: var(--human-deep); color: var(--human); border-radius: var(--r); padding: 6px 10px; font-weight: 600; }
+  .steps { padding: 4px 12px 12px; }
+  .step, .event { border-bottom: 1px solid var(--line); padding: 8px 0; }
   .step { cursor: pointer; }
-  .step-head { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; }
+  .step-head { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .t, .n, .dur, .when { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .call { font: 12px var(--mono); color: var(--ai); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .step-head .dur { margin-left: auto; }
-  .call { font: 12px ui-monospace, monospace; color: var(--accent); }
-  .step-head .model { font-size: 11px; color: var(--muted); border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; }
+  .model { font-size: 10px; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 4px; white-space: nowrap; }
   .reasoning, .result { margin-top: 3px; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; }
-  .reasoning { -webkit-line-clamp: 3; line-clamp: 3; }
+  .reasoning { -webkit-line-clamp: 2; line-clamp: 2; }
   .result { -webkit-line-clamp: 2; line-clamp: 2; color: var(--muted); }
   .step.open .reasoning, .step.open .result { display: block; }
+  .step.fail { box-shadow: inset 2px 0 0 var(--bad); padding-left: 8px; }
   .result.fail { color: var(--bad); }
-  .step.fail { border-left: 3px solid var(--bad); padding-left: 6px; }
-  .inflight { cursor: default; }
-  .thinking { color: var(--warn); font-weight: 600; }
-  .event { display: flex; gap: 8px; }
-  .ev-pause span:last-child { color: var(--warn); }
-  .ev-resume span:last-child { color: var(--accent); }
+  .inflight-row { cursor: default; }
+  .event { display: flex; gap: 8px; color: var(--text-2); }
+  .ev-pause span:last-child { color: var(--human); }
+  .ev-resume span:last-child { color: var(--ai); }
+  .event.restart { justify-content: center; color: var(--muted); font-size: 11px; }
 
-  .party-sum { display: grid; gap: 2px; margin-bottom: 8px; }
-  .balls { color: var(--muted); }
-  .warn-strip { background: var(--warn); color: #1d1200; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
-  .mons { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
-  .mon { background: var(--inset); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
-  .mon.fainted { opacity: .6; }
-  .mon-head { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
-  .species { font-weight: 700; }
-  .nick { color: var(--muted); }
-  .lv { margin-left: auto; color: var(--muted); }
-  .tag.lead { background: var(--accent); color: #04140a; border-radius: 4px; padding: 0 5px; font-size: 11px; font-weight: 700; }
-  .hpbar { height: 6px; background: var(--key); border-radius: 3px; margin: 6px 0 2px; overflow: hidden; }
-  .hp-fill { height: 100%; }
-  .hp-high { background: var(--accent); }
-  .hp-mid { background: var(--mid); }
-  .hp-low { background: var(--bad); }
-  .hp-zero { background: var(--muted); }
-  .hp-text, .ability { color: var(--muted); font-size: 12px; }
-  .status { color: var(--bad); font-weight: 600; }
-  .moves { list-style: none; margin: 6px 0 0; padding: 0; font-size: 12px; }
-  .move { display: flex; gap: 6px; }
-  .move .type { color: var(--muted); font-size: 10px; align-self: center; }
-  .move .pp { margin-left: auto; font-variant-numeric: tabular-nums; }
-  .move.no-pp .pp { color: var(--bad); }
-
-  .prog-top { position: sticky; top: 0; background: var(--panel); padding-bottom: 6px; z-index: 1; }
-  .prog-head { font-weight: 600; margin-bottom: 6px; }
-  .pips { display: flex; flex-wrap: wrap; gap: 4px; }
-  .pip { border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; font-size: 11px; color: var(--muted); }
-  .pip.earned { background: var(--accent); border-color: var(--accent); color: #04140a; font-weight: 600; }
-  .chap-head {
-    width: 100%; display: flex; gap: 6px; align-items: baseline; background: none; border: 0; padding: 6px 0;
-    color: var(--text); font: inherit; font-weight: 600; cursor: pointer; text-align: left;
-    border-bottom: 1px solid var(--line);
+  .prog { padding: 0 12px 12px; }
+  .prog-top {
+    position: sticky; top: 0; background: var(--surface); padding: 10px 0 8px; z-index: 1;
+    display: grid; gap: 6px; border-bottom: 1px solid var(--line);
   }
-  .chap-head .count { margin-left: auto; font-weight: 400; }
+  .seg { display: inline-flex; justify-self: start; background: var(--sunken); border: 1px solid var(--line); border-radius: var(--r); padding: 2px; }
+  .seg button { background: none; border: 0; padding: 3px 10px; border-radius: 4px; cursor: pointer; color: var(--muted); font-size: 12px; }
+  .seg button[aria-pressed="true"] { background: var(--raised); color: var(--text); box-shadow: inset 0 0 0 1px var(--line-strong); }
+  .pips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pip { border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 7px; font-size: 11px; color: var(--muted); }
+  .pip.earned { background: var(--ai-deep); border-color: transparent; color: var(--ai); font-weight: 600; }
+  .chap-head {
+    width: 100%; display: flex; gap: 6px; align-items: baseline; background: none; border: 0; padding: 8px 0;
+    font-weight: 600; cursor: pointer; text-align: left; border-bottom: 1px solid var(--line);
+  }
+  .chap-head .count { margin-left: auto; font-weight: 400; color: var(--muted); font-family: var(--mono); font-size: 11px; }
   .chapter.finished .chap-name { color: var(--muted); }
   .objs { list-style: none; margin: 0; padding: 0; }
-  .obj { display: flex; gap: 6px; padding: 3px 0; }
+  .obj { display: flex; gap: 8px; padding: 4px 0; }
   .obj .mark { width: 1em; flex: none; text-align: center; }
   .obj .desc { flex: 1; min-width: 0; }
-  .obj.done .mark { color: var(--accent); }
+  .obj.done .mark { color: var(--ai); }
   .obj.done .desc { color: var(--muted); }
   .obj.upcoming .mark { color: var(--muted); }
-  .obj.current { background: var(--inset); border-left: 3px solid var(--warn); padding: 6px; border-radius: 4px; }
-  .obj.current .mark { color: var(--warn); }
+  .obj.current { background: var(--raised); box-shadow: inset 2px 0 0 var(--text); border-radius: var(--r); padding: 7px 8px; margin: 4px 0; }
   .obj.current .desc > div:first-child { font-weight: 600; }
-  .hint, .target { color: var(--muted); margin-top: 2px; }
-  .battle-head { font-size: 13px; margin: 14px 0 4px; display: flex; gap: 6px; }
-  .battle-head .count { margin-left: auto; font-weight: 400; }
+  .hint, .target { color: var(--text-2); margin-top: 3px; font-size: 12px; }
+
+  /* ---------- Narrower windows ---------- */
+  @media (max-width: 1180px) {
+    main {
+      grid-template-columns: minmax(0, 1fr) 340px; grid-template-rows: auto minmax(0, 1fr);
+      grid-template-areas: "party party" "stage feed";
+    }
+    .party .card-head { display: none; }
+    .mons { flex-direction: row; overflow-x: auto; overflow-y: hidden; }
+    .mon { flex: 1 0 150px; }
+    .moves { display: none; }
+    .fact.balls { display: none; }
+  }
+  @media (max-width: 760px) {
+    body { height: auto; overflow: auto; }
+    /* Stacked, the page scrolls, so the fixed desktop chrome heights are released. */
+    .topbar, .objstrip, .dock { height: auto; }
+    .topbar { flex-wrap: wrap; padding: 8px 12px; row-gap: 8px; }
+    .facts { order: 3; flex-basis: 100%; overflow-x: auto; }
+    main { grid-template-columns: minmax(0, 1fr); grid-template-areas: "stage" "party" "feed"; }
+    .screen-wrap { flex: none; container-type: inline-size; }
+    .screen { width: 100%; }
+    .objstrip { grid-template-columns: 1fr; }
+    .obj-cell + .obj-cell { border-left: 0; border-top: 1px solid var(--line); }
+    .dock { flex-wrap: wrap; justify-content: center; padding: 12px 14px; }
+    .dock-msg { flex-basis: 100%; text-align: center; margin: 0; }
+    .pad { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 40px); }
+    .face .key { width: 52px; height: 52px; }
+    .feed { height: 70vh; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <h1>Pokémon Emerald — Controller</h1>
-  <button id="mode" class="ai" title="Pause the AI and take control, or hand control back">AI is playing — take control</button>
+<header class="topbar">
+  <h1 class="brand"><span class="brand-mark" aria-hidden="true"></span>Emerald <small>Controller</small></h1>
+  <div class="facts" id="facts"></div>
+  <span class="conn" id="conn" title="Game server connected"></span>
+  <button id="mode" class="switch" aria-pressed="false" title="AI is playing: click to take control">
+    <span class="s-ai">AI playing</span><span class="s-you">You</span>
+  </button>
 </header>
-<div id="offline" role="alert">Game server not responding — the picture below is frozen. Run <code>./play-local.sh</code> to resume from the last checkpoint.</div>
+
 <main>
-  <div class="screen" id="screen"><img id="frame" alt="Game screen"></div>
-  <aside>
-    <h2>Keyboard</h2>
-    <table>
-      <tr><td>D-pad</td><td><kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd></td></tr>
-      <tr><td>A</td><td><kbd>X</kbd></td></tr>
-      <tr><td>B</td><td><kbd>Z</kbd></td></tr>
-      <tr><td>Start</td><td><kbd>Return</kbd></td></tr>
-      <tr><td>Select</td><td><kbd>Delete</kbd></td></tr>
-    </table>
-    <div class="pad">
-      <span></span><button data-btn="UP">▲</button><span></span>
-      <button data-btn="LEFT">◀</button><span></span><button data-btn="RIGHT">▶</button>
-      <span></span><button data-btn="DOWN">▼</button><span></span>
+  <section class="card party" aria-label="Party">
+    <h2 class="card-head">Party <span class="right" id="party-health"></span></h2>
+    <div class="mons" id="party"></div>
+  </section>
+
+  <section class="stage" aria-label="Game">
+    <div class="screen-wrap">
+      <div class="screen" id="screen">
+        <img id="frame" alt="Game screen">
+        <span class="live" id="live"><i></i><span id="live-text">AI playing</span></span>
+        <div id="offline" role="alert">Game server not responding: the picture is frozen. Run <code>./play-local.sh</code> to resume from the last checkpoint.</div>
+      </div>
     </div>
-    <div class="face"><button data-btn="B">B</button><button data-btn="A">A</button></div>
-    <div class="sys"><button data-btn="SELECT">SELECT</button><button data-btn="START">START</button></div>
-    <div id="status"></div>
-    <div id="saved"></div>
-    <div class="note">Take control first so the AI doesn't press buttons at the same time. The AI resumes when you hand control back. While you play, progress is checkpointed every minute.</div>
-  </aside>
+
+    <div class="card objstrip" id="objstrip" aria-label="Current objectives"></div>
+
+    <div class="card dock locked" id="dock" aria-label="Controls">
+      <div class="pad">
+        <button class="key up" data-btn="UP" aria-label="Up (arrow key)">▲</button>
+        <button class="key left" data-btn="LEFT" aria-label="Left (arrow key)">◀</button>
+        <button class="key right" data-btn="RIGHT" aria-label="Right (arrow key)">▶</button>
+        <button class="key down" data-btn="DOWN" aria-label="Down (arrow key)">▼</button>
+      </div>
+      <div class="face">
+        <button class="key b" data-btn="B" aria-label="B (Z key)">B<span class="cap">Z</span></button>
+        <button class="key a" data-btn="A" aria-label="A (X key)">A<span class="cap">X</span></button>
+      </div>
+      <div class="sys">
+        <button class="key" data-btn="SELECT" aria-label="Select (Delete key)">SELECT <span class="cap">⌫</span></button>
+        <button class="key" data-btn="START" aria-label="Start (Return key)">START <span class="cap">↵</span></button>
+      </div>
+      <div class="dock-msg">
+        <div id="lockline"></div>
+        <div id="status" role="status"></div>
+        <div id="saved"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card feed" aria-label="AI activity and objectives">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" id="tab-feed" aria-selected="true" aria-controls="panel-feed">What the AI is doing <span class="count" id="step-count"></span></button>
+      <button class="tab" role="tab" id="tab-progress" aria-selected="false" aria-controls="panel-progress">Objectives <span class="count" id="obj-count"></span></button>
+    </div>
+    <div class="tabpanel" id="panel-feed" role="tabpanel" aria-labelledby="tab-feed">
+      <div class="panel-body" id="feed"></div>
+    </div>
+    <div class="tabpanel" id="panel-progress" role="tabpanel" aria-labelledby="tab-progress" hidden>
+      <div class="panel-body" id="progress"></div>
+    </div>
+  </section>
 </main>
-<div class="panels">
-  <section class="panel"><h2>What the AI is doing</h2><div class="panel-body" id="feed"></div></section>
-  <section class="panel"><h2>Party</h2><div class="panel-body" id="party"></div></section>
-  <section class="panel"><h2>Progress</h2><div class="panel-body" id="progress"></div></section>
-</div>
 <script src="/play_panels.js"></script>
 <script>
 const base = window.location.origin;
@@ -184,6 +367,11 @@ const modeBtn = document.getElementById("mode");
 const statusEl = document.getElementById("status");
 const savedEl = document.getElementById("saved");
 const offlineEl = document.getElementById("offline");
+const dockEl = document.getElementById("dock");
+const liveEl = document.getElementById("live");
+const liveText = document.getElementById("live-text");
+const lockline = document.getElementById("lockline");
+const connEl = document.getElementById("conn");
 const KEYS = { ArrowUp: "UP", ArrowDown: "DOWN", ArrowLeft: "LEFT", ArrowRight: "RIGHT",
                x: "A", X: "A", z: "B", Z: "B", Enter: "START", Backspace: "SELECT" };
 const DPAD = new Set(["UP", "DOWN", "LEFT", "RIGHT"]);
@@ -206,12 +394,20 @@ function setOnline(ok) {
   online = ok;
   offlineEl.classList.toggle("show", !ok);
   screenEl.classList.toggle("stale", !ok);
+  connEl.classList.toggle("off", !ok);
+  connEl.title = ok ? "Game server connected" : "Game server not responding";
   modeBtn.disabled = !ok;
 }
 
 function renderMode() {
-  modeBtn.className = paused ? "human" : "ai";
-  modeBtn.textContent = paused ? "You are playing — hand back to AI" : "AI is playing — take control";
+  modeBtn.setAttribute("aria-pressed", String(paused));
+  modeBtn.title = paused ? "You are playing: click to hand back to the AI" : "AI is playing: click to take control";
+  dockEl.classList.toggle("locked", !paused);
+  liveEl.classList.toggle("human", paused);
+  liveText.textContent = paused ? "You have control" : "AI playing";
+  lockline.textContent = paused
+    ? "You have control. Progress is checkpointed every minute; the AI resumes when you hand back."
+    : "Take control first, so the AI doesn't press buttons at the same time.";
 }
 
 let serverId = null;  // /health's server_id when this page loaded
@@ -319,13 +515,19 @@ async function pollFrame() {
 const feedEl = document.getElementById("feed");
 const partyEl = document.getElementById("party");
 const progressEl = document.getElementById("progress");
+const factsEl = document.getElementById("facts");
+const stripEl = document.getElementById("objstrip");
+const partyHealthEl = document.getElementById("party-health");
+const stepCountEl = document.getElementById("step-count");
+const objCountEl = document.getElementById("obj-count");
 const PANELS_EVERY_MS = 2000;
-const expandedSteps = {};  // step number -> reasoning expanded
+const expandedSteps = {};  // step key -> reasoning expanded
 const openChapters = {};   // chapter key -> open, only for chapters the user toggled
+let track = "story";       // which list the Objectives tab shows: "story" or "battle"
 let panelsInFlight = false;
 let lastFeed = null, lastDash = null, lastObjectives = null;
 let serverSkewMs = 0;      // browser clock minus server clock, from feed.now
-let scrolledToId = null;
+let scrolledTo = null;
 
 function setHtml(el, html) {
   if (el.dataset.html === html) return;
@@ -336,7 +538,10 @@ function setHtml(el, html) {
 function serverNow() { return Date.now() - serverSkewMs; }
 
 function drawProgress() {
-  setHtml(progressEl, renderProgress(lastObjectives, lastDash && lastDash.badges, openChapters));
+  setHtml(progressEl, renderProgress(lastObjectives, lastDash && lastDash.badges, openChapters, track));
+  setHtml(stripEl, renderObjectiveStrip(lastObjectives));
+  const story = lastObjectives ? trackSummary(lastObjectives.story) : null;
+  objCountEl.textContent = story && story.total ? `${story.done}/${story.total}` : "";
 }
 
 async function pollPanels() {
@@ -352,29 +557,56 @@ async function pollPanels() {
       const now = parseUtc(lastFeed.now);
       if (Number.isFinite(now)) serverSkewMs = Date.now() - now;
       setHtml(feedEl, renderFeed(lastFeed, serverNow(), expandedSteps));
+      const f = lastFeed.in_flight;
+      const newest = f ? f.step : lastFeed.steps && lastFeed.steps[0] ? lastFeed.steps[0].step : null;
+      stepCountEl.textContent = newest === null ? "" : `#${newest}`;
     }
     if (dash.status === "fulfilled") {
       lastDash = dash.value;
       setHtml(partyEl, renderParty(lastDash));
+      setHtml(factsEl, renderFacts(lastDash));
+      partyHealthEl.textContent = partyHealth(lastDash);
     }
     if (objs.status === "fulfilled") lastObjectives = objs.value;
     if (objs.status === "fulfilled" || dash.status === "fulfilled") drawProgress();
-    scrollToCurrentObjective();
+    scrollToCurrentObjective(false);
   } finally {
     panelsInFlight = false;
   }
 }
 
-// Only when the current objective changes, so reading further down isn't undone every poll.
-function scrollToCurrentObjective() {
-  const id = lastObjectives && lastObjectives.story ? lastObjectives.story.current_id : null;
-  if (!id || id === scrolledToId) return;
+// Only when the current objective (or the list shown) changes, so reading further
+// down isn't undone every poll; a hidden panel has no layout to scroll, so wait.
+function scrollToCurrentObjective(force) {
+  if (!lastObjectives || progressEl.closest("[hidden]")) return;
+  const list = track === "battle" ? lastObjectives.battling : lastObjectives.story;
+  const key = `${track}:${list ? list.current_id : ""}`;
+  if (!list || !list.current_id || (key === scrolledTo && !force)) return;
   const target = progressEl.querySelector(".scroll-target");
   if (!target) return;
-  scrolledToId = id;
+  scrolledTo = key;
   const sticky = progressEl.querySelector(".prog-top");
   progressEl.scrollTop = target.offsetTop - (sticky ? sticky.offsetHeight : 0) - 8;
 }
+
+function selectTab(which) {
+  const showProgress = which === "progress";
+  document.getElementById("tab-feed").setAttribute("aria-selected", String(!showProgress));
+  document.getElementById("tab-progress").setAttribute("aria-selected", String(showProgress));
+  document.getElementById("panel-feed").hidden = showProgress;
+  document.getElementById("panel-progress").hidden = !showProgress;
+  if (showProgress) scrollToCurrentObjective(true);
+}
+document.getElementById("tab-feed").addEventListener("click", () => selectTab("feed"));
+document.getElementById("tab-progress").addEventListener("click", () => selectTab("progress"));
+
+stripEl.addEventListener("click", (e) => {
+  const link = e.target.closest("[data-open-track]");
+  if (!link) return;
+  track = link.dataset.openTrack;
+  drawProgress();
+  selectTab("progress");
+});
 
 feedEl.addEventListener("click", (e) => {
   if (window.getSelection().toString()) return;  // selecting text to copy, not toggling
@@ -386,6 +618,13 @@ feedEl.addEventListener("click", (e) => {
 });
 
 progressEl.addEventListener("click", (e) => {
+  const seg = e.target.closest("[data-track]");
+  if (seg) {
+    track = seg.dataset.track;
+    drawProgress();
+    scrollToCurrentObjective(true);
+    return;
+  }
   const head = e.target.closest("[data-chapter]");
   if (!head) return;
   openChapters[head.dataset.chapter] = head.getAttribute("aria-expanded") !== "true";
@@ -399,6 +638,7 @@ setInterval(() => {
   el.textContent = `thinking… ${fmtElapsed(Number(el.dataset.sinceMs), serverNow())}`;
 }, 1000);
 
+renderMode();
 refreshState();
 setInterval(refreshState, 3000);
 pollFrame();

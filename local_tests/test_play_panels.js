@@ -52,7 +52,7 @@ const tests = {
   test_no_status_shows_nothing() {
     const mon = { slot: 2, species: "NUMEL", level: 19, hp: 55, max_hp: 55, status: "NONE", moves: [] };
     const html = P.renderParty({ party: [mon], badges: [], balls: [] });
-    assert.ok(html.includes("55/55 HP") && !html.includes("NONE") && !html.includes('class="status"'), html);
+    assert.ok(html.includes('<span class="hp-text">55/55</span>') && !html.includes("NONE") && !html.includes('class="status"'), html);
     const poisoned = P.renderParty({ party: [{ ...mon, status: "PSN" }], badges: [], balls: [] });
     assert.ok(poisoned.includes('<span class="status">PSN</span>'), poisoned);
   },
@@ -155,40 +155,63 @@ const tests = {
     assert.ok(P.renderFeed(null, NOW).includes("Waiting"));
   },
 
-  test_party_summary() {
-    const html = P.renderParty(DASH);
-    assert.ok(html.includes("<b>ROUTE 112</b> (7, 47)"));
+  // The 2026-11-04 redesign moved where-the-run-stands from the party panel's head to
+  // the top bar, so it stays in view; the EXP warning stays above the party.
+  test_top_bar_facts() {
+    const html = P.renderFacts(DASH);
+    assert.ok(html.includes('<b>ROUTE 112</b> <span class="muted mono">7, 47</span>'), html);
     assert.ok(html.includes("₽18,921"));
     assert.ok(html.includes("Badges 3/8"));
+    assert.strictEqual(html.split('class="badge earned"').length - 1, 3);
+    assert.strictEqual(html.split('class="badge"').length - 1, 5);
     assert.ok(html.includes("Poke Ball ×22 · Great Ball ×5"));
+    assert.ok(P.renderFacts({ ...DASH, balls: [] }).includes("No balls"));
+    assert.ok(P.renderFacts({ ...DASH, location: "<x>" }).includes("<b>&lt;x&gt;</b>"));
+    assert.strictEqual(P.renderFacts(null), "");
+  },
+
+  test_party_exp_warning_and_health() {
+    const html = P.renderParty(DASH);
     assert.ok(html.includes('class="warn-strip">EXP: BRELOOM is Lv38'));
     assert.ok(html.includes("set_lead(&quot;AZUMARILL&quot;)"));
     assert.ok(!P.renderParty({ ...DASH, exp_note: "" }).includes("warn-strip"));
+    // (70+12+0+20+47) / (106+78+70+52+50); the egg's 0/0 doesn't count.
+    assert.strictEqual(P.partyHealth(DASH), "42% HP");
+    assert.strictEqual(P.partyHealth({ party: [] }), "");
   },
 
   test_party_cards() {
     const html = P.renderParty(DASH);
     assert.strictEqual(html.split('class="mon-head"').length - 1, 6, "six cards");
-    const lead = slice(html, "BRELOOM</span>", '<div class="mon');
+    // The compact cards (2026-11-04 redesign) keep the nickname, ability and move type,
+    // as hover titles; the card head still starts at the species.
+    const card = (species) => slice(html, `>${species}</span>`, '<div class="mon');
+    const head = (species) => {
+      const at = html.indexOf(`>${species}</span>`);
+      const cardHead = html.lastIndexOf('<div class="mon-head">', at);
+      return html.slice(html.lastIndexOf('<div class="mon', cardHead - 1), at);
+    };
+    const lead = card("BRELOOM");
     assert.ok(lead.includes('<span class="tag lead">LEAD</span>'), lead);
-    assert.ok(!lead.includes('class="nick"'), "nickname equal to species is not repeated");
+    assert.ok(head("BRELOOM").startsWith('<div class="mon lead">'), head("BRELOOM"));
+    assert.ok(head("BRELOOM").includes('title="EFFECT SPORE"'), "nickname equal to species is not repeated");
     assert.strictEqual(html.split(">LEAD<").length - 1, 1, "only the lead is tagged");
-    assert.ok(lead.includes('<span class="mv">MACH PUNCH</span><span class="type">FIGHTING</span><span class="pp">25/30</span>'));
+    assert.ok(lead.includes('<li class="move" title="FIGHTING"><span class="mv">MACH PUNCH</span><span class="pp">25/30</span></li>'), lead);
     assert.ok(lead.includes('class="move no-pp"'), "a move with 0 PP is marked");
-    assert.ok(lead.includes("EFFECT SPORE"));
     assert.ok(lead.includes('hp-fill hp-high" style="width:66%"'), lead);
-    const azu = slice(html, "AZUMARILL</span>", '<div class="mon');
-    assert.ok(azu.includes("“Bubbles &amp; &lt;Co&gt;”"), azu);
+    assert.ok(lead.includes('<span class="hp-text">70/106</span>'), lead);
+    assert.ok(head("AZUMARILL").includes("“Bubbles &amp; &lt;Co&gt;”"), head("AZUMARILL"));
+    const azu = card("AZUMARILL");
     assert.ok(azu.includes("hp-low"), azu);
     assert.ok(azu.includes('<span class="status">PSN</span>'));
-    const fainted = slice(html, "GROVYLE</span>", '<div class="mon');
+    const fainted = card("GROVYLE");
     assert.ok(fainted.includes('hp-fill hp-zero" style="width:0%"'), fainted);
-    assert.ok(fainted.includes("Fainted"));
-    assert.ok(html.includes('<div class="mon fainted"><div class="mon-head"><span class="species">GROVYLE'));
-    assert.ok(slice(html, "TAILLOW</span>", '<div class="mon').includes("hp-mid"));
+    assert.ok(fainted.includes('<span class="status">Fainted</span>'));
+    assert.ok(head("GROVYLE").startsWith('<div class="mon fainted"><div class="mon-head"><span class="species"'), head("GROVYLE"));
+    assert.ok(card("TAILLOW").includes("hp-mid"));
     assert.ok(html.includes('<div class="mon egg"><div class="mon-head"><span class="species">Egg</span>'));
     assert.ok(!html.includes("WYNAUT"), "an egg's species stays hidden");
-    assert.ok(!slice(html, "NUMEL</span>", '<div class="mon').includes(">OK<"));
+    assert.ok(!card("NUMEL").includes(">OK<"));
   },
 
   test_group_chapters() {
@@ -199,7 +222,8 @@ const tests = {
 
   test_progress_header_badges_and_marks() {
     const html = P.renderProgress(OBJS, DASH.badges, {});
-    assert.ok(html.includes("5 of 11 story objectives done"));
+    assert.ok(html.includes('data-track="story" aria-pressed="true">Story <span class="mono">5/11</span>'), html);
+    assert.ok(html.includes('data-track="battle" aria-pressed="false">Battle <span class="mono">1/3</span>'), html);
     assert.strictEqual(html.split('class="pip earned"').length - 1, 3);
     assert.strictEqual(html.split('class="pip"').length - 1, 5);
     for (const name of ["Stone", "Knuckle", "Dynamo", "Heat", "Balance", "Feather", "Mind", "Rain"]) {
@@ -233,15 +257,59 @@ const tests = {
     assert.ok(!toggled.includes("Defeat Maxie"));
   },
 
+  // Since the 2026-11-04 redesign the panel shows one list at a time (Story | Battle),
+  // so the auto-scroll target is the current row of whichever list is shown.
   test_progress_battling_list() {
-    const html = P.renderProgress(OBJS, DASH.badges, {});
-    const battle = slice(html, "Battling goals", "</ol>");
-    assert.ok(battle.includes('<span class="count">1/3</span>'));
+    const story = P.renderProgress(OBJS, DASH.badges, {});
+    assert.ok(!story.includes("Win the Roxanne rematch"), "the story view leaves the battle list out");
+    assert.strictEqual(story.split("scroll-target").length - 1, 1, "one scroll target: the story's current row");
+    const html = P.renderProgress(OBJS, DASH.badges, {}, "battle");
+    assert.ok(html.includes('data-track="battle" aria-pressed="true"'), html);
+    const battle = slice(html, '<ol class="objs battling">', "</ol>");
     assert.ok(battle.includes("✓</span><span class=\"desc\">Win the Roxanne rematch"));
     assert.ok(battle.includes("▶</span>"));
     assert.ok(battle.includes("Train in the grass on ROUTE 112."));
     assert.ok(battle.includes("○</span><span class=\"desc\">Teach a Fire-type move"));
-    assert.ok(!battle.includes("scroll-target"), "auto-scroll only targets the story objective");
+    assert.strictEqual(html.split("scroll-target").length - 1, 1, battle);
+    assert.ok(!html.includes('data-chapter='), "the battle view leaves the story chapters out");
+    const none = { ...OBJS, battling: { done: 0, total: 0, current_id: null, objectives: [] } };
+    assert.ok(P.renderProgress(none, [], {}, "battle").includes("No battling goals."));
+  },
+
+  // Under the game screen: both current objectives, always in view.
+  test_objective_strip() {
+    const html = P.renderObjectiveStrip(OBJS);
+    const story = slice(html, 'data-track-cell="story"', 'data-track-cell="battle"');
+    assert.ok(story.includes('<span class="num">5/11</span>'), story);
+    assert.ok(story.includes('style="width:45%"'), story);
+    assert.ok(story.includes("Defeat Maxie"), story);
+    assert.ok(story.includes("Target <b>MT CHIMNEY</b>"), story);
+    assert.ok(story.includes('Maxie stands by the machine at the crater&#39;s edge.">Defeat Maxie'), "the hint is the title");
+    assert.ok(story.includes('data-open-track="story"'), story);
+    const battle = slice(html, 'data-track-cell="battle"', "</div></div></div>");
+    assert.ok(battle.includes('<span class="num">1/3</span>') && battle.includes("Target <b>ROUTE 112</b>"), battle);
+    const empty = { story: { done: 0, total: 0, objectives: [] }, battling: { done: 0, total: 0, objectives: [] } };
+    assert.ok(P.renderObjectiveStrip(empty).includes("Loading…"));
+    assert.ok(!P.renderObjectiveStrip(empty).includes("0 of 0"));
+    const finished = { ...OBJS, battling: { done: 1, total: 1, objectives: [{ id: "battle_001", status: "done", description: "x" }] } };
+    assert.ok(slice(P.renderObjectiveStrip(finished), 'data-track-cell="battle"', "</div></div></div>").includes("All done."));
+    assert.ok(P.renderObjectiveStrip(null).includes("Waiting"));
+  },
+
+  // One bar per step, oldest first; height is time taken relative to the slowest.
+  test_step_strip() {
+    const html = P.renderStrip(FEED);
+    const bars = html.split('<span class="bar').slice(1).map((b) => b.slice(0, b.indexOf("</span>")));
+    // FEED newest first: 60 (33.2 s), 59 (12.8 s), 58 (failed, 6 s), 57 (running); then the in-flight #61.
+    assert.strictEqual(bars.length, 5, html);
+    assert.ok(bars[0].startsWith(' pending"') && bars[0].includes("Step 57"), bars[0]);
+    assert.ok(bars[1].startsWith(' fail" style="height:18%"') && bars[1].includes("Step 58"), bars[1]);
+    assert.ok(bars[2].startsWith('" style="height:39%"'), bars[2]);
+    assert.ok(bars[3].startsWith('" style="height:100%"') && bars[3].includes("Step 60"), bars[3]);
+    assert.ok(bars[4].includes("Step 61 thinking"), bars[4]);
+    assert.ok(html.includes("Last 4 steps") && html.includes("avg 17.3 s · 1 failed"), html);
+    assert.strictEqual(P.renderStrip({ steps: [] }), "");
+    assert.ok(P.renderFeed(FEED, NOW).indexOf("strip-wrap") < P.renderFeed(FEED, NOW).indexOf("inflight"));
   },
 
   test_progress_escapes_objective_text() {
@@ -253,7 +321,12 @@ const tests = {
 
   test_play_html_wiring() {
     const html = fs.readFileSync(path.join(ROOT, "server", "play.html"), "utf8");
-    for (const id of ['id="feed"', 'id="party"', 'id="progress"']) assert.ok(html.includes(id), id);
+    for (const id of ['id="feed"', 'id="party"', 'id="progress"', 'id="facts"', 'id="objstrip"', 'id="party-health"']) {
+      assert.ok(html.includes(id), id);
+    }
+    for (const call of ["renderFacts(", "renderObjectiveStrip(", "partyHealth(", "trackSummary("]) {
+      assert.ok(html.includes(call), call);
+    }
     assert.ok(html.includes('<script src="/play_panels.js"></script>'));
     for (const url of ['"/ai_feed"', '"/dashboard"', '"/objectives"']) assert.ok(html.includes(url), url);
     assert.ok(html.includes("pollFrame, 100"), "frame poll untouched");

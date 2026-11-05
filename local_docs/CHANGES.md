@@ -891,6 +891,24 @@ prompt. That came to 1.1 tiles walked per minute.
 - Checkpoints every minute while a human plays, plus at each hand-over and when the tab closes.
 - Shows an offline banner and visible errors.
 - A held arrow keeps walking (the `normal` speed preset); taps no longer just turn the player.
+- **One-screen layout (2026-11-04, David: "isn't designed efficiently where I can see everything
+  on one screen").** At 1512×727 the old page was 1263 px tall: the AI feed, party and progress
+  panels sat below the fold. Now, with no page scroll:
+  - Party rail: six compact cards (HP, level, four moves with PP). Nickname, ability and move
+    type moved to hover titles.
+  - Game stage: the screen, then a strip with the current story and battle objectives, then a
+    control dock with the keyboard key printed on each button (it replaces the keyboard table).
+    The stage column is as wide as a 3:2 screen at full height, so no width is lost beside it.
+  - Activity rail: a bar per recent step (height = time taken, red = failed), the thinking row,
+    and the steps; an Objectives tab shows one list at a time (Story | Battle) and scrolls to
+    its current row.
+  - Top bar: location, badges, money and balls, a connection dot, and the take-control button
+    as a two-state switch (AI playing | You).
+  - Narrower windows: party becomes a row below 1180 px; everything stacks below 760 px.
+  - Same endpoints, JSON and behaviour (checkpoints, keys, reload on restart, feed events).
+  - *Verified:* `test_play_panels.js` 24/24, with new tests for the top bar, objective strip,
+    step strip, party health and the battle list; rendered against the live server at
+    1512×727 (727 px tall, no scroll), 1060 px and 390 px.
 
 **`hints/emerald_hints.json`**: 7 hints seeded into the AI's memory, deduplicated by title.
 

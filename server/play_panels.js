@@ -1,4 +1,5 @@
-// Renderers for the controller page's live panels (AI feed, party, progress).
+// Renderers for the controller page (top bar facts, party rail, objective strip,
+// activity feed, objectives panel).
 // Pure functions: JSON in, HTML string out, no DOM access, so
 // local_tests/test_play_panels.js can exercise them under plain node.
 // play.html does the polling, DOM writes and click handling.
@@ -85,6 +86,28 @@ const PlayPanels = (() => {
     return `${tool || "?"}(${inner})`;
   }
 
+  // ---------- Top bar ----------
+
+  // Where the run stands, as chips in the top bar: location, badges, money, balls.
+  // These used to head the party panel, below the fold on a laptop screen.
+  function renderFacts(dash) {
+    if (!dash) return "";
+    const pos = Array.isArray(dash.position) && dash.position.length >= 2
+      ? ` <span class="muted mono">${escapeHtml(dash.position[0])}, ${escapeHtml(dash.position[1])}</span>` : "";
+    const badges = Array.isArray(dash.badges) ? dash.badges : [];
+    const earned = badges.filter(Boolean).length;
+    const dots = BADGE_NAMES.map((name, i) =>
+      `<span class="badge${badges[i] ? " earned" : ""}" title="${name} Badge${badges[i] ? "" : " (not yet)"}"></span>`).join("");
+    const balls = (Array.isArray(dash.balls) ? dash.balls : [])
+      .map((b) => `${escapeHtml(b.name)} ×${escapeHtml(b.count)}`).join(" · ");
+    return `<span class="fact loc" title="Location"><b>${escapeHtml(dash.location || "Unknown")}</b>${pos}</span>`
+      + `<span class="fact" title="Badges"><span class="badges">${dots}</span><b class="mono">Badges ${earned}/8</b></span>`
+      + `<span class="fact" title="Money"><b class="mono">₽${fmtMoney(dash.money)}</b></span>`
+      + `<span class="fact balls" title="Balls">${balls || "No balls"}</span>`;
+  }
+
+  // ---------- Activity feed ----------
+
   function stepRow(s, expanded) {
     // Step numbers start again at each server restart: the time keeps the key unique.
     const key = `${s.step}@${s.time}`;
@@ -118,6 +141,32 @@ const PlayPanels = (() => {
       + `<span class="t">${fmtClock(parseUtc(e.time))}</span><span>${label}</span></div>`;
   }
 
+  // One bar per recent step, oldest on the left: height is the time it took, red a
+  // failure, a pulsing bar the step still running. The run's rhythm at a glance
+  // (stalls, a run of failures) before reading any rows.
+  function renderStrip(feed) {
+    const steps = (feed && Array.isArray(feed.steps) ? feed.steps : []).slice().reverse();
+    if (!steps.length) return "";
+    const longest = Math.max(1, ...steps.map((s) => Number(s.duration_s) || 0));
+    const bars = steps.map((s) => {
+      const d = Number(s.duration_s) || 0;
+      const running = s.result === null || s.result === undefined;
+      const cls = s.success === false ? " fail" : running ? " pending" : "";
+      const height = Math.max(10, Math.round((d / longest) * 100));
+      // "Step 7", not "#7": the rows below own "#n", and tests find rows by it.
+      const label = `Step ${s.step} ${s.tool || "?"} · ${d ? `${d.toFixed(1)} s` : "running"}`;
+      return `<span class="bar${cls}" style="height:${height}%" title="${escapeHtml(label)}"></span>`;
+    });
+    const f = feed.in_flight;
+    if (f) bars.push(`<span class="bar pending" style="height:30%" title="Step ${escapeHtml(f.step)} thinking"></span>`);
+    const fails = steps.filter((s) => s.success === false).length;
+    const durs = steps.map((s) => Number(s.duration_s)).filter((d) => d > 0);
+    const avg = durs.length ? `${(durs.reduce((a, b) => a + b, 0) / durs.length).toFixed(1)} s` : "–";
+    return `<div class="strip-wrap"><div class="strip" aria-hidden="true">${bars.join("")}</div>`
+      + `<div class="strip-legend"><span>Last ${steps.length} steps</span>`
+      + `<span class="mono">avg ${avg} · ${fails} failed</span></div></div>`;
+  }
+
   // nowMs is "now" on the server's clock (play.html corrects for skew via feed.now),
   // so the thinking counter doesn't drift when the browser's clock is off.
   function renderFeed(feed, nowMs, expanded) {
@@ -135,17 +184,20 @@ const PlayPanels = (() => {
     const key = (ms) => (Number.isFinite(ms) ? ms : -Infinity);
     items.sort((a, b) => key(b.ms) - key(a.ms));
 
-    let html = feed.paused ? `<div class="feed-paused">AI is paused</div>` : "";
+    let html = renderStrip(feed);
+    if (feed.paused) html += `<div class="feed-paused">AI is paused</div>`;
     const f = feed.in_flight;
     if (f) {
       const since = parseUtc(f.since);
-      html += `<div class="step inflight"><div class="step-head">`
-        + `<span class="t">${fmtClock(since)}</span><span class="n">#${escapeHtml(f.step)}</span>`
+      // The model that chose the last step is the one thinking now, unless the
+      // backend switches mid-step (then the 🔁 row says so).
+      const model = steps[0] && steps[0].model ? `<span class="model">${escapeHtml(steps[0].model)}</span>` : "";
+      html += `<div class="inflight"><span class="n">#${escapeHtml(f.step)}</span>`
         + `<span class="thinking" data-since-ms="${Number.isFinite(since) ? since : ""}">`
-        + `thinking… ${fmtElapsed(since, nowMs)}</span></div></div>`;
+        + `thinking… ${fmtElapsed(since, nowMs)}</span>${model}</div>`;
     }
     if (!items.length && !f) return `${html}<div class="empty">No steps yet.</div>`;
-    return html + withRestartDividers(items).map((i) => i.html).join("");
+    return `${html}<div class="steps">${withRestartDividers(items).map((i) => i.html).join("")}</div>`;
   }
 
   // Newest first, step numbers fall; where an older step's number is not below the
@@ -166,6 +218,8 @@ const PlayPanels = (() => {
     return out;
   }
 
+  // ---------- Party rail ----------
+
   function hpClass(hp, max) {
     if (!(hp > 0)) return "hp-zero";
     const pct = max > 0 ? (hp / max) * 100 : 0;
@@ -173,6 +227,8 @@ const PlayPanels = (() => {
     return pct > 20 ? "hp-mid" : "hp-low";
   }
 
+  // A compact card: six have to fit the rail's height without scrolling, so the
+  // ability, nickname and move types move to hover titles.
   function monCard(p) {
     const lead = (p.lead === undefined ? p.slot === 1 : p.lead) ? `<span class="tag lead">LEAD</span>` : "";
     if (p.egg) {
@@ -182,41 +238,74 @@ const PlayPanels = (() => {
     const max = Number(p.max_hp) || 0;
     const pct = max > 0 ? Math.max(0, Math.min(100, Math.round((hp / max) * 100))) : 0;
     const nick = p.nickname && String(p.nickname).toUpperCase() !== String(p.species).toUpperCase()
-      ? ` <span class="nick">“${escapeHtml(p.nickname)}”</span>` : "";
+      ? `“${p.nickname}”` : "";
     let status = "";
-    if (hp <= 0) status = ` · <span class="status">Fainted</span>`;
+    if (hp <= 0) status = `<span class="status">Fainted</span>`;
     else if (p.status && !HEALTHY_STATUSES.has(String(p.status).toUpperCase())) {
-      status = ` · <span class="status">${escapeHtml(p.status)}</span>`;
+      status = `<span class="status">${escapeHtml(p.status)}</span>`;
     }
     const moves = (Array.isArray(p.moves) ? p.moves : []).map((m) => {
       const noPp = m.pp === 0 ? " no-pp" : "";
-      return `<li class="move${noPp}"><span class="mv">${escapeHtml(m.name)}</span>`
-        + `<span class="type">${escapeHtml(m.type)}</span>`
+      return `<li class="move${noPp}" title="${escapeHtml(m.type)}"><span class="mv">${escapeHtml(m.name)}</span>`
         + `<span class="pp">${escapeHtml(m.pp)}/${escapeHtml(m.max_pp)}</span></li>`;
     }).join("");
-    return `<div class="mon${hp <= 0 ? " fainted" : ""}">`
-      + `<div class="mon-head"><span class="species">${escapeHtml(p.species)}</span>${nick}`
-      + `<span class="lv">Lv${escapeHtml(p.level)}</span>${lead}</div>`
-      + `<div class="hpbar"><div class="hp-fill ${hpClass(hp, max)}" style="width:${pct}%"></div></div>`
-      + `<div class="hp-text">${hp}/${max} HP${status}</div>`
-      + (p.ability ? `<div class="ability">${escapeHtml(p.ability)}</div>` : "")
+    const about = [nick, p.ability].filter(Boolean).join(" · ");
+    return `<div class="mon${hp <= 0 ? " fainted" : ""}${lead ? " lead" : ""}">`
+      + `<div class="mon-head"><span class="species" title="${escapeHtml(about)}">${escapeHtml(p.species)}</span>${lead}`
+      + `<span class="lv">Lv${escapeHtml(p.level)}</span></div>`
+      + `<div class="hp-row"><div class="hpbar"><div class="hp-fill ${hpClass(hp, max)}" style="width:${pct}%"></div></div>`
+      + `<span class="hp-text">${hp}/${max}</span>${status}</div>`
       + `<ul class="moves">${moves}</ul></div>`;
   }
 
   function renderParty(dash) {
     if (!dash) return `<div class="empty">Waiting for game state…</div>`;
-    const pos = Array.isArray(dash.position) && dash.position.length >= 2
-      ? ` (${escapeHtml(dash.position[0])}, ${escapeHtml(dash.position[1])})` : "";
-    const badges = Array.isArray(dash.badges) ? dash.badges.filter(Boolean).length : 0;
-    const balls = (Array.isArray(dash.balls) ? dash.balls : [])
-      .map((b) => `${escapeHtml(b.name)} ×${escapeHtml(b.count)}`).join(" · ");
     const party = Array.isArray(dash.party) ? dash.party : [];
-    return `<div class="party-sum">`
-      + `<div><b>${escapeHtml(dash.location || "Unknown")}</b>${pos}</div>`
-      + `<div>₽${fmtMoney(dash.money)} · Badges ${badges}/8</div>`
-      + `<div class="balls">${balls || "No balls"}</div></div>`
-      + (dash.exp_note ? `<div class="warn-strip">${escapeHtml(dash.exp_note)}</div>` : "")
-      + `<div class="mons">${party.length ? party.map(monCard).join("") : `<div class="empty">No Pokémon.</div>`}</div>`;
+    return (dash.exp_note ? `<div class="warn-strip">${escapeHtml(dash.exp_note)}</div>` : "")
+      + (party.length ? party.map(monCard).join("") : `<div class="empty">No Pokémon.</div>`);
+  }
+
+  // The party's total HP as one number for the rail's header ("93% HP").
+  function partyHealth(dash) {
+    const party = dash && Array.isArray(dash.party) ? dash.party.filter((p) => !p.egg) : [];
+    const max = party.reduce((a, p) => a + (Number(p.max_hp) || 0), 0);
+    if (!max) return "";
+    const hp = party.reduce((a, p) => a + Math.max(0, Number(p.hp) || 0), 0);
+    return `${Math.round((hp / max) * 100)}% HP`;
+  }
+
+  // ---------- Objectives ----------
+
+  function trackSummary(track) {
+    const list = track && Array.isArray(track.objectives) ? track.objectives : [];
+    return {
+      list,
+      current: list.find((o) => o.status === "current") || null,
+      done: track && typeof track.done === "number" ? track.done : list.filter((o) => o.status === "done").length,
+      total: track && typeof track.total === "number" ? track.total : list.length,
+    };
+  }
+
+  function stripCell(label, track, which) {
+    const { current, done, total } = trackSummary(track);
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    let body;
+    if (current) {
+      const target = current.target_location ? `Target <b>${escapeHtml(current.target_location)}</b> · ` : "";
+      body = `<div class="obj-desc" title="${escapeHtml(current.navigation_hint || "")}">${escapeHtml(current.description)}</div>`
+        + `<div class="obj-target">${target}<button type="button" class="linkish" data-open-track="${which}">See all</button></div>`;
+    } else {
+      body = `<div class="obj-desc muted">${total ? "All done." : "Loading… (objectives load with the AI's first step)"}</div>`;
+    }
+    return `<div class="obj-cell" data-track-cell="${which}"><div class="obj-top"><span class="label">${label}</span>`
+      + `<span class="meter"><i style="width:${pct}%"></i></span><span class="num">${done}/${total}</span></div>${body}</div>`;
+  }
+
+  // The two current objectives under the game screen, always in view; the full lists
+  // are one click away in the Objectives tab.
+  function renderObjectiveStrip(objectives) {
+    if (!objectives) return `<div class="obj-cell muted">Waiting for objectives…</div>`;
+    return stripCell("Story", objectives.story, "story") + stripCell("Battle", objectives.battling, "battle");
   }
 
   // Chapters are the id prefix before the first "_" (early_001 → early), kept in
@@ -241,7 +330,7 @@ const PlayPanels = (() => {
     return chapters;
   }
 
-  function objRow(o, scrollTarget) {
+  function objRow(o) {
     if (o.status === "done") {
       return `<li class="obj done"><span class="mark">✓</span><span class="desc">${escapeHtml(o.description)}</span>`
         + `<span class="when">${fmtStamp(parseUtc(o.completed_at))}</span></li>`;
@@ -249,7 +338,7 @@ const PlayPanels = (() => {
     if (o.status === "current") {
       const hint = o.navigation_hint ? `<div class="hint">${escapeHtml(o.navigation_hint)}</div>` : "";
       const target = o.target_location ? `<div class="target">Target: ${escapeHtml(o.target_location)}</div>` : "";
-      return `<li class="obj current${scrollTarget ? " scroll-target" : ""}"><span class="mark">▶</span>`
+      return `<li class="obj current scroll-target"><span class="mark">▶</span>`
         + `<div class="desc"><div>${escapeHtml(o.description)}</div>${hint}${target}</div></li>`;
     }
     return `<li class="obj upcoming"><span class="mark">○</span><span class="desc">${escapeHtml(o.description)}</span></li>`;
@@ -258,43 +347,44 @@ const PlayPanels = (() => {
   function capitalize(s) { return s ? s[0].toUpperCase() + s.slice(1) : "Other"; }
 
   // openChapters holds the user's toggles by chapter key; without one a chapter
-  // is open unless every objective in it is done.
-  function renderProgress(objectives, badges, openChapters) {
+  // is open unless every objective in it is done. track is "story" (default) or
+  // "battle": one list at a time, so the panel's auto-scroll has one current row.
+  function renderProgress(objectives, badges, openChapters, track) {
     if (!objectives) return `<div class="empty">Waiting for objectives…</div>`;
     const toggles = openChapters || {};
-    const story = objectives.story || { objectives: [] };
-    const list = Array.isArray(story.objectives) ? story.objectives : [];
-    // Right after a server restart the objectives are loaded with the agent's first
-    // step; until then /objectives has none ("0 of 0 … done" read like a fault).
-    if (!list.length) return `<div class="empty">Loading objectives… (they load with the AI's first step)</div>`;
-    const done = typeof story.done === "number" ? story.done : list.filter((o) => o.status === "done").length;
-    const total = typeof story.total === "number" ? story.total : list.length;
+    const showBattle = track === "battle";
+    const story = trackSummary(objectives.story);
+    const battle = trackSummary(objectives.battling);
     const pips = BADGE_NAMES.map((name, i) => {
       const got = Array.isArray(badges) && badges[i];
       return `<span class="pip${got ? " earned" : ""}" title="${name} Badge${got ? "" : " (not yet)"}">${name}</span>`;
     }).join("");
+    const seg = `<div class="seg" role="group" aria-label="Objective list">`
+      + `<button type="button" data-track="story" aria-pressed="${!showBattle}">Story <span class="mono">${story.done}/${story.total}</span></button>`
+      + `<button type="button" data-track="battle" aria-pressed="${showBattle}">Battle <span class="mono">${battle.done}/${battle.total}</span></button></div>`;
+    const top = `<div class="prog-top">${seg}<div class="pips">${pips}</div></div>`;
 
-    const chapters = groupChapters(list).map((c) => {
-      const finished = c.done === c.total;
-      const open = toggles[c.key] === undefined ? !finished : Boolean(toggles[c.key]);
-      const rows = open ? `<ol class="objs">${c.items.map((o) => objRow(o, true)).join("")}</ol>` : "";
-      return `<section class="chapter${open ? " open" : ""}${finished ? " finished" : ""}">`
-        + `<button type="button" class="chap-head" data-chapter="${escapeHtml(c.key)}" aria-expanded="${open}">`
-        + `<span class="caret">${open ? "▾" : "▸"}</span><span class="chap-name">${escapeHtml(capitalize(c.key))}</span>`
-        + `<span class="count">${c.done}/${c.total}</span></button>${rows}</section>`;
-    }).join("");
-
-    const battle = objectives.battling;
-    const blist = battle && Array.isArray(battle.objectives) ? battle.objectives : [];
-    const bdone = blist.filter((o) => o.status === "done").length;
-    const battling = blist.length
-      ? `<h3 class="battle-head">Battling goals <span class="count">${bdone}/${blist.length}</span></h3>`
-        + `<ol class="objs battling">${blist.map((o) => objRow(o, false)).join("")}</ol>`
-      : "";
-
-    return `<div class="prog-top"><div class="prog-head">${escapeHtml(done)} of ${escapeHtml(total)} story objectives done</div>`
-      + `<div class="pips">${pips}</div></div>`
-      + (chapters || `<div class="empty">No story objectives.</div>`) + battling;
+    let body;
+    if (showBattle) {
+      body = battle.list.length
+        ? `<ol class="objs battling">${battle.list.map(objRow).join("")}</ol>`
+        : `<div class="empty">No battling goals.</div>`;
+    } else if (!story.list.length) {
+      // Right after a server restart the objectives are loaded with the agent's first
+      // step; until then /objectives has none ("0 of 0 … done" read like a fault).
+      body = `<div class="empty">Loading objectives… (they load with the AI's first step)</div>`;
+    } else {
+      body = groupChapters(story.list).map((c) => {
+        const finished = c.done === c.total;
+        const open = toggles[c.key] === undefined ? !finished : Boolean(toggles[c.key]);
+        const rows = open ? `<ol class="objs">${c.items.map(objRow).join("")}</ol>` : "";
+        return `<section class="chapter${open ? " open" : ""}${finished ? " finished" : ""}">`
+          + `<button type="button" class="chap-head" data-chapter="${escapeHtml(c.key)}" aria-expanded="${open}">`
+          + `<span class="caret">${open ? "▾" : "▸"}</span><span class="chap-name">${escapeHtml(capitalize(c.key))}</span>`
+          + `<span class="count">${c.done}/${c.total}</span></button>${rows}</section>`;
+      }).join("");
+    }
+    return `<div class="prog">${top}${body}</div>`;
   }
 
   // A different /health server_id than the one this page first saw: the game server
@@ -307,7 +397,8 @@ const PlayPanels = (() => {
 
   return {
     escapeHtml, parseUtc, fmtClock, fmtElapsed, fmtCall,
-    renderFeed, renderParty, renderProgress, groupChapters, serverRestarted,
+    renderFacts, renderFeed, renderStrip, renderParty, partyHealth,
+    renderObjectiveStrip, renderProgress, groupChapters, trackSummary, serverRestarted,
   };
 })();
 
