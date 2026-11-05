@@ -96,10 +96,12 @@ def test_tile_route_to_flannery_is_the_holes_and_geysers_chain():
     route = game_tools.tile_route(GYM_1F, GYM_DOOR, _beside(*FLANNERY))
     print("    from the door:", route)
     assert route, route
+    # B1F was spelled "B 1F" in exit names, unlike the LAVARIDGE TOWN GYM B1F location
+    # read_location gives there; exits now use that name (test_map_enum.py).
     assert route[-4:] == [
-        ("LAVARIDGE TOWN GYM B 1F (2, 3)", "LAVARIDGE TOWN GYM B 1F"),
+        ("LAVARIDGE TOWN GYM B1F (2, 3)", "LAVARIDGE TOWN GYM B1F"),
         ("LAVARIDGE TOWN GYM 1F (7, 2)", "LAVARIDGE TOWN GYM 1F"),
-        ("LAVARIDGE TOWN GYM B 1F (10, 6)", "LAVARIDGE TOWN GYM B 1F"),
+        ("LAVARIDGE TOWN GYM B1F (10, 6)", "LAVARIDGE TOWN GYM B1F"),
         ("LAVARIDGE TOWN GYM 1F (12, 12)", "LAVARIDGE TOWN GYM 1F"),
     ], route
     # Floors alternate: every step is a hole down or a geyser up.

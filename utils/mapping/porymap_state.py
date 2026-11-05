@@ -107,31 +107,10 @@ ROM_TO_PORYMAP_MAP = {
     # Buildings (common patterns)
     "PETALBURG WOODS": "PetalburgWoods",
     "RUSTURF TUNNEL": "RusturfTunnel",
-    "RUSTURF TUNNEL ALT": "RusturfTunnel",  # Alternative map ID 0x1804
-
-    # Route 110 Trick House (Group 29 = 0x1D)
-    "ROUTE 110 TRICK HOUSE ENTRANCE ALT": "Route110_TrickHouseEntrance",
-    "ROUTE 110 TRICK HOUSE END ALT": "Route110_TrickHouseEnd",
-    "ROUTE 110 TRICK HOUSE CORRIDOR ALT": "Route110_TrickHouseCorridor",
-    "ROUTE 110 TRICK HOUSE PUZZLE1 ALT": "Route110_TrickHousePuzzle1",
-    "ROUTE 110 TRICK HOUSE PUZZLE2 ALT": "Route110_TrickHousePuzzle2",
-    "ROUTE 110 TRICK HOUSE PUZZLE3 ALT": "Route110_TrickHousePuzzle3",
-    "ROUTE 110 TRICK HOUSE PUZZLE4 ALT": "Route110_TrickHousePuzzle4",
-    "ROUTE 110 TRICK HOUSE PUZZLE5 ALT": "Route110_TrickHousePuzzle5",
-    "ROUTE 110 TRICK HOUSE PUZZLE6 ALT": "Route110_TrickHousePuzzle6",
-    "ROUTE 110 TRICK HOUSE PUZZLE7 ALT": "Route110_TrickHousePuzzle7",
-    "ROUTE 110 TRICK HOUSE PUZZLE8 ALT": "Route110_TrickHousePuzzle8",
-    "ROUTE 110 SEASIDE CYCLING ROAD SOUTH ENTRANCE ALT": "Route110_SeasideCyclingRoadSouthEntrance",
-    "ROUTE 110 SEASIDE CYCLING ROAD NORTH ENTRANCE ALT": "Route110_SeasideCyclingRoadNorthEntrance",
 
     # Professor Birch's Lab
     "LITTLEROOT TOWN PROFESSOR BIRCHS LAB": "LittlerootTown_ProfessorBirchsLab",
     "PROFESSOR BIRCHS LAB": "LittlerootTown_ProfessorBirchsLab",
-
-    # Raw map IDs (fallback when memory reader can't resolve location name)
-    "Map_18_0B": "PetalburgWoods",  # Group 0x18 (Dungeons), Map 0x0B
-    "Map_18_04": "RusturfTunnel",  # Group 0x18 (Indoor Route 104), Map 0x04
-    "MAP_18_04": "RusturfTunnel",  # Alternate capitalization
 
         # The folloing mappings were generated via cursor and verified
     "ABANDONED SHIP CAPTAINS OFFICE": "AbandonedShip_CaptainsOffice",  # 100.0% match, verified
@@ -207,11 +186,8 @@ ROM_TO_PORYMAP_MAP = {
     "FORTREE CITY POKEMON CENTER 1F": "FortreeCity_PokemonCenter_1F",  # 100.0% match, verified
     "FORTREE CITY POKEMON CENTER 2F": "FortreeCity_PokemonCenter_2F",  # 100.0% match, verified
     "GRANITE CAVE 1F": "GraniteCave_1F",  # 100.0% match, verified
-    "GRANITE CAVE 1F ALT": "GraniteCave_1F",  # Map ID 0x1807 - same layout as 0x1907
     "GRANITE CAVE B1F": "GraniteCave_B1F",  # 100.0% match, verified
-    "GRANITE CAVE B1F ALT": "GraniteCave_B1F",  # Map ID 0x1808 - same layout as 0x1908
     "GRANITE CAVE B2F": "GraniteCave_B2F",  # 100.0% match, verified
-    "GRANITE CAVE B2F ALT": "GraniteCave_B2F",  # Map ID 0x1809 - same layout as 0x1909
     "GRANITE CAVE STEVENS ROOM": "GraniteCave_StevensRoom",  # 100.0% match, verified
     "ISLAND CAVE": "IslandCave",  # 100.0% match, verified
     "JAGGED PASS": "JaggedPass",  # 100.0% match, verified
@@ -257,7 +233,6 @@ ROM_TO_PORYMAP_MAP = {
     "MAGMA HIDEOUT 3F 2R": "MagmaHideout_3F_2R",  # 100.0% match, verified
     "MAGMA HIDEOUT 3F 3R": "MagmaHideout_3F_3R",  # 100.0% match, verified
     "MAGMA HIDEOUT 4F": "MagmaHideout_4F",  # 100.0% match, verified
-    "MAP RUSTURF TUNNEL": "RusturfTunnel",  # 89.7% match, verified
     "MARINE CAVE END": "MarineCave_End",  # 100.0% match, verified
     "MARINE CAVE ENTRANCE": "MarineCave_Entrance",  # 100.0% match, verified
     "MAUVILLE CITY BIKE SHOP": "MauvilleCity_BikeShop",  # 100.0% match, verified
@@ -322,7 +297,6 @@ ROM_TO_PORYMAP_MAP = {
     "PETALBURG CITY POKEMON CENTER 2F": "PetalburgCity_PokemonCenter_2F",  # 100.0% match, verified
     "PETALBURG CITY WALLYS HOUSE": "PetalburgCity_WallysHouse",  # 100.0% match, verified
     "ROUTE 104 MR BRINEYS HOUSE": "Route104_MrBrineysHouse",  # 100.0% match, verified
-    "ROUTE 104 MR BRINEYS HOUSE ALT": "Route104_MrBrineysHouse",  # 91.9% match, verified
     "ROUTE 104 PRETTY PETAL FLOWER SHOP": "Route104_PrettyPetalFlowerShop",  # 100.0% match, verified
     "ROUTE 109 SEASHORE HOUSE": "Route109_SeashoreHouse",  # 100.0% match, verified
     "ROUTE 110 TRICK HOUSE CORRIDOR": "Route110_TrickHouseCorridor",  # 100.0% match, verified
@@ -339,7 +313,6 @@ ROM_TO_PORYMAP_MAP = {
     "ROUTE 111 WINSTRATE FAMILYS HOUSE": "Route111_WinstrateFamilysHouse",  # 100.0% match, verified
     "ROUTE 112 CABLE CAR STATION": "Route112_CableCarStation",  # 100.0% match, verified
     "ROUTE 113 GLASS WORKSHOP": "Route113_GlassWorkshop",  # 100.0% match, verified
-    "ROUTE_113_GLASS_WORKSHOP": "Route113_GlassWorkshop",  # Enum name variant
     "ROUTE 114 FOSSIL MANIACS HOUSE": "Route114_FossilManiacsHouse",  # 100.0% match, verified
     "ROUTE 114 FOSSIL MANIACS TUNNEL": "Route114_FossilManiacsTunnel",  # 100.0% match, verified
     "ROUTE 114 LANETTES HOUSE": "Route114_LanettesHouse",  # 100.0% match, verified
@@ -435,7 +408,7 @@ ROM_TO_PORYMAP_MAP = {
     "UNDERWATER ROUTE 127": "Underwater_Route127",  # 100.0% match, verified
     "UNDERWATER ROUTE 128": "Underwater_Route128",  # 100.0% match, verified
     "UNDERWATER ROUTE 129": "Underwater_Route129",  # 100.0% match, verified
-    "UNDERWATER ROUTE134": "Underwater_Route134",  # 100.0% match, verified
+    "UNDERWATER ROUTE 134": "Underwater_Route134",  # 100.0% match, verified
     "UNDERWATER SEAFLOOR CAVERN": "Underwater_SeafloorCavern",  # 100.0% match, verified
     "UNDERWATER SEALED CHAMBER": "Underwater_SealedChamber",  # 100.0% match, verified
     "UNDERWATER SOOTOPOLIS CITY": "Underwater_SootopolisCity",  # 100.0% match, verified
@@ -541,16 +514,26 @@ _EDGE_BLOCKED = {"#", "X", "W"}
 
 
 def _readable_map_name(map_const: str) -> str:
-    """MAP_LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB -> LITTLEROOT TOWN PROFESSOR BIRCHS LAB."""
+    """MAP_LITTLEROOT_TOWN_PROFESSOR_BIRCHS_LAB -> LITTLEROOT TOWN PROFESSOR BIRCHS LAB.
+
+    The same name memory_reader.read_location gives that map (MapLocation's member name
+    with spaces), so an exit's name is the location the player reads after taking it.
+    """
     name = str(map_const)
     if name.startswith("MAP_"):
         name = name[len("MAP_"):]
-    # pokeemerald writes ROUTE101; the rest of the prompt says ROUTE 101.
+    # pokeemerald writes ROUTE101; the rest of the prompt says ROUTE 101. Only routes:
+    # spacing every letter-digit pair made GRANITE_CAVE_B1F "GRANITE CAVE B 1F", an exit
+    # name that never equalled the GRANITE CAVE B1F the player then stood on.
     out = []
-    for i, ch in enumerate(name):
-        if i and ch.isdigit() and name[i - 1].isalpha():
-            out.append(" ")
-        out.append(ch)
+    i = 0
+    while i < len(name):
+        if name.startswith("ROUTE", i) and name[i + 5:i + 6].isdigit():
+            out.append("ROUTE ")
+            i += len("ROUTE")
+        else:
+            out.append(name[i])
+            i += 1
     return "".join(out).replace("_", " ")
 
 
@@ -589,10 +572,8 @@ def _map_group_dirs() -> Tuple[Tuple[str, ...], ...]:
 def decomp_map_at(group: int, num: int) -> Optional[Tuple[str, str]]:
     """(data/maps directory, readable name) of map (group, num) as the ROM numbers it.
 
-    Seen live: map (22, 0) is ROUTE 117 POKEMON DAY CARE, but pokemon_env's MapLocation
-    table called it ROUTE 116 TUNNELERS REST HOUSE; the prompt then showed that house's
-    map and exits, and the AI walked at an exit that wasn't there. 24 of the table's
-    names are off like this. The readable name is registered in ROM_TO_PORYMAP_MAP.
+    Straight from the decomp's map_groups.json, which MapLocation is generated from, so the
+    readable name is the one read_location gives for the same (group, num).
     """
     groups = _map_group_dirs()
     if not (0 <= group < len(groups) and 0 <= num < len(groups[group])):
@@ -600,8 +581,28 @@ def decomp_map_at(group: int, num: int) -> Optional[Tuple[str, str]]:
     map_dir = groups[group][num]
     const = next((c for c, d in _map_dirs_by_const().items() if d == map_dir), None)
     readable = _readable_map_name(const) if const else map_dir
-    ROM_TO_PORYMAP_MAP.setdefault(readable, map_dir)
     return map_dir, readable
+
+
+def _register_every_map() -> None:
+    """Give ROM_TO_PORYMAP_MAP every map's location name, not just the hand-listed ones.
+
+    The hand-written table above lacks 156 maps (the Safari Zone, Battle Frontier, S.S.
+    Tidal, Southern Island, Trick House Puzzle 8, ...); a location missing from it gets
+    no map, ASCII or exits. Names come from MapLocation, the
+    same enum read_location names maps with, and directories from map_groups.json.
+    """
+    from pokemon_env.enums import MapLocation
+
+    for group, map_dirs in enumerate(_map_group_dirs()):
+        for num, map_dir in enumerate(map_dirs):
+            try:
+                location = MapLocation((group << 8) | num)
+            except ValueError:
+                # local_tests/test_map_enum.py fails on this; the server still starts.
+                logger.warning(f"MapLocation has no map ({group}, {num}) = {map_dir}")
+                continue
+            ROM_TO_PORYMAP_MAP.setdefault(location.name.replace("_", " "), map_dir)
 
 
 @lru_cache(maxsize=64)
@@ -1565,4 +1566,10 @@ def _format_porymap_info(
     
     # Return formatted text only if json_map not available
     return PorymapResult(context_parts=context_parts)
+
+
+# At import, because callers read ROM_TO_PORYMAP_MAP directly (server/app.py, game_tools).
+# Last in the file: importing pokemon_env from here can come back round to
+# utils.state_formatter, which imports this module's functions, so all must exist by now.
+_register_every_map()
 

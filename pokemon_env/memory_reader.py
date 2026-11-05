@@ -32,10 +32,6 @@ from utils.mapping import map_stitcher_singleton
 logger = logging.getLogger(__name__)
 
 
-def _squash_map_name(name: str) -> str:
-    """'ROUTE_117_POKEMON_DAY_CARE' / 'Route117_PokemonDayCare' -> 'ROUTE117POKEMONDAYCARE'."""
-    return "".join(c for c in str(name).upper() if c.isalnum())
-
 # gBattleTypeFlags bits (pret/pokeemerald include/constants/battle.h).
 BATTLE_TYPE_DOUBLE = 1 << 0
 BATTLE_TYPE_LINK = 1 << 1
@@ -1293,32 +1289,16 @@ class PokemonEmeraldReader:
             if self.is_in_title_sequence():
                 return "TITLE_SEQUENCE"
             
-            # Special case: Battle Frontier Ranking Hall during intro (moving van)
-            # Distinguish by checking if this is early game (no party, no badges)
-            if map_id == 0x1928:  # BATTLE_FRONTIER_RANKING_HALL
-                try:
-                    party_size = self.read_party_size()
-                    badges = self.read_badges()
-                    # If no party and no badges, this is the moving van intro scene
-                    if party_size == 0 and len(badges) == 0:
-                        return "MOVING_VAN"
-                except:
-                    pass
-            
-            try:
-                location = MapLocation(map_id)
-                location_name = location.name.replace('_', ' ')
-                # The MapLocation table is wrong for 24 ids (a block of houses is off by
-                # one group): trust the decomp's map_groups.json, which numbers the ROM's
-                # maps, whenever the table's name doesn't name that map.
-                from utils.mapping.porymap_state import decomp_map_at
+            # The intro's moving van is pret's MAP_INSIDE_OF_TRUCK (0x1928). The
+            # INTRO_CUTSCENE_COMPLETE milestone, utils/anticheat.py and ROM_TO_PORYMAP_MAP
+            # know it as MOVING_VAN, and the truck exists only in the intro.
+            if map_id == MapLocation.INSIDE_OF_TRUCK:
+                return "MOVING_VAN"
 
-                decomp = decomp_map_at(map_bank, map_num)
-                if decomp is not None:
-                    table = location.name[:-4] if location.name.endswith("_ALT") else location.name
-                    if _squash_map_name(table) != _squash_map_name(decomp[0]):
-                        logger.info(f"Location 0x{map_id:04X}: table says {location_name}, decomp says {decomp[1]}")
-                        location_name = decomp[1]
+            try:
+                # MapLocation is generated from pret's map_groups.json, so its name for the
+                # id is the decomp's name for that map: nothing left to correct here.
+                location_name = MapLocation(map_id).name.replace('_', ' ')
                 logger.info(f"Location resolved: map_id=0x{map_id:04X} → {location_name}")
                 return location_name
             except ValueError:

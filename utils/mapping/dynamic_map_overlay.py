@@ -23,7 +23,6 @@ DYNAMIC_MAP_LOCATIONS = {
     # Seen live (2026-11-03): at (6,10) the static grid showed (6,11) as open floor but
     # the game blocked the step, and navigate_to failed 5 times in a row.
     "RUSTURF TUNNEL",
-    "RUSTURF TUNNEL ALT",
     # "FORTREE CITY GYM",
 }
 

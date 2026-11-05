@@ -460,7 +460,9 @@ def test_routes_treat_hm_obstacles_as_walls():
     s = server()
     s.load(Path(__file__).resolve().parent / "test_rusturf_tunnel.state")
     assert {(24, 4), (24, 5)} <= game_tools._obstacle_tiles("RusturfTunnel")
-    way = game_tools.way_to_pokemon_center("RUSTURF TUNNEL ALT", (23, 5))
+    # read_location used to call this map RUSTURF TUNNEL ALT (a MapLocation alias); it
+    # now gives pret's name, the one ROM_TO_PORYMAP_MAP and exits use (test_map_enum.py).
+    way = game_tools.way_to_pokemon_center("RUSTURF TUNNEL", (23, 5))
     print("   ", way)
     assert "VERDANTURF" not in way and "RUSTBORO CITY POKEMON CENTER 1F" in way, way
     saved = game_tools.flag_reader
@@ -509,20 +511,23 @@ def test_route_names_the_ladder_when_two_lead_to_the_same_map():
     from server.field_control import match_exits
     from server.game_tools import way_to_place
 
-    hint = way_to_place("GRANITE CAVE 1F ALT", (16, 11), "Granite Cave Steven's Room")
+    # Location names were GRANITE CAVE 1F ALT / B1F ALT (MapLocation aliases) and exits
+    # were spelled "GRANITE CAVE B 1F"; both are now pret's names, GRANITE CAVE 1F / B1F,
+    # so an exit's name is the location read after taking it (test_map_enum.py).
+    hint = way_to_place("GRANITE CAVE 1F", (16, 11), "Granite Cave Steven's Room")
     print("   ", hint)
     assert "is through an exit of this map" not in hint, hint  # the door is beyond the ledges
-    assert 'go_to_exit("GRANITE CAVE B 1F (17, 11)")' in hint, hint
+    assert 'go_to_exit("GRANITE CAVE B1F (17, 11)")' in hint, hint
     # West of the ledges the door is just a walk.
-    near = way_to_place("GRANITE CAVE 1F ALT", (8, 6), "Granite Cave Steven's Room")
+    near = way_to_place("GRANITE CAVE 1F", (8, 6), "Granite Cave Steven's Room")
     assert near.startswith("GRANITE CAVE STEVENS ROOM is through an exit of this map"), near
-    hint = way_to_place("GRANITE CAVE B1F ALT", (6, 13), "Granite Cave Steven's Room")
+    hint = way_to_place("GRANITE CAVE B1F", (6, 13), "Granite Cave Steven's Room")
     print("   ", hint)
     assert "GRANITE CAVE 1F (4, 21)" not in hint, hint
     exits = [
         {"kind": "warp", "x": 25, "y": 13, "listed_xy": (25, 13), "name": "GRANITE CAVE 1F"},
         {"kind": "warp", "x": 4, "y": 21, "listed_xy": (4, 21), "name": "GRANITE CAVE 1F"},
-        {"kind": "warp", "x": 29, "y": 13, "listed_xy": (29, 13), "name": "GRANITE CAVE B 2F"},
+        {"kind": "warp", "x": 29, "y": 13, "listed_xy": (29, 13), "name": "GRANITE CAVE B2F"},
     ]
     assert match_exits(exits, "GRANITE CAVE 1F (4, 21)") == [exits[1]]
     assert match_exits(exits, "GRANITE CAVE 1F") == exits[:2]  # the name alone still matches both
@@ -545,7 +550,7 @@ def test_equally_far_places_pick_the_nearer_exit():
 def test_maps_are_named_as_the_rom_numbers_them():
     """Seen live: inside ROUTE 117's Day Care (map 22,0) the prompt said ROUTE 116 TUNNELERS
     REST HOUSE and showed that house's exits; the AI walked at a door that wasn't there.
-    pokemon_env's MapLocation table is off for 24 ids; the decomp's map_groups.json wins."""
+    MapLocation is now generated from the decomp's map_groups.json (test_map_enum.py)."""
     from utils.mapping.porymap_state import decomp_map_at
 
     assert decomp_map_at(22, 0) == ("Route117_PokemonDayCare", "ROUTE 117 POKEMON DAY CARE")
@@ -562,7 +567,8 @@ def test_maps_are_named_as_the_rom_numbers_them():
 def test_loose_target_names_match_their_map():
     from server.game_tools import arrived_at
 
-    assert arrived_at("RUSTURF TUNNEL ALT", None, "Rusturf Tunnel")
+    # Was "RUSTURF TUNNEL ALT", a MapLocation alias read_location no longer gives.
+    assert arrived_at("RUSTURF TUNNEL", None, "Rusturf Tunnel")
     assert arrived_at("DEWFORD TOWN GYM", None, "Dewford Gym")
     assert arrived_at("GRANITE CAVE 1F", None, "Granite Cave")
     # Seen live: on METEOR FALLS 1F 1R, meteor_falls_reached never showed as done.

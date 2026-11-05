@@ -106,7 +106,9 @@ def test_full_part_b_sequence_through_dynamo_badge():
     emu.check_and_update_milestones(_state("ROUTE 116", badges=["Stone"]))
     emu.check_and_update_milestones(_state("RUSTURF TUNNEL", badges=["Stone"]))
     emu.check_and_update_milestones(_state("RUSTBORO CITY DEVON CORP 3F", badges=["Stone"]))
-    emu.check_and_update_milestones(_state("ROUTE_104_MR_BRINEYS_HOUSE_ALT", badges=["Stone"]))
+    # Was "ROUTE_104_MR_BRINEYS_HOUSE_ALT", a MapLocation alias; read_location now gives
+    # pret's name for map (17, 0).
+    emu.check_and_update_milestones(_state("ROUTE 104 MR BRINEYS HOUSE", badges=["Stone"]))
     emu.check_and_update_milestones(_state("DEWFORD TOWN", badges=["Stone"]))
     emu.check_and_update_milestones(_state("ROUTE 106", badges=["Stone"]))
     emu.check_and_update_milestones(_state("GRANITE CAVE STEVENS ROOM", badges=["Stone"]))

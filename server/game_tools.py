@@ -1592,16 +1592,13 @@ _HALVES = {"NORTH": (1, -1), "SOUTH": (1, 1), "WEST": (0, -1), "EAST": (0, 1)}
 
 
 def _is_floor_or_variant(word: str) -> bool:
-    """'1F', 'B2F', '1R', 'ALT': parts of a map name that only say which floor, room or
-    copy it is.
+    """'1F', 'B2F', '1R': parts of a map name that only say which floor or room it is.
 
     Seen live: on METEOR FALLS 1F 1R, inside the Route 114 door, "Head west through Route
     114 to Meteor Falls" (meteor_falls_reached) never showed as done, and the model walked
     back out twice. The decomp numbers the rooms of a floor 1R, 2R (Meteor Falls, Magma
     Hideout).
     """
-    if word == "ALT":
-        return True
     core = word[1:] if word.startswith("B") else word
     return len(core) >= 2 and core[-1] in "FR" and core[:-1].isdigit()
 
@@ -1627,10 +1624,9 @@ def _same_word(a: str, b: str) -> bool:
 def _names_same_place(location_name: str, target: str) -> bool:
     """True when a loosely written target names this map.
 
-    Seen live: "Enter Rusturf Tunnel" never counted as done on RUSTURF TUNNEL ALT, and
-    the objective list writes "Dewford Gym" for DEWFORD TOWN GYM and "Granite Cave" for
-    GRANITE CAVE 1F. The target's words must appear in the map name in order, and the
-    map name, without a floor or ALT suffix, must end with the target's last word. So
+    Seen live: the objective list writes "Dewford Gym" for DEWFORD TOWN GYM and "Granite
+    Cave" for GRANITE CAVE 1F. The target's words must appear in the map name in order,
+    and the map name, without a floor or room suffix, must end with the target's last word. So
     "Rustboro City" does not match RUSTBORO CITY GYM.
     """
     have = _place_words(location_name)
