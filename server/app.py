@@ -8431,8 +8431,12 @@ async def _fish_cast(rod: int, source: str) -> Tuple[str, str]:
 
 
 async def _back_to_fishing_spot(spot: Tuple[Any, int, int, str, bool]) -> Optional[str]:
-    """After a heal trip: walk back to the tile train fished from and face the water.
-    None when there, else why not. A spot on the water (surfing) is not walked back to."""
+    """Walk back to the tile train fished from and face the water (after a heal trip).
+    None when there, or when a battle or text stopped the walk (train's loop fights it
+    and calls this again before the next cast), else why not. A spot on the water
+    (surfing) is not walked back to. Seen in a suite run: a wild battle in ROUTE 119's
+    grass on the way back from FORTREE CITY's Pokémon Center ended the call
+    ("did not get back to the fishing spot")."""
     from server import game_tools
 
     map_id, x, y, facing, surfing = spot
@@ -8449,7 +8453,9 @@ async def _back_to_fishing_spot(spot: Tuple[Any, int, int, str, bool]) -> Option
             "x": x - ox, "y": y - oy, "variance": "none", "reason": "train: back to the fishing spot", "consider_npcs": True,
         })
         snap = _field_snapshot()
-        if snap is None or (snap.x, snap.y) != (x, y):
+        if snap is None or not snap.field_free or _mem(lambda r: r.is_in_battle()):
+            return None
+        if (snap.x, snap.y) != (x, y):
             return f"did not get back to the fishing spot ({x},{y}): {walk.get('summary') or walk.get('error')}"
     if snap.facing != facing:
         await _macro_press([facing], "train")  # the water's elevation stops the step: this only turns
@@ -8666,6 +8672,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     steps = stuck = pair_index = 0
     quiet_steps = texts_read = 0
     casts = quiet_casts = 0
+    hooked = False  # the battle about to be fought began at a cast
     last_walk = ""
     while stop is None:
         if _mem(lambda r: r.is_in_battle()):
@@ -8679,6 +8686,9 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             record, stop = await _train_battle(
                 trainee_pid, partner_pid, deadline + TRAIN_FINISH_BATTLE_S, catch, rotation
             )
+            if method == "fish":
+                # Hooked, or met in the grass on a walk (to heal, or back to the water).
+                record["hooked"], hooked = hooked, False
             battles.append(record)
             quiet_steps = quiet_casts = 0
             if lowest:
@@ -8755,8 +8765,16 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                 if fishing is None:
                     stop = ("no_fishing", why)
                     break
+            map_id, x, y, facing, _ = fishing["spot"]
+            if (snap.map_id, snap.x, snap.y, snap.facing) != (map_id, x, y, facing):
+                # Off the spot: a wild battle stopped the walk back after a heal trip.
+                missed = await _back_to_fishing_spot(fishing["spot"])
+                if missed:
+                    stop = ("no_fishing", missed)
+                continue
             result, why = await _fish_cast(fishing["rod"], source)
             casts += 1
+            hooked = result == "battle"
             if result == "error":
                 stop = ("unexpected", why)
             elif result != "battle":

@@ -210,8 +210,16 @@ def test_one_hurt_bystander_does_not_stop_train():
     assert max(levels, key=levels.get) != "COMBUSKEN", levels
     r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
     print("   ", r.get("summary") or r)
-    assert r["success"] is True and r["stopped_because"] != "team_weak", r
-    assert "healed at" not in r["summary"], r
+    # It trains, with no heal first. This used to assert that train never stops weak and
+    # never heals, which only held while the partners stayed above half HP: seen in a
+    # suite run (2026-11-05), SABLEYE, taking its turn as partner (_train_rotation_pick),
+    # fought two ODDISH down to 29/67, train rightly went to heal, and an unbeaten ROUTE 117
+    # trainer (facing at random) spotted the walk. The same test passed on ef1a194,
+    # cc1e103 and 5b09e36 alone. What this test is about: the hurt bystander is never
+    # the reason.
+    assert r["success"] is True and r["battles"], r
+    assert not r["summary"].startswith("On the way: healed at"), r
+    assert "COMBUSKEN" not in r["summary"].split("Stopped: ", 1)[-1], r
 
 
 def test_train_heals_from_the_bag_before_walking_to_a_pokemon_center():
@@ -786,10 +794,24 @@ def test_train_partners_take_turns():
     assert max(partners.count(p) for p in partners) * 2 <= len(partners) + 1, partners
     assert all(a != b for a, b in zip(partners, partners[1:])), partners
     assert "taking turns" in r["summary"], r
+    from server import game_tools
     from utils.mapping.dynamic_map_overlay import swapped_layout
 
+    # The room is drawn by the tide of its last load: pret UpdateShoalTideFlag (the
+    # local hour: high 00-02, 09-14, 21-23) sets FLAG_SYS_SHOAL_TIDE, and the OnTransition
+    # script picks the layout from it. The emulator's RTC follows the host's clock, so a
+    # heal trip that loads the room again can cross into high tide. This used to assert
+    # "still low tide": seen in a suite run (2026-11-05), after "healed at MOSSDEEP CITY
+    # POKEMON CENTER 1F and came back", the room was drawn at high tide and the test
+    # failed though train did right. Now: the layout drawn matches the tide flag.
     with s.srv.memory_lock:
-        assert swapped_layout(s.srv.env.memory_reader) is None  # low tide: the map file's own layout
+        reader = s.srv.env.memory_reader
+        high = reader._is_event_flag_set(game_tools.flag_id("FLAG_SYS_SHOAL_TIDE"))
+        live = swapped_layout(reader)
+    if high:
+        assert live is not None and live.get("id") == "LAYOUT_SHOAL_CAVE_HIGH_TIDE_ENTRANCE_ROOM", live
+    else:
+        assert live is None, live  # low tide: the map file's own layout
 
 
 # -- healing: a Pokémon Center unless the bag is allowed (2026-11-05) -----------------

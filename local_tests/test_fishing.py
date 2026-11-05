@@ -52,17 +52,22 @@ def test_fishing_battles_what_bites_without_moving():
     began = time.time()
     r = s.call("mcp_train", {"trainee": "LOWEST", "method": "fish", "max_minutes": 1, "reasoning": "test"})
     print(f"    ({time.time() - began:.0f} s) {r.get('summary') or r}")
-    assert r["success"] is True and r["battles"] and "healed at" not in r["summary"], r
+    # A heal trip may still happen (seen under load: a hooked CARVANHA Lv40 hits hard), and
+    # its walks can meet wild Pokémon in the grass: only hooked battles are checked
+    # against the fishing table, and the spot only when no trip was made.
+    hooked = [b for b in r["battles"] if b.get("hooked")]
+    assert r["success"] is True and hooked, r
     end = s.snapshot()
-    assert (end.x, end.y, end.map_id) == (start.x, start.y, start.map_id), (start, end)
+    if "healed at" not in r["summary"]:
+        assert (end.x, end.y, end.map_id) == (start.x, start.y, start.map_id), (start, end)
     area = _read(s, lambda rd: (game_tools.wild_table(rd), game_tools.fishing_wild("Route119", 2))[1])
     names = {_read(s, lambda rd, sp=sp: rd._battle_species_name(sp)).upper() for sp in area.species}
-    for battle in r["battles"]:
+    for battle in hooked:
         species = battle["opponents"][0].rsplit(" Lv", 1)[0]
         assert species in names, (battle["opponents"], names)
     exp_after = {m.species_name.upper(): m.experience for m in _party(s)}
     assert exp_after["TROPIUS"] > exp_before["TROPIUS"], (exp_before, exp_after)
-    assert r["casts"] >= len(r["battles"]) and "with the SUPER ROD" in r["summary"], r
+    assert r["casts"] >= len(hooked) and "with the SUPER ROD" in r["summary"], r
 
 
 def test_fishing_refuses_without_water_ahead():
