@@ -130,20 +130,32 @@ STAT_STAGE_RATIOS = (
 def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]:
     """Is the team too worn down to fight a trainer? Eggs are ignored.
 
-    Weak when any Pokémon has fainted, any other is under TEAM_LOW_HP_SHARE of its
-    max HP, or every damaging move (power > 0) of the lead (the first Pokémon able to
-    battle) is at or under TEAM_LOW_PP_SHARE of its base PP. `move_data(move enum
-    name)` returns gBattleMoves' {"power", "pp", ...} or None for an empty slot.
+    Judged on the Pokémon that can still fight. Weak when fewer than two of them are
+    left (the only one, in a team of one), when most of them (more than half) are under
+    TEAM_LOW_HP_SHARE of their max HP, or when every damaging move (power > 0) of the
+    lead (the first Pokémon able to battle) is at or under TEAM_LOW_PP_SHARE of its base
+    PP. `move_data(move enum name)` returns gBattleMoves' {"power", "pp", ...} or None
+    for an empty slot.
+
+    "reasons" lists, when weak, every fainted or low Pokémon and the lead's PP; when not
+    weak the fainted or low ones are "notes", worth knowing but no reason to turn back.
+    Seen live: only CAMERUPT fainted, the other five at 70-100% HP, and
+    "TEAM IS WEAK" sent the model out of the Weather Institute mid-objective, ~10 steps
+    of use_item with no medicine and heal_at_pokecenter across water and ledges.
     """
     members = [p for p in party if not p.is_egg]
-    reasons: List[str] = []
+    hurt: List[str] = []
+    able = [p for p in members if p.current_hp > 0]
+    low = [p for p in able if p.current_hp < p.max_hp * TEAM_LOW_HP_SHARE]
     for mon in members:
         name = mon.species_name.upper()
         if mon.current_hp == 0:
-            reasons.append(f"{name} fainted")
+            hurt.append(f"{name} fainted")
         elif mon.current_hp < mon.max_hp * TEAM_LOW_HP_SHARE:
-            reasons.append(f"{name} {mon.current_hp}/{mon.max_hp} HP")
-    lead = next((p for p in members if p.current_hp > 0), None)
+            hurt.append(f"{name} {mon.current_hp}/{mon.max_hp} HP")
+    worn = len(able) < min(2, len(members)) or 2 * len(low) > len(able)
+    tired: List[str] = []
+    lead = able[0] if able else None
     if lead is not None:
         damaging = []
         for move, pp in zip(lead.moves, lead.move_pp):
@@ -151,10 +163,12 @@ def assess_team_condition(party: List[PokemonData], move_data) -> Dict[str, Any]
             if is_attack(data) and data["pp"] > 0:
                 damaging.append((move.replace("_", " "), pp, data["pp"]))
         if damaging and all(pp <= base * TEAM_LOW_PP_SHARE for _, pp, base in damaging):
-            reasons.extend(f"{move} {pp}/{base} PP" for move, pp, base in damaging)
+            tired = [f"{move} {pp}/{base} PP" for move, pp, base in damaging]
+    weak = worn or bool(tired)
     return {
-        "weak": bool(reasons),
-        "reasons": reasons,
+        "weak": weak,
+        "reasons": hurt + tired if weak else [],
+        "notes": [] if weak else hurt,
         "lead": lead.species_name.upper() if lead is not None else None,
     }
 

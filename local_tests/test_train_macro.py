@@ -164,23 +164,55 @@ def _put_in_bag(s, item_id, quantity):
     put(s, item_id, quantity)
 
 
+def _hurt_partner(s, trainee):
+    """RAM: the highest-level teammate of `trainee` (the partner train wants) to 10 HP.
+    Returns its name."""
+    party = s.srv._train_party()
+    slot, mon = max(
+        ((i, m) for i, (_, m) in enumerate(party) if not m.is_egg and m.species_name.upper() != trainee),
+        key=lambda pair: pair[1].level,
+    )
+    _write(s, 16, PARTY + 100 * slot + 0x56, 10)
+    return mon.species_name.upper()
+
+
+def test_one_hurt_bystander_does_not_stop_train():
+    """A teammate that is neither the trainee nor its partner, under half HP, no longer
+    makes the team weak (assess_team_condition): train trains on without healing. RAM:
+    COMBUSKEN (slot 2) at 10 HP; in this party it isn't the partner (asserted below)."""
+    s = server()
+    s.load(HERE / "test_verdanturf_east.state")
+    assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
+    _no_medicine(s)
+    _write(s, 16, PARTY + 100 + 0x56, 10)
+    assert _by_name(s, "COMBUSKEN").current_hp == 10
+    levels = {m.species_name.upper(): m.level for _, m in s.srv._train_party() if m.species_name.upper() != "MARILL"}
+    assert max(levels, key=levels.get) != "COMBUSKEN", levels
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["stopped_because"] != "team_weak", r
+    assert "healed at" not in r["summary"], r
+
+
 def test_train_heals_from_the_bag_before_walking_to_a_pokemon_center():
     """emerald-new (2026-11-04), David's "Potions + Jagged Pass": train stopped with "the
     team is weak (AZUMARILL 32/82 HP)" and walked to Lavaridge below Jagged Pass's one-way
     ledges, a 10-15 minute loop. With medicine in the bag it heals on the spot and trains
-    on. Same place as the next test; RAM: COMBUSKEN (slot 2) at 10 HP, no medicine but 3
-    SUPER POTIONs (id 22)."""
+    on. Same place as the next test; RAM: train's partner (the highest-level teammate) at
+    10 HP, no medicine but 3 SUPER POTIONs (id 22). (This used to lower COMBUSKEN, which
+    isn't the partner: since one hurt bystander no longer makes the team weak, train
+    rightly trained on with BRELOOM; the partner being hurt is what sends it to heal.)"""
     s = server()
     s.load(HERE / "test_verdanturf_east.state")
     assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
     _no_medicine(s)
     _put_in_bag(s, 22, 3)
-    _write(s, 16, PARTY + 100 + 0x56, 10)
-    top = _by_name(s, "COMBUSKEN").max_hp
+    partner = _hurt_partner(s, "MARILL")
+    top = _by_name(s, partner).max_hp
     r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
     print("   ", r.get("summary") or r)
     assert r["success"] is True, r
-    want = f"On the way: used SUPER POTION on COMBUSKEN (10→{min(top, 60)} HP)"
+    want = f"On the way: used SUPER POTION on {partner} (10→{min(top, 60)} HP)"
     assert r["summary"].startswith(want), r["summary"]
     assert "healed at" not in r["summary"] and r["stopped_because"] != "team_weak", r
     assert "SUPER POTIONs left" in r["summary"] or "SUPER POTION left" in r["summary"], r
@@ -196,11 +228,12 @@ def test_train_heals_a_weak_team_itself_and_comes_back():
     s = server()
     # ROUTE 117 (0,8), next to VERDANTURF TOWN: test_verdanturf_east.state then east. (From
     # test_marill_in_party.state's (18,14) the heal walk can cross the sight of an unbeaten
-    # trainer at (8,12), depending on where he faces.) RAM: COMBUSKEN (slot 2) at 10 HP.
+    # trainer at (8,12), depending on where he faces.) RAM: train's partner at 10 HP (it
+    # was COMBUSKEN, a bystander that no longer makes the team weak on its own).
     s.load(HERE / "test_verdanturf_east.state")
     assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
     _no_medicine(s)
-    _write(s, 16, PARTY + 100 + 0x56, 10)
+    partner = _hurt_partner(s, "MARILL")
     r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
     print("   ", r.get("summary") or r)
     assert r["success"] is True, r
@@ -209,8 +242,8 @@ def test_train_heals_a_weak_team_itself_and_comes_back():
     # the fixture carries a Repel from how it was made, and unbeaten Route 117 trainers
     # may spot the player on the way to the grass, depending on where they face.)
     assert r["stopped_because"] != "team_weak", r
-    combusken = _by_name(s, "COMBUSKEN")
-    assert combusken.current_hp * 2 > combusken.max_hp, combusken  # healed (a battle since may cost a little)
+    healed = _by_name(s, partner)
+    assert healed.current_hp * 2 > healed.max_hp, healed  # healed (a battle since may cost a little)
     # When the heal trip itself is stopped (from PETALBURG WOODS a ROUTE 104 trainer spots
     # the player on the way), train hands back and says why.
     s.load(WOODS)

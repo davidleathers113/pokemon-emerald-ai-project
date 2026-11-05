@@ -3628,7 +3628,12 @@ def _switch_train_line(guidance: Dict[str, Any]) -> str:
             names = [str(p.species_name).upper() for p in party if not p.is_egg]
             if not level.isdigit() or trainee not in names or all(n == trainee for n in names):
                 return ""  # nothing to train, or no teammate to fight for it
-            if env.memory_reader.read_team_condition()["weak"]:
+            # train's own heal rule (_train_weakness): a weak team, or a hurt trainee or
+            # partner, gets the heal-first line instead.
+            trainee_pid = next(
+                (pid for pid, mon in _train_party() if not mon.is_egg and str(mon.species_name).upper() == trainee), None
+            )
+            if _train_weakness(None, trainee_pid):
                 return ""
             return (
                 f'TRAINING: call train("{trainee}", until_level={int(level)}) now. It walks into the tall '
@@ -3884,17 +3889,22 @@ def _note_story_scenes(guidance: Dict[str, Any]) -> None:
     story["navigation_hint"] = f"{' '.join(lines)} {story.get('navigation_hint') or ''}".strip()
 
 
-def _team_weak_line(condition: Dict[str, Any], location: str, position: Optional[Tuple[int, int]]) -> str:
-    """'TEAM IS WEAK (TORCHIC 15/35 HP): heal before any trainer — <where to heal>'."""
+def _team_weak_line(
+    condition: Dict[str, Any], location: str, position: Optional[Tuple[int, int]], toward: Optional[str] = None
+) -> str:
+    """'TEAM IS WEAK (TORCHIC 15/35 HP): heal before any trainer — <where to heal>'.
+    `toward` is the objective's place: with no Pokémon Center in reach, the line says to
+    keep going there and names the next Center on the way (game_tools.no_pokemon_center_note)."""
     from server import game_tools
 
-    head = f"TEAM IS WEAK ({', '.join(condition['reasons'])}): heal before any trainer — "
-    way = game_tools.way_to_pokemon_center(location, position)
+    reasons = ", ".join(condition["reasons"])
+    head = f"TEAM IS WEAK ({reasons}): heal before any trainer — "
+    way = game_tools.way_to_pokemon_center(location, position, toward)
     if not way:
         return head + f"you are inside {location}: call heal_at_pokecenter() now."
     route = game_tools.pokemon_center_route(location, position)
     if not route:
-        return head + way  # none reachable on foot: the note says so
+        return f"TEAM IS WEAK ({reasons}): avoid trainers where you can; {way}"
     # Seen live: the model was given the way and an exit to take, and never walked it.
     # heal_at_pokecenter makes the trip itself (_walk_to_pokemon_center).
     return head + f"call heal_at_pokecenter() now: it walks to {route[-1][1]} and heals."
@@ -3909,6 +3919,9 @@ def _note_team_condition(guidance: Optional[Dict[str, Any]]) -> Optional[str]:
     follows best, so the instruction goes first there; on a battle objective the
     description itself starts with it too. Nothing is said in a battle (the battle
     section shows HP and PP). Returns the line, or None when the team is fine.
+
+    A team that is not weak but has a fainted or low member (assess_team_condition
+    "notes") gets a quiet note at the end of the hint instead: keep to the objective.
     """
     if env is None or getattr(env, "memory_reader", None) is None:
         return None
@@ -3917,11 +3930,21 @@ def _note_team_condition(guidance: Optional[Dict[str, Any]]) -> Optional[str]:
         if reader.is_in_battle():
             return None
         condition = reader.read_team_condition()
-    if not condition["weak"]:
-        return None
-    snap = _field_snapshot()
-    line = _team_weak_line(condition, _location_name(), (snap.x, snap.y) if snap is not None else None)
     story = guidance.get("story") if isinstance(guidance, dict) else None
+    if not condition["weak"]:
+        notes = condition.get("notes") or []
+        if not notes:
+            return None
+        line = (
+            f"TEAM: {', '.join(notes)}; the others can still fight, so keep to the objective "
+            "(no need to turn back to heal: heal when you pass a Pokémon Center)."
+        )
+        if isinstance(story, dict):
+            story["navigation_hint"] = f"{story.get('navigation_hint') or ''} {line}".strip()
+        return line
+    snap = _field_snapshot()
+    toward = story.get("target_location") if isinstance(story, dict) else None
+    line = _team_weak_line(condition, _location_name(), (snap.x, snap.y) if snap is not None else None, toward)
     if isinstance(story, dict):
         story["navigation_hint"] = f"{line} {story.get('navigation_hint') or ''}".strip()
         if story.get("action_type") == "battle":
@@ -7073,12 +7096,44 @@ def _train_partner_pick(
     return max(able, key=lambda i: party[i][1].level), "the highest level"
 
 
-def _train_weakness(partner_index: Optional[int]) -> List[str]:
+def _train_weakness(
+    partner_index: Optional[int], trainee_pid: Optional[int] = None, wanted_partner_pid: Optional[int] = None
+) -> List[str]:
     """The team-weak reasons (read_team_condition), with the partner's PP as the one that
-    counts: the trainee leads but never attacks."""
+    counts: the trainee leads but never attacks. And the two train itself relies on,
+    fainted or under TEAM_LOW_HP_SHARE: the trainee, which leads every battle and takes
+    the foe's first hit, and the partner it wants (the one asked for, else the
+    highest-level teammate). A fainted bystander alone no longer makes the team weak
+    (assess_team_condition), but with its strongest partner down train would grind with
+    a weaker one, so a trip to heal those two is still worth it."""
+    from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
+
     with memory_lock:
         condition = env.memory_reader.read_team_condition(lead_index=partner_index)
-    return list(condition["reasons"]) if condition["weak"] else []
+    reasons = list(condition["reasons"])
+    if trainee_pid is None:
+        return reasons
+    party = _train_party()
+    mons = dict(party)
+    wanted = wanted_partner_pid if wanted_partner_pid in mons else max(
+        (pid for pid, mon in party if pid != trainee_pid and not mon.is_egg),
+        key=lambda pid: mons[pid].level,
+        default=None,
+    )
+    for pid in (trainee_pid, wanted):
+        mon = mons.get(pid)
+        if mon is None or mon.is_egg:
+            continue
+        name = mon.species_name.upper()
+        if mon.current_hp == 0:
+            text = f"{name} fainted"
+        elif mon.current_hp < mon.max_hp * TEAM_LOW_HP_SHARE:
+            text = f"{name} {mon.current_hp}/{mon.max_hp} HP"
+        else:
+            continue
+        if text not in reasons:
+            reasons.append(text)
+    return reasons
 
 
 def _heal_way() -> str:
@@ -7253,7 +7308,7 @@ def _train_stop_after_battle(
             return ("until_level", f"every Pokémon able to battle is Lv{until_level} or higher (the lowest, {name}, is Lv{trainee.level}).")
         return ("until_level", f"{name} reached Lv{trainee.level} (until_level={until_level}).")
     index = _train_partner(party, trainee_pid, wanted_partner_pid)
-    weak = _train_weakness(index)
+    weak = _train_weakness(index, trainee_pid, wanted_partner_pid)
     if weak:
         return ("team_weak", f"the team is weak ({', '.join(weak)}): heal first. {_heal_way()}")
     if index is None:
@@ -7472,7 +7527,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                 )
             return _refusal(f"No tall grass here ({location}), and it isn't a cave: {way}", stopped_because="no_grass")
     partner_index = _train_partner(party, trainee_pid, partner_pid)
-    weak = _train_weakness(partner_index)
+    weak = _train_weakness(partner_index, trainee_pid, partner_pid)
     heal_notes: List[str] = []
     trips = 0  # Pokémon Center trips (TRAIN_MAX_HEALS); healing from the bag isn't counted
     origin = _location_name()
@@ -7483,7 +7538,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             heal_notes.append(note)
             party = _train_party()
             partner_index = _train_partner(party, trainee_pid, partner_pid)
-            weak = _train_weakness(partner_index)
+            weak = _train_weakness(partner_index, trainee_pid, partner_pid)
     if weak and not in_battle:
         # Heal first, then come back here and train (TRAIN_MAX_HEALS per call).
         ok, note = await _train_heal_trip(origin)
@@ -7496,7 +7551,7 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
         if not spots["pairs"]:
             return _refusal(f"{note}, but no tall grass can be walked to from here now.", stopped_because="no_grass")
         partner_index = _train_partner(party, trainee_pid, partner_pid)
-        weak = _train_weakness(partner_index)
+        weak = _train_weakness(partner_index, trainee_pid, partner_pid)
     if weak:
         return _refusal(
             f"Not training: the team is weak ({', '.join(weak)}). Heal first: {_heal_way()}", stopped_because="team_weak"
@@ -8280,7 +8335,17 @@ async def mcp_heal_at_pokecenter(request: dict = None):
             trip, why = await _walk_to_pokemon_center(source)
             if why:
                 walked = f" Walked {' → '.join(trip)} first." if trip else ""
-                return _refusal(f"Did not heal: {why}.{walked}")
+                # None in reach at all (game_tools.no_pokemon_center_note): seen live, the
+                # model then tried go_to to a Center over water and ledges, away from its
+                # objective. Say to go on instead.
+                from server import game_tools
+
+                on = ""
+                snap = _field_snapshot()
+                tile = (snap.x, snap.y) if snap is not None else None
+                if not trip and not game_tools.pokemon_center_route(_location_name(), tile):
+                    on = " Don't turn back for one: keep going, and heal at the next Pokémon Center on your way."
+                return _refusal(f"Did not heal: {why}.{walked}{on}")
 
         before = _party_lines()
         spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_NURSE, "nurse", source)

@@ -1891,9 +1891,12 @@ def pokemon_center_route(location_name: str, position: Optional[Tuple[int, int]]
     return paths[0] if paths else []
 
 
-def way_to_pokemon_center(location_name: str, position: Optional[Tuple[int, int]]) -> str:
+def way_to_pokemon_center(
+    location_name: str, position: Optional[Tuple[int, int]], toward: Optional[str] = None
+) -> str:
     """Where to heal: "" when already inside a Pokémon Center 1F (the nurse's floor),
-    else the way on foot to the nearest one, or a note that none can be reached.
+    else the way on foot to the nearest one, or, when none can be reached, to keep going
+    (toward the objective's place `toward`, naming the next Center on the way).
 
     Map names end in "POKEMON CENTER 1F" (RUSTBORO CITY POKEMON CENTER 1F); a 2F's way
     down the stairs is found the same way as any other.
@@ -1902,11 +1905,101 @@ def way_to_pokemon_center(location_name: str, position: Optional[Tuple[int, int]
         return ""
     path = pokemon_center_route(location_name, position)
     if not path:
-        return "no Pokémon Center can be reached on foot from here: go back the way you came."
+        return no_pokemon_center_note(location_name, toward)
     # heal_at_pokecenter walks the way itself (server _walk_to_pokemon_center); the way
     # is named so the model knows where it is going.
     way = " → ".join(name for _, name in path)
     return f"call heal_at_pokecenter(): it walks to {path[-1][1]} ({way}) and heals."
+
+
+def no_pokemon_center_note(location_name: str, toward: Optional[str] = None) -> str:
+    """What to do when no Pokémon Center can be reached from here: keep going, and heal
+    at the next one on the way (next_pokemon_center), never "go back the way you came".
+
+    Seen live: one fainted CAMERUPT and five healthy teammates in ROUTE 119 WEATHER
+    INSTITUTE; the advice to heal sent the model back over water and ledges it could not
+    cross (heal_at_pokecenter refused, go_to Mauville), away from the objective.
+    """
+    how = "on foot or by Surf" if can_surf() else "on foot"
+    head = f"no Pokémon Center can be reached {how} from here, so don't turn back for one: keep going"
+    center = next_pokemon_center(location_name, toward)
+    if center:
+        return f"{head} toward {toward} and heal at {center}, the next one on the way."
+    return f"{head} (none is reachable from here)."
+
+
+def _map_neighbours(map_dir: str) -> List[str]:
+    """Maps this one leads to by its edges and its warps, whatever lies between: the
+    decomp's map links (map.json connections, warp_events), not a walk."""
+    from utils.mapping.porymap_state import _map_dirs_by_const
+
+    raw, dirs = _raw_map_json(map_dir), _map_dirs_by_const()
+    consts = [c.get("map") for c in raw.get("connections") or []]
+    consts += [w.get("dest_map") for w in raw.get("warp_events") or []]
+    return [dirs[c] for c in consts if c in dirs]
+
+
+def _center_of(map_dir: str, names: Dict[str, str]) -> Optional[str]:
+    """The readable name of the Pokémon Center 1F a map has a door to, or None. `names`
+    maps a map dir to its readable name."""
+    target = _squash_name(POKEMON_CENTER_1F)
+    for neighbour in _map_neighbours(map_dir):
+        name = names.get(neighbour, "")
+        if _squash_name(name).endswith(target):
+            return name
+    return None
+
+
+def next_pokemon_center(location_name: str, toward: Optional[str]) -> Optional[str]:
+    """The Pokémon Center the player comes to next on the way to `toward` (an objective's
+    place, matched like go_to's place_route): the first map with one along the fewest
+    maps from here to there, counting map links only (what blocks the way now, a ledge
+    or water without Surf, is the player's to get past by going on). None without a
+    `toward`, when it names no map, or when no Center lies on the way."""
+    from collections import deque
+
+    from utils.mapping.porymap_state import _map_dirs_by_const, _readable_map_name
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    start = ROM_TO_PORYMAP_MAP.get(location_name, "")
+    words = _place_words(toward or "")
+    if not start or not words:
+        return None
+    names = {d: _readable_map_name(c) for c, d in _map_dirs_by_const().items()}
+
+    def is_goal(map_dir: str) -> bool:
+        have, at = _place_words(names.get(map_dir, "")), 0
+        for word in words:
+            while at < len(have) and not _same_word(have[at], word):
+                at += 1
+            if at == len(have):
+                return False
+            at += 1
+        return True
+
+    parent = {start: None}
+    queue = deque([start])
+    goal = None
+    while queue:
+        here = queue.popleft()
+        if is_goal(here):
+            goal = here
+            break
+        for there in _map_neighbours(here):
+            if there not in parent:
+                parent[there] = here
+                queue.append(there)
+    if goal is None:
+        return None
+    way = []
+    while goal is not None:
+        way.append(goal)
+        goal = parent[goal]
+    for map_dir in reversed(way[:-1]):  # the maps after this one, in walking order
+        center = _center_of(map_dir, names)
+        if center:
+            return center
+    return None
 
 
 # ---------------------------------------------------------------------------

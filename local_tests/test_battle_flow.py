@@ -391,7 +391,9 @@ def test_assess_team_condition_rules():
     data = table.get
     moves = ["SCRATCH", "GROWL", "EMBER", "NONE"]
     healthy = assess_team_condition([_mon("Torchic", 18, 35, moves, [30, 40, 20, 0])], data)
-    assert healthy == {"weak": False, "reasons": [], "lead": "TORCHIC"}, healthy  # 18/35 is over half
+    # 18/35 is over half. ("notes" is new: the fainted or low ones of a team that isn't
+    # weak; the old exact dict had no such key.)
+    assert healthy == {"weak": False, "reasons": [], "notes": [], "lead": "TORCHIC"}, healthy
     hurt = assess_team_condition([_mon("Torchic", 17, 35, moves, [30, 40, 20, 0])], data)
     assert hurt["weak"] and hurt["reasons"] == ["TORCHIC 17/35 HP"], hurt
     # Damaging moves all at <= 25% of base PP (GROWL's PP doesn't matter).
@@ -403,7 +405,89 @@ def test_assess_team_condition_rules():
         [_mon("Torchic", 0, 35, moves, [0, 0, 0, 0]), _mon("Shroomish", 20, 20, ["TACKLE"], [35])],
         {**table, "TACKLE": {"power": 35, "pp": 35}}.get,
     )
+    # Two members, one fainted: fewer than two can fight, still weak.
     assert fainted["reasons"] == ["TORCHIC fainted"] and fainted["lead"] == "SHROOMISH", fainted
+
+
+LAVARIDGE = HERE / "test_lavaridge_after_chimney.state"  # six Pokémon, all at full HP
+JAGGED_PASS = HERE / "test_jagged_pass_top.state"  # saved live: BRELOOM fainted, two under half
+AT_SEA = HERE / "test_after_briney.state"  # ROUTE 105 at sea on Mr. Briney's boat, no Surf
+
+
+def _set_hp(s, slot, hp):
+    _write(s, 16, PARTY + slot * 100 + 0x56, hp)
+
+
+def test_one_fainted_with_healthy_others_is_not_weak():
+    """Seen live: only CAMERUPT fainted, the other five at 70-100% HP; "TEAM IS WEAK"
+    sent the model out of the Weather Institute to heal. RAM: test_lavaridge_after_chimney
+    .state's BRELOOM (slot 6) at 0 HP. The fainted one is a note, not a reason to turn
+    back."""
+    s = server()
+    s.load(LAVARIDGE, wild_encounters=False)
+    _set_hp(s, 5, 0)
+    condition = _read(s, lambda r: r.read_team_condition())
+    print("   ", condition)
+    assert condition["weak"] is False and condition["reasons"] == [], condition
+    assert condition["notes"] == ["BRELOOM fainted"], condition
+    guidance = {"story": {"description": "Beat Flannery", "navigation_hint": "Go in.", "target_location": "Lavaridge Gym"}}
+    line = s.srv._note_team_condition(guidance)
+    hint = guidance["story"]["navigation_hint"]
+    print("   ", hint)
+    assert line and "TEAM IS WEAK" not in hint and "heal_at_pokecenter" not in hint, hint
+    assert hint.startswith("Go in.") and "BRELOOM fainted" in hint and "keep to the objective" in hint, hint
+
+
+def test_live_jagged_pass_team_is_not_weak_but_most_low_is():
+    """test_jagged_pass_top.state (saved live): BRELOOM fainted, AZUMARILL 24/75 and
+    SABLEYE 23/69, the other three healthy: two of the five that can fight are low, not
+    most (the old rule called it weak). With COMBUSKEN low too (RAM) three of five are:
+    weak. And with all but one fainted (RAM), whatever their HP: weak."""
+    s = server()
+    s.load(JAGGED_PASS, wild_encounters=False)
+    live = _read(s, lambda r: r.read_team_condition())
+    print("   ", live)
+    assert live["weak"] is False, live
+    assert set(live["notes"]) == {"BRELOOM fainted", "AZUMARILL 24/75 HP", "SABLEYE 23/69 HP"}, live
+    _set_hp(s, 4, 10)  # COMBUSKEN (slot 5) 10/83
+    most = _read(s, lambda r: r.read_team_condition())
+    print("   ", most)
+    assert most["weak"] is True and "COMBUSKEN 10/83 HP" in most["reasons"] and "BRELOOM fainted" in most["reasons"], most
+    s.load(LAVARIDGE, wild_encounters=False)
+    for slot in range(1, 6):
+        _set_hp(s, slot, 0)
+    alone = _read(s, lambda r: r.read_team_condition())
+    assert alone["weak"] is True and alone["lead"] == "NUMEL", alone  # NUMEL at full HP, but alone
+
+
+def test_no_reachable_center_says_keep_going_and_names_the_next_one():
+    """With no Pokémon Center in reach the advice was "go back the way you came" (seen
+    live: the model left its objective for a Center it could not reach). test_after_briney.state is at sea on ROUTE 105 with no Surf: no Center can be
+    reached. The advice says to keep going, toward the objective's place, and names the
+    next Center on the way there (pret maps: ROUTE 105 → ROUTE 106 → DEWFORD TOWN)."""
+    from server import game_tools
+
+    s = server()
+    s.load(AT_SEA, wild_encounters=False)
+    snap = s.snapshot()
+    location = s.srv._location_name()
+    assert location == "ROUTE 105" and game_tools.pokemon_center_route(location, (snap.x, snap.y)) == []
+    plain = game_tools.way_to_pokemon_center(location, (snap.x, snap.y))
+    print("   ", plain)
+    assert "go back" not in plain and "keep going" in plain and "none is reachable from here" in plain, plain
+    toward = game_tools.way_to_pokemon_center(location, (snap.x, snap.y), "Dewford Town")
+    print("   ", toward)
+    assert toward.endswith(
+        "keep going toward Dewford Town and heal at DEWFORD TOWN POKEMON CENTER 1F, the next one on the way."
+    ), toward
+    # A weak team there: the objective line says the same, not "heal before any trainer".
+    _set_hp(s, 0, 5)
+    _set_hp(s, 1, 5)
+    guidance = {"story": {"description": "Sail to Dewford", "navigation_hint": "", "target_location": "Dewford Town"}}
+    line = s.srv._note_team_condition(guidance)
+    print("   ", line)
+    assert line.startswith("TEAM IS WEAK (") and "DEWFORD TOWN POKEMON CENTER 1F, the next one on the way" in line, line
+    assert "heal before any trainer" not in line and "go back" not in line, line
 
 
 def test_team_condition_from_memory_healthy_then_low():
