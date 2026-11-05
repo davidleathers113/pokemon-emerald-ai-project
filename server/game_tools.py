@@ -2721,6 +2721,55 @@ def fly_destination_named(destinations: List[FlyDestination], name: str) -> Opti
     return None
 
 
+@lru_cache(maxsize=None)
+def visit_triggers(map_dir: str, flag: str) -> Tuple[bool, Tuple[Tuple[int, int], ...]]:
+    """How the game sets a town's FLAG_VISITED_* flag: (a map script sets it on arrival,
+    the coord_events tiles whose script sets it).
+
+    In pret most towns `setflag FLAG_VISITED_<town>` in their OnTransition map script
+    (DewfordTown_OnTransition), some through a call (SlateportCity_OnTransition →
+    SlateportCity_EventScript_EnterSlateport). Mossdeep and Ever Grande set it only from
+    coord events: MossdeepCity_EventScript_VisitedMossdeep at (25,25), (26,25), (32,27)
+    and (33,27). Seen live: MOSSDEEP CITY was refused by fly_to after the player came in
+    from Route 124's west edge, past none of those tiles. Map scripts that run in tables
+    (MAP_SCRIPT_ON_FRAME_TABLE, ..._WARP_INTO_MAP_TABLE) run only when a var matches, so
+    only the plain ones (ON_TRANSITION, ON_LOAD, ON_RESUME, ...) count as arriving.
+    """
+
+    def sets(label: str) -> bool:
+        # _script_lines follows the label's calls, gotos and fall-throughs.
+        return any(line.split() == ["setflag", flag] for line in _script_lines(map_dir, label))
+
+    on_arrival = False
+    for line in _script_labels(map_dir)[0].get(f"{map_dir}_MapScripts", ()):
+        command, _, args = line.partition(" ")
+        kind, _, script = args.partition(",")
+        if command == "map_script" and not kind.strip().endswith("_TABLE") and sets(script.strip()):
+            on_arrival = True
+    tiles = []
+    for event in _raw_map_json(map_dir).get("coord_events") or []:
+        tile = (int(event.get("x", -1)), int(event.get("y", -1)))
+        if event.get("type") == "trigger" and tile not in tiles and sets(str(event.get("script", ""))):
+            tiles.append(tile)
+    return on_arrival, tuple(sorted(tiles, key=lambda t: (t[1], t[0])))  # row by row, as on screen
+
+
+def visit_hint(town: str) -> str:
+    """A sentence on what makes fly_to's `town` count as visited, from its map's scripts
+    (visit_triggers), or "" when nothing there sets its FLAG_VISITED_* flag."""
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    on_arrival, tiles = visit_triggers(ROM_TO_PORYMAP_MAP.get(town, ""), "FLAG_VISITED_" + town.replace(" ", "_"))
+    ways = ["as soon as you arrive there"] if on_arrival else []
+    if tiles:
+        cells = [f"({x},{y})" for x, y in tiles]
+        listed = cells[0] if len(cells) == 1 else ", ".join(cells[:-1]) + " or " + cells[-1]
+        ways.append(f"once you walk over {listed} there")
+    if not ways:
+        return ""
+    return f"{town} counts as visited {', or '.join(ways)}."
+
+
 def can_fly() -> bool:
     """A party Pokémon (not an egg) knows FLY and the Feather Badge is set."""
     return FLY in _usable_field_moves()

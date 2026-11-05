@@ -8641,7 +8641,13 @@ async def mcp_fly_to(request: dict = None):
     if town is None:
         return _refusal(f"{wanted} is not a town Fly goes to. Towns you can fly to: {visited}.")
     if not town.visited:
-        return _refusal(f"You haven't been to {town.town} yet, and Fly only goes to towns you have visited: {visited}.")
+        # Seen live: MOSSDEEP CITY refused after the player had walked in from Route 124;
+        # its flag is set only on a few trigger tiles, so the refusal names them.
+        hint = game_tools.visit_hint(town.town)
+        return _refusal(
+            f"You haven't been to {town.town} yet, and Fly only goes to towns you have visited: {visited}."
+            + (f" {hint}" if hint else "")
+        )
     index, why = _flyer()
     if index is None:
         return _refusal(f"Can't fly: {why}.")
@@ -8949,6 +8955,30 @@ def _hm_moves() -> set:
         return {ms.tmhm_move(env.memory_reader, item) for item in range(ms.ITEM_TM01 + 50, ms.ITEM_TM01 + 58)}
 
 
+def _hm_carrier_refusal(item: dict, move: str, species: str, party: list) -> Optional[Dict[str, Any]]:
+    """teach_move's refusal when `item` is an HM whose move David's protocol gives to
+    another species (pokemon_env/hm_carriers.py), else None. TMs, and HMs the table
+    doesn't name (ROCK SMASH), are left alone. An HM can't be forgotten in the field
+    (pret: only the Move Deleter in Lilycove), so one taught to the wrong Pokémon keeps
+    a fighter's move slot for good."""
+    from pokemon_env import hm_carriers
+    from server import menu_state as ms
+
+    if not ms.ITEM_TM01 + 50 <= item["item_id"] < ms.ITEM_TM01 + 58:  # HM01-HM08
+        return None
+    carrier = hm_carriers.HM_CARRIERS.get(move)
+    if carrier is None or carrier == species:
+        return None
+    where = (
+        "" if any(p.species_name.upper() == carrier for p in party if not p.is_egg)
+        else f" {carrier} is not in your party: withdraw it from the PC first."
+    )
+    return _refusal(
+        f"{item['name']} ({move}) goes on {carrier}, not {species}: the HM protocol keeps HMs on their "
+        f"carrier and off the fighters.{where}"
+    )
+
+
 @app.post("/mcp/teach_move")
 async def mcp_teach_move(request: dict = None):
     """MCP Tool: teach a TM or HM from the bag to a party Pokémon, forgetting a move if needed.
@@ -9005,6 +9035,9 @@ async def mcp_teach_move(request: dict = None):
         personalities = ms.party_personalities(env.memory_reader)
     if not able:
         return _refusal(f"{name} is NOT ABLE to learn {new_name} from {item['name']}.")
+    refused = _hm_carrier_refusal(item, new_name, name, party)
+    if refused:
+        return refused
     known = [m for m in mon.moves if m and m != "NONE"]
     if move_name[item["item_id"]] in known:
         return _refusal(f"{name} already knows {new_name}.")

@@ -211,6 +211,63 @@ def test_an_unvisited_town_is_never_chosen():
     assert _where(s) == before and s.srv._player_can_walk(), "the menus are still open"
 
 
+def test_visit_triggers_read_from_the_map_scripts():
+    """pret: Mossdeep sets FLAG_VISITED_MOSSDEEP_CITY only in
+    MossdeepCity_EventScript_VisitedMossdeep, a coord event at four tiles; Dewford sets
+    its flag in DewfordTown_OnTransition; Slateport through a call from its OnTransition
+    (SlateportCity_EventScript_EnterSlateport). No emulator needed."""
+    from server import game_tools
+
+    assert game_tools.visit_triggers("MossdeepCity", "FLAG_VISITED_MOSSDEEP_CITY") == (
+        False, ((25, 25), (26, 25), (32, 27), (33, 27))
+    )
+    assert game_tools.visit_triggers("DewfordTown", "FLAG_VISITED_DEWFORD_TOWN") == (True, ())
+    assert game_tools.visit_triggers("SlateportCity", "FLAG_VISITED_SLATEPORT_CITY") == (True, ())
+    # A flag the map never sets, and a map with no scripts.inc.
+    assert game_tools.visit_triggers("MossdeepCity", "FLAG_VISITED_DEWFORD_TOWN") == (False, ())
+    assert game_tools.visit_triggers("NoSuchMap", "FLAG_VISITED_MOSSDEEP_CITY") == (False, ())
+    assert game_tools.visit_hint("MOSSDEEP CITY") == (
+        "MOSSDEEP CITY counts as visited once you walk over (25,25), (26,25), (32,27) or (33,27) there."
+    )
+    assert game_tools.visit_hint("DEWFORD TOWN") == "DEWFORD TOWN counts as visited as soon as you arrive there."
+
+
+def _trigger_tiles(map_dir, script):
+    """The coord_events tiles in data/maps/<map_dir>/map.json that run `script`, row by row."""
+    import json
+
+    from pokemon_env.porymap_paths import get_porymap_root
+
+    data = json.loads((Path(get_porymap_root()) / "data" / "maps" / map_dir / "map.json").read_text(encoding="utf-8"))
+    return sorted(((e["x"], e["y"]) for e in data["coord_events"] if e["script"] == script), key=lambda t: (t[1], t[0]))
+
+
+def test_an_unvisited_town_s_refusal_says_what_marks_it_visited():
+    """Seen live: fly_to("MOSSDEEP CITY") was refused after the player had come in from
+    Route 124's west edge, past none of the tiles that set its flag. Mossdeep and Ever
+    Grande (both unvisited here) name their trigger tiles, read from map.json here;
+    Lilycove's OnTransition sets its flag, so arriving is enough."""
+    s = server()
+    _load(s)
+    before = _where(s)
+    for town, map_dir, script in (
+        ("MOSSDEEP CITY", "MossdeepCity", "MossdeepCity_EventScript_VisitedMossdeep"),
+        ("EVER GRANDE CITY", "EverGrandeCity", "EverGrandeCity_EventScript_SetVisitedEverGrande"),
+    ):
+        tiles = [f"({x},{y})" for x, y in _trigger_tiles(map_dir, script)]
+        assert len(tiles) >= 4, tiles
+        r = s.call("mcp_fly_to", {"town": town, "reasoning": "test"})
+        print("   ", r.get("error") or r)
+        assert r["success"] is False and r["error"].startswith(f"You haven't been to {town} yet"), r
+        assert r["error"].endswith(
+            f" {town} counts as visited once you walk over {', '.join(tiles[:-1])} or {tiles[-1]} there."
+        ), r
+    r = s.call("mcp_fly_to", {"town": "Lilycove", "reasoning": "test"})
+    print("   ", r.get("error") or r)
+    assert r["success"] is False and r["error"].endswith(" LILYCOVE CITY counts as visited as soon as you arrive there."), r
+    assert _where(s) == before and s.srv._player_can_walk()
+
+
 def test_indoors_no_fly():
     s = server()
     _load(s)

@@ -676,6 +676,45 @@ def test_teach_move_backs_out_cleanly_when_the_forget_cursor_misses():
     assert _read(s, lambda rd: [p.moves for p in rd.read_party_pokemon()]) == before, "a move was forgotten"
 
 
+def test_teach_move_keeps_a_table_hm_on_its_carrier():
+    """David's HM protocol (pokemon_env/hm_carriers.py): FLASH goes on TROPIUS, never on a
+    fighter. test_fly_ready.state (see test_fly.py) has HM05 (FLASH) and HM06 (ROCK SMASH,
+    not in the table) in the bag, TROPIUS in the party, and SABLEYE and BRELOOM able to
+    learn FLASH; test_fortree_gym.state has HM05 too and no TROPIUS. No RAM writes."""
+    from pokemon_env import hm_carriers
+
+    assert hm_carriers.HM_CARRIERS["FLASH"] == "TROPIUS"
+    s = server()
+    s.load(HERE / "test_fly_ready.state", wild_encounters=False)
+    before = _read(s, lambda rd: [p.moves for p in rd.read_party_pokemon()])
+    for fighter in ("SABLEYE", "BRELOOM"):
+        r = s.call("mcp_teach_move", {"item": "HM05", "pokemon": fighter, "reasoning": "test"})
+        print("   ", r.get("error") or r)
+        assert r["success"] is False, r
+        assert r["error"].startswith(f"HM05 (FLASH) goes on TROPIUS, not {fighter}"), r
+        assert "keeps HMs on their carrier and off the fighters" in r["error"], r
+        assert "not in your party" not in r["error"], r
+    assert s.srv._player_can_walk(), "a menu was opened"
+    assert _read(s, lambda rd: [p.moves for p in rd.read_party_pokemon()]) == before
+    # The guard leaves TMs and HMs outside the table alone (they go on to the menus as before).
+    party = _party(s)
+    assert s.srv._hm_carrier_refusal({"item_id": 344, "name": "HM06"}, "ROCK SMASH", "SABLEYE", party) is None
+    assert s.srv._hm_carrier_refusal({"item_id": 327, "name": "TM39"}, "ROCK TOMB", "SABLEYE", party) is None
+    # The carrier itself is taught: the whole menu flow runs and FLASH replaces SWEET SCENT.
+    r = s.call("mcp_teach_move", {"item": "HM05", "pokemon": "TROPIUS", "forget": "SWEET SCENT", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["summary"].startswith("TROPIUS learned FLASH (forgot SWEET SCENT)"), r
+    tropius = next(p for p in _party(s) if p.species_name.upper() == "TROPIUS")
+    assert "FLASH" in tropius.moves and "SWEET_SCENT" not in tropius.moves, tropius.moves
+    assert s.srv._player_can_walk()
+    # Without the carrier in the party, the refusal says where it is.
+    s.load(HERE / "test_fortree_gym.state", wild_encounters=False)
+    r = s.call("mcp_teach_move", {"item": "HM05", "pokemon": "MANECTRIC", "reasoning": "test"})
+    print("   ", r.get("error") or r)
+    assert r["success"] is False and r["error"].startswith("HM05 (FLASH) goes on TROPIUS, not MANECTRIC"), r
+    assert r["error"].endswith("TROPIUS is not in your party: withdraw it from the PC first."), r
+
+
 def _run_all():
     import test_movement_feedback as harness
 
