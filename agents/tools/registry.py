@@ -873,13 +873,15 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "name": "train",
         "scaffolds": GUIDE_SCAFFOLDS,
         "description": (
-            "Level up one party Pokemon on wild battles, in one call: walks into the nearest "
-            "tall grass (or cave), steps until a wild Pokemon appears, switches the trainee "
-            "out on turn 1 for your strongest teammate, wins with its best move, and repeats. "
-            "The trainee shares the EXP without fighting. Stops at until_level, when the team "
-            "is weak, at a question (new move, evolution), a trainer, or after max_minutes, "
-            "and reports every battle. With catch, it also stops when that wild species "
-            "appears (at catch_min_level or higher) so you can catch it."
+            "Level up one party Pokemon on wild battles, in one call: walks onto the nearest "
+            "tiles where this map's wild Pokemon appear, steps until one does, switches the "
+            "trainee out on turn 1 for a teammate that wins (teammates take turns), wins with "
+            "its best move, and repeats. The trainee shares the EXP without fighting. A weak "
+            "team is healed at a Pokemon Center, not with the bag, unless heal_with_items. "
+            "Stops at until_level, when the team is weak, at a question (new move, "
+            "evolution), a trainer, or after max_minutes, and reports every battle and the "
+            "wild levels here. With catch, it also stops when that wild species appears (at "
+            "catch_min_level or higher) so you can catch it."
         ),
         "parameters": {
             "type_": "OBJECT",
@@ -899,6 +901,13 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
                 "max_minutes": {"type_": "NUMBER", "description": "Time limit, default 4, at most 10."},
                 "catch": {"type_": "STRING", "description": "A wild species to stop for and catch, e.g. 'SABLEYE'."},
                 "catch_min_level": {"type_": "INTEGER", "description": "Only stop for one at this level or higher."},
+                "heal_with_items": {
+                    "type_": "BOOLEAN",
+                    "description": (
+                        "Heal a weak team with the bag's Potions when they are enough, instead of at a Pokemon "
+                        "Center (default false). Never Revive, Max Revive, Full Restore or Max Potion."
+                    ),
+                },
                 "reasoning": {"type_": "STRING", "description": "One short sentence: why train now."},
             },
             "required": ["trainee", "reasoning"],

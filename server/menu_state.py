@@ -386,6 +386,96 @@ def active_battler_personality(reader) -> int:
     return reader._read_u32(G_BATTLE_MONS + BATTLE_MON_PERSONALITY)
 
 
+# What keeps a battler in (pret include/constants/battle.h, include/battle.h struct
+# BattlePokemon: +0x20 ability, +0x21/+0x22 types, +0x2E item, +0x50 status2).
+G_BATTLERS_COUNT = 0x0202406C
+G_STATUSES3 = 0x020242AC          # u32[4]
+G_BATTLE_STRUCT = 0x0202449C      # struct BattleStruct *; +0x04 wrappedMove[battler * 2] (u16, two bytes)
+G_LAST_LANDED_MOVES = 0x02024250  # u16[4]: the move that last hit each battler
+G_LAST_HIT_BY = 0x02024270        # u8[4]: the battler that last hit each one
+BATTLE_MON_ABILITY, BATTLE_MON_TYPE1, BATTLE_MON_TYPE2 = 0x20, 0x21, 0x22
+BATTLE_MON_ITEM, BATTLE_MON_STATUS2 = 0x2E, 0x50
+STATUS2_WRAPPED = 0x0000E000
+STATUS2_ESCAPE_PREVENTION = 0x04000000
+STATUS3_ROOTED = 0x400
+ABILITY_SHADOW_TAG, ABILITY_LEVITATE, ABILITY_MAGNET_PULL, ABILITY_RUN_AWAY, ABILITY_ARENA_TRAP = 23, 26, 42, 50, 71
+TYPE_FLYING, TYPE_STEEL = 2, 8
+ITEM_SMOKE_BALL = 194  # HOLD_EFFECT_CAN_ALWAYS_RUN
+# Moves that set STATUS2_WRAPPED (pret EFFECT_TRAP): BIND, WRAP, FIRE SPIN, CLAMP, WHIRLPOOL, SAND TOMB.
+TRAPPING_MOVES = (20, 35, 83, 128, 250, 328)
+
+
+@dataclass(frozen=True)
+class Trap:
+    """Why our battler can't be switched out, and whether it may still run."""
+
+    why: str       # "FIRE SPIN", "MEAN LOOK, BLOCK or SPIDER WEB", "SHADOW TAG", ...
+    can_run: bool  # RUN AWAY or a SMOKE BALL still flee a wild battle
+
+
+def _move_text(move_id: int) -> str:
+    from pokemon_env.enums import Move
+
+    try:
+        return Move(move_id).name.replace("_", " ")
+    except ValueError:
+        return f"MOVE {move_id}"
+
+
+def battler_trap(reader, battler: int = 0) -> Optional[Trap]:
+    """What keeps battler (0: ours in a single battle) from switching out, or None.
+
+    pret battle_main.c IsRunningFromBattleImpossible and the party menu's switch check
+    (battle_util/party_menu): a foe with SHADOW TAG; a foe with ARENA TRAP unless ours
+    flies (FLYING type or LEVITATE); a foe with MAGNET PULL when ours is STEEL;
+    STATUS2_WRAPPED (Bind, Wrap, Fire Spin, Clamp, Whirlpool, Sand Tomb) or
+    STATUS2_ESCAPE_PREVENTION (Mean Look, Block, Spider Web); STATUS3_ROOTED (its own
+    Ingrain). RUN AWAY and HOLD_EFFECT_CAN_ALWAYS_RUN let it run, never switch.
+    Seen live (2026-11-05, MAGMA HIDEOUT): wild TORKOAL's FIRE SPIN; SHIFT left the
+    party menu open ("SABLEYE can't be switched out!") and running said "Can't escape!".
+    """
+    base = G_BATTLE_MONS + battler * BATTLE_MON_SIZE
+    ability = reader._read_u8(base + BATTLE_MON_ABILITY)
+    types = {reader._read_u8(base + BATTLE_MON_TYPE1), reader._read_u8(base + BATTLE_MON_TYPE2)}
+    can_run = ability == ABILITY_RUN_AWAY or reader._read_u16(base + BATTLE_MON_ITEM) == ITEM_SMOKE_BALL
+    count = min(reader._read_u8(G_BATTLERS_COUNT), 4)
+    for foe in range(count):
+        if foe % 2 == battler % 2:
+            continue
+        foe_ability = reader._read_u8(G_BATTLE_MONS + foe * BATTLE_MON_SIZE + BATTLE_MON_ABILITY)
+        if foe_ability == ABILITY_SHADOW_TAG:
+            return Trap("its foe's SHADOW TAG", can_run)
+        if foe_ability == ABILITY_ARENA_TRAP and TYPE_FLYING not in types and ability != ABILITY_LEVITATE:
+            return Trap("its foe's ARENA TRAP", can_run)
+        if foe_ability == ABILITY_MAGNET_PULL and TYPE_STEEL in types:
+            return Trap("its foe's MAGNET PULL", can_run)
+    status2 = reader._read_u32(base + BATTLE_MON_STATUS2)
+    if status2 & STATUS2_WRAPPED:
+        struct = reader._read_u32(G_BATTLE_STRUCT)
+        move = reader._read_u16(struct + 4 + battler * 2) if ROM_START > struct >= 0x02000000 else 0
+        if move not in TRAPPING_MOVES:
+            # The foe's own moves name it when the struct doesn't.
+            known = [
+                m for foe in range(count) if foe % 2 != battler % 2
+                for m in (reader._read_u16(G_BATTLE_MONS + foe * BATTLE_MON_SIZE + 0x0C + 2 * i) for i in range(4))
+                if m in TRAPPING_MOVES
+            ]
+            move = known[0] if len(set(known)) == 1 else 0
+        return Trap(_move_text(move) if move else "a trapping move", can_run)
+    if status2 & STATUS2_ESCAPE_PREVENTION:
+        return Trap("MEAN LOOK, BLOCK or SPIDER WEB", can_run)
+    if reader._read_u32(G_STATUSES3 + 4 * battler) & STATUS3_ROOTED:
+        return Trap("its own INGRAIN", can_run)
+    return None
+
+
+def last_hit(reader, battler: int = 0) -> Tuple[int, int]:
+    """(battler that last hit `battler`, the move it landed): pret gLastHitBy and
+    gLastLandedMoves (battle_script_commands.c MOVEEND_UPDATE_LAST_MOVES). gLastHitBy is
+    not updated by a hit that knocks the target out; 0xFFFF as the move: no effect."""
+    return reader._read_u8(G_LAST_HIT_BY + battler), reader._read_u16(G_LAST_LANDED_MOVES + 2 * battler)
+
+
 # ---------------------------------------------------------------------------
 # Party
 # ---------------------------------------------------------------------------

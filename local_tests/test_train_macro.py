@@ -87,12 +87,18 @@ def test_encounter_tiles_from_the_map_data():
         assert abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1, (a, b)
         assert grid[a[1]][a[0]] == "~" and grid[b[1]][b[0]] == "~", (a, b)
     # Caves count on their floor; a town, and the Abandoned Ship's corridors (no land
-    # Pokémon), don't.
+    # Pokémon), don't. Whether a map has land Pokémon is the ROM's gWildMonHeaders now
+    # (read by wild_encounter_spots above): Route 125 is sea and sandbars with water
+    # Pokémon only; Shoal Cave's rooms have land ones at Lv26-32.
     assert game_tools.map_has_wild_encounters("RusturfTunnel")
     assert game_tools.map_has_wild_encounters("GraniteCave_1F")
     assert game_tools.map_has_wild_encounters("PetalburgWoods")
     assert not game_tools.map_has_wild_encounters("RustboroCity")
     assert not game_tools.map_has_wild_encounters("AbandonedShip_Corridors_1F")
+    assert not game_tools.map_has_wild_encounters("Route125")
+    shoal = game_tools.land_wild("ShoalCave_LowTideEntranceRoom")
+    assert shoal is not None and (shoal.rate, shoal.levels) == (10, "Lv26-32"), shoal
+    assert game_tools.land_wild("Route101").levels == "Lv2-3"
 
 
 # -- refusals (nothing pressed) -------------------------------------------------
@@ -105,10 +111,24 @@ def test_train_refuses_without_grass_and_names_the_way():
     r = s.call("mcp_train", {"trainee": "TORCHIC", "reasoning": "test"})
     print("   ", r)
     assert r["success"] is False and r["stopped_because"] == "no_grass", r
-    assert "No tall grass here (RUSTBORO CITY POKEMON CENTER 1F)" in r["error"], r
-    assert 'go_to_exit("RUSTBORO CITY")' in r["error"] and "ROUTE 116" in r["error"], r
+    # Was "No tall grass here (...), and it isn't a cave": the "underground means wild
+    # Pokémon" guess, replaced by the ROM's wild table, which also gives the levels.
+    assert "RUSTBORO CITY POKEMON CENTER 1F has no wild Pokémon on land" in r["error"], r
+    assert 'go_to_exit("RUSTBORO CITY")' in r["error"] and "ROUTE 116 (Lv6-8)" in r["error"], r
     after = s.snapshot()
     assert (after.x, after.y) == (before.x, before.y), (before, after)
+
+
+def test_train_refuses_a_map_without_land_pokemon():
+    """ROUTE 125 has water Pokémon only (gWildMonHeaders: no landMonsInfo), though its
+    sandbars look walkable. test_route125_by_shoal_cave.state is the live checkpoint
+    (2026-11-05 17:02 UTC) on ROUTE 125 (19,31), by the Shoal Cave entrance."""
+    s = server()
+    s.load(HERE / "test_route125_by_shoal_cave.state")
+    r = s.call("mcp_train", {"trainee": "LOWEST", "until_level": 48, "reasoning": "test"})
+    print("   ", r)
+    assert r["success"] is False and r["stopped_because"] == "no_grass", r
+    assert r["error"].startswith("ROUTE 125 has no wild Pokémon on land: "), r
 
 
 def test_train_only_picks_grass_it_can_walk_to():
@@ -209,7 +229,10 @@ def test_train_heals_from_the_bag_before_walking_to_a_pokemon_center():
     _put_in_bag(s, 22, 3)
     partner = _hurt_partner(s, "MARILL")
     top = _by_name(s, partner).max_hp
-    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
+    # heal_with_items=True: since 2026-11-05 the bag is used only when asked (seen live,
+    # one call spent David's FULL RESTORE, 5 SUPER POTIONs and a REVIVE); this test is
+    # about the bag heal itself, so it asks.
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "heal_with_items": True, "reasoning": "test"})
     print("   ", r.get("summary") or r)
     assert r["success"] is True, r
     want = f"On the way: used SUPER POTION on {partner} (10→{min(top, 60)} HP)"
@@ -695,6 +718,266 @@ def test_agent_registers_train_and_outwaits_its_time_limit():
     # Capped like the server caps max_minutes.
     assert pa.tool_timeout_s("train", {"max_minutes": 99}) == pa.tool_timeout_s("train", {"max_minutes": s.srv.TRAIN_MAX_MINUTES})
     assert pa.tool_timeout_s("use_move", {}) == pa.PRESSING_TOOL_TIMEOUT_S
+
+
+# -- Shoal Cave: a map whose layout a script swaps (2026-11-05) ---------------------
+#
+# Seen live: train(LOWEST, until_level=48) in SHOAL CAVE LOW TIDE ENTRANCE ROOM said "No
+# wild battle in 25 s (300 steps in the grass)" twice. The room was flooded: at high tide
+# its OnTransition script draws it from LAYOUT_SHOAL_CAVE_HIGH_TIDE_ENTRANCE_ROOM
+# (setmaplayoutindex, gSaveBlock1Ptr->mapLayoutId), while the harness read the map file's
+# low-tide layout. Its cave floor at (18,16) and (14,24) is shallow water at high tide,
+# which rolls no encounter (pret sTileBitAttributes). Fixtures, both walked into from
+# test_route125_by_shoal_cave.state with go_to("SHOAL CAVE LOW TIDE ENTRANCE ROOM"):
+#   test_shoal_cave_high_tide.state  entered at high tide (layout 168), at (20,30)
+#   test_shoal_cave_low_tide.state   entered at low tide (layout 164), at (20,30): out to
+#                                    ROUTE 125, the game clock moved 3 hours on in RAM
+#                                    (SaveBlock2 localTimeOffset.hours, what the clock
+#                                    setting changes), and back in
+# Party: AZUMARILL 41 (lead), TROPIUS 33 with the Exp. Share, SABLEYE 37, BLAZIKEN 37,
+# BRELOOM 42, MANECTRIC 37.
+HIGH_TIDE = HERE / "test_shoal_cave_high_tide.state"
+LOW_TIDE = HERE / "test_shoal_cave_low_tide.state"
+MB_CAVE, MB_SHALLOW_WATER = 8, 23  # pret include/constants/metatile_behaviors.h
+
+
+def test_train_at_high_tide_walks_the_layout_the_game_draws():
+    from server import game_tools
+
+    s = server()
+    s.load(HIGH_TIDE)
+    r = s.call("mcp_train", {"trainee": "LOWEST", "until_level": 48, "max_minutes": 1.5, "reasoning": "test"})
+    print("   ", r["summary"])
+    assert r["success"] is True and r["steps"] > 0 and r["battles"], r
+    assert "Wild Pokémon here: Lv26-32." in r["summary"], r
+    assert s.snapshot().map_id == (24, 46)
+    from utils.mapping.dynamic_map_overlay import swapped_layout
+
+    s.load(HIGH_TIDE)
+    with s.srv.memory_lock:
+        swapped = swapped_layout(s.srv.env.memory_reader)
+        state = game_tools.load_pathfinding_state(s.srv.env)[0]
+        spots = game_tools.wild_encounter_spots(s.srv.env)
+    assert swapped and swapped["id"] == "LAYOUT_SHOAL_CAVE_HIGH_TIDE_ENTRANCE_ROOM", swapped
+    raw = state["map"]["porymap"]["raw_tiles"]
+    # The tiles train stepped on live: cave floor in the map file, water now.
+    for x, y in ((18, 16), (14, 24), (15, 24)):
+        assert int(raw[y][x][1]) == MB_SHALLOW_WATER, ((x, y), raw[y][x])
+    assert spots["pairs"] and spots["land"].levels == "Lv26-32", spots
+    for pair in spots["pairs"]:
+        for x, y in pair:
+            assert int(raw[y][x][1]) == MB_CAVE, ((x, y), raw[y][x])
+
+
+def test_train_partners_take_turns():
+    """David (2026-11-05): fighters spread out. Seen live in MAGMA HIDEOUT: AZUMARILL
+    fought every battle of a 10-minute call (TROPIUS, the trainee, earns from the bench
+    with the Exp. Share, so the lead fought each one). Low tide: the map file's layout."""
+    s = server()
+    s.load(LOW_TIDE)
+    exp_before = _by_name(s, "TROPIUS").experience
+    r = s.call("mcp_train", {"trainee": "LOWEST", "until_level": 48, "max_minutes": 1.5, "reasoning": "test"})
+    print("   ", r["summary"])
+    partners = [b["partner"] for b in r["battles"] if b.get("partner")]
+    print("    partners:", partners)
+    assert len(partners) >= 3, r
+    assert "TROPIUS" not in partners and _by_name(s, "TROPIUS").experience > exp_before, partners
+    # Nobody fights more than half the battles, and never two in a row while others win.
+    assert max(partners.count(p) for p in partners) * 2 <= len(partners) + 1, partners
+    assert all(a != b for a, b in zip(partners, partners[1:])), partners
+    assert "taking turns" in r["summary"], r
+    from utils.mapping.dynamic_map_overlay import swapped_layout
+
+    with s.srv.memory_lock:
+        assert swapped_layout(s.srv.env.memory_reader) is None  # low tide: the map file's own layout
+
+
+# -- healing: a Pokémon Center unless the bag is allowed (2026-11-05) -----------------
+
+
+def _weak_at_route117(s, *items):
+    """ROUTE 117 (0,8) by VERDANTURF TOWN, the bag's medicine gone but `items` (id, n),
+    train's partner for MARILL at 10 HP. Returns the partner's name."""
+    s.load(HERE / "test_verdanturf_east.state")
+    assert s.call("mcp_go_to_exit", {"exit": "east", "reasoning": "test"})["success"]
+    _no_medicine(s)
+    for item_id, quantity in items:
+        _put_in_bag(s, item_id, quantity)
+    return _hurt_partner(s, "MARILL")
+
+
+def test_train_heals_at_a_pokemon_center_by_default():
+    """Seen live (MAGMA HIDEOUT): one 10-minute call used David's FULL RESTORE, 5 SUPER
+    POTIONs and a REVIVE. Without heal_with_items, the SUPER POTIONs stay in the bag."""
+    s = server()
+    partner = _weak_at_route117(s, (22, 3))
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 1, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["summary"].startswith("On the way: healed at "), r
+    assert "used " not in r["summary"] and s.srv._bag_counts().get(22) == 3, (r, s.srv._bag_counts())
+    assert _by_name(s, partner).current_hp > 10
+
+
+def test_train_with_items_keeps_the_rare_medicine():
+    """David (2026-11-05): train never uses FULL RESTORE, MAX POTION, REVIVE or MAX
+    REVIVE (kept for gyms and bosses), even with heal_with_items=True: with only those in
+    the bag it heals at a Pokémon Center. RAM: the bag's items inserted (_put_in_bag)."""
+    rare = ((19, 1), (20, 1), (24, 1))  # FULL RESTORE, MAX POTION, REVIVE
+    s = server()
+    _weak_at_route117(s, *rare)
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 0.5, "heal_with_items": True, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["summary"].startswith("On the way: healed at "), r
+    counts = s.srv._bag_counts()
+    assert all(counts.get(i) == n for i, n in rare), counts
+
+
+def test_no_bag_item_when_a_center_trip_is_due_anyway():
+    """Seen live: train used the last REVIVE, then walked to the Pokémon Center anyway
+    (David: "What a waste!"). With a fainted partner the Center trip is due whatever the
+    Potions do, so nothing in the bag is used, heal_with_items or not. RAM: a REVIVE and 3
+    SUPER POTIONs inserted in the bag, train's partner for MARILL at 0 HP."""
+    s = server()
+    partner = _weak_at_route117(s, (24, 1), (22, 3))
+    slot = next(i for i, mon in enumerate(_party(s)) if mon.species_name.upper() == partner)
+    _write(s, 16, PARTY + 100 * slot + 0x56, 0)
+    r = s.call("mcp_train", {"trainee": "MARILL", "max_minutes": 0.5, "heal_with_items": True, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["summary"].startswith("On the way: healed at "), r
+    assert "used " not in r["summary"], r
+    counts = s.srv._bag_counts()
+    assert counts.get(24) == 1 and counts.get(22) == 3, counts
+    assert _by_name(s, partner).current_hp > 0
+
+
+# -- trainee safety, faints, traps (2026-11-05) -------------------------------------
+
+
+def _foe_moves(s, move_id):
+    """RAM: the wild Pokémon (gBattleMons[1]) knows only `move_id`, 20 PP in each slot."""
+    for i in range(4):
+        _write(s, 16, BATTLE_MONS + 0x58 + 0x0C + 2 * i, move_id)
+        _write(s, 8, BATTLE_MONS + 0x58 + 0x24 + i, 20)
+
+
+def test_a_trainee_weak_to_the_foe_is_not_sent_in():
+    """Seen live (MAGMA HIDEOUT): BLAZIKEN and MANECTRIC fainted training among
+    GEODUDE/GRAVELER (MAGNITUDE, ROCK THROW). test_wild_two_party.state: TORCHIC out,
+    SHROOMISH (the trainee) on the bench, which train normally sends in for one turn
+    (test_trainee_not_leading_still_gets_the_exp). RAM: the wild SILCOON knows only EMBER,
+    2x on SHROOMISH: it stays on the bench."""
+    s = server()
+    s.load(WILD_TWO)
+    _foe_moves(s, 52)  # EMBER
+    r = s.call("mcp_train", {"trainee": "SHROOMISH", "max_minutes": 0.2, "reasoning": "test"})
+    print("   ", r["summary"])
+    first = r["battles"][0]
+    print("      ", first)
+    assert not first.get("trainee_sent_in") and first["switched"] is False, first
+    assert first["exp_gained"] == 0, first  # it never came out, so it shares nothing here
+    s.load(WILD_TWO)
+    _foe_moves(s, 52)
+    trainee = next(pid for pid, mon in s.srv._train_party() if mon.species_name.upper() == "SHROOMISH")
+    with s.srv.memory_lock:
+        view = s.srv.env.memory_reader.read_battle_view()
+    threat = s.srv._trainee_threat(s.srv._train_party(), trainee, view)
+    assert threat == "SILCOON's EMBER is 2x on SHROOMISH", threat
+
+
+def test_a_faint_in_train_is_reported_with_its_move():
+    """Seen live: a call ended with BLAZIKEN 0/121 and MANECTRIC 0/111, and nothing said
+    how. RAM, as in test_train_stops_at_a_battle_question but without the poison: the
+    battling TORCHIC at 1 HP, the wild SILCOON at 500/500 HP knowing only TACKLE."""
+    s = server()
+    s.load(WILD_TWO)
+    _write(s, 16, BATTLE_MONS + 0x28, 1)
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x28, 500)
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x2C, 500)
+    _foe_moves(s, 33)  # TACKLE
+    r = s.call("mcp_train", {"trainee": "SHROOMISH", "reasoning": "test"})
+    print("   ", r["summary"])
+    assert r["stopped_because"] == "question", r
+    assert "Fainted: TORCHIC fainted (last hit by SILCOON Lv" in r["summary"], r
+    assert "'s TACKLE)" in r["summary"], r
+
+
+# pret struct BattlePokemon +0x50 status2; STATUS2_WRAPPED's turn count is bits 13-15.
+# gBattleStruct (a pointer) +0x04: wrappedMove[battler * 2].
+STATUS2, WRAPPED_3_TURNS, G_BATTLE_STRUCT = 0x50, 0x6000, 0x0202449C
+
+
+def _fire_spin(s):
+    """RAM: our battler wrapped (gBattleMons[0].status2 STATUS2_WRAPPED, 3 turns left) by
+    FIRE SPIN (gBattleStruct->wrappedMove[0]), what wild TORKOAL did live."""
+    status2 = _read(s, lambda r: r._read_u32(BATTLE_MONS + STATUS2))
+    _write(s, 32, BATTLE_MONS + STATUS2, status2 | WRAPPED_3_TURNS)
+    struct = _read(s, lambda r: r._read_u32(G_BATTLE_STRUCT))
+    _write(s, 16, struct + 4, 83)  # FIRE SPIN
+
+
+def test_a_trapped_battler_fights_on():
+    """Seen live (MAGMA HIDEOUT): wild TORKOAL's FIRE SPIN; train chose SHIFT ("SABLEYE
+    can't be switched out!") and run_from_battle said "Can't escape!". In
+    test_wild_two_party.state TORCHIC (the trainee here) is out and would be switched for
+    SHROOMISH: trapped, it fights. And WILD_BATTLES=run doesn't try to run. RAM also: the
+    wild SILCOON at 200/200 HP, so TORCHIC's EMBER needs more hits than it may fight alone
+    (_trainee_advantage) and train would switch it out if it could."""
+    import os
+
+    s = server()
+    s.load(WILD_TWO)
+    _fire_spin(s)
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x28, 200)
+    _write(s, 16, BATTLE_MONS + 0x58 + 0x2C, 200)
+    r = s.call("mcp_train", {"trainee": "TORCHIC", "max_minutes": 0.2, "reasoning": "test"})
+    print("   ", r["summary"])
+    first = r["battles"][0]
+    assert first.get("trapped") == "FIRE SPIN" and first["trainee_fought"] and first["turns"] >= 1, first
+    assert "Trapped by FIRE SPIN: fought it out" in r["summary"], r
+    s.load(WILD_TWO)
+    _fire_spin(s)
+    os.environ.pop("WILD_BATTLES", None)  # the default: run
+    s.srv._battle_rules_done.clear()  # no earlier escape attempt on this fixture's foe
+    whys = []
+    with s.srv.memory_lock:
+        view = s.srv.env.memory_reader.read_battle_view()
+    asyncio.run(s.srv._wild_run_rule(view, whys))
+    assert _in_battle(s) and "trapped by FIRE SPIN, fighting" in whys, whys
+    from server import menu_state as ms
+
+    trap = _read(s, ms.battler_trap)
+    assert trap is not None and trap.why == "FIRE SPIN" and not trap.can_run, trap
+
+
+def test_a_party_read_mid_update_is_read_again():
+    """Seen live: "Error in train: 3677367865", the trainee's personality missing from
+    the party, after "Failed to read Pokemon at slot 3: 40996 is not a valid Move". The
+    game decrypts a Pokémon's data in place while it reads or writes it (pret pokemon.c
+    DecryptBoxMon / EncryptBoxMon), and a read between frames can catch that; the slot was
+    left out and every personality after it paired with the wrong Pokémon. RAM:
+    test_train_woods.state's SHROOMISH (slot 1) written decrypted, as the game leaves it
+    mid-update, and encrypted again 0.2 s later."""
+    import threading
+
+    s = server()
+    s.load(WOODS)
+    names = [mon.species_name.upper() for _, mon in s.srv._train_party()]
+    assert names == ["SHROOMISH", "TORCHIC"], names
+    personality = _read(s, lambda r: r._read_u32(PARTY))
+    key = personality ^ _read(s, lambda r: r._read_u32(PARTY + 4))
+    secure = [_read(s, lambda r, i=i: r._read_u32(PARTY + 0x20 + 4 * i)) for i in range(12)]
+    for i, word in enumerate(secure):
+        _write(s, 32, PARTY + 0x20 + 4 * i, word ^ key)
+    assert len(_party(s)) == 1, "the decrypted slot must fail to read, as it did live"
+
+    def encrypt_again():
+        for i, word in enumerate(secure):
+            _write(s, 32, PARTY + 0x20 + 4 * i, word)
+
+    threading.Timer(0.2, encrypt_again).start()
+    party = s.srv._train_party()
+    assert [(pid, mon.species_name.upper()) for pid, mon in party][0] == (personality, "SHROOMISH"), party
+    assert [mon.species_name.upper() for _, mon in party] == ["SHROOMISH", "TORCHIC"], party
 
 
 def _run_all():

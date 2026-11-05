@@ -1461,13 +1461,16 @@ def boulder_tiles(map_dir: str, loaded: Optional[dict] = None) -> frozenset:
     return frozenset(boulder_places(map_dir, loaded).values())
 
 
-def surf_start_tile(map_dir: str, tile) -> bool:
+def surf_start_tile(map_dir: str, tile, layout: str = "") -> bool:
     """Whether the map's (x, y) is water Surf can be started onto (pathfinding
-    SURF_START_BEHAVIORS), by the decomp's layout."""
+    SURF_START_BEHAVIORS), by the decomp's layout: `layout` (a LAYOUT_* id) when a script
+    swapped one in (dynamic_map_overlay.swapped_layout), else the map file's. Seen in a
+    test: SHOAL CAVE's entrance room at high tide, (8,22) is water there but cave floor in
+    the map file's low-tide layout, and the walk to its cave floor stopped at the shore."""
     from utils.mapping.pathfinding import is_surf_start
     from utils.mapping.porymap_state import layout_tiles
 
-    tiles = layout_tiles(map_dir) if map_dir else ()
+    tiles = layout_tiles(map_dir, layout) if map_dir else ()
     x, y = int(tile[0]), int(tile[1])
     return 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) and is_surf_start(tiles[y][x])
 
@@ -2346,35 +2349,129 @@ def next_pokemon_center(location_name: str, toward: Optional[str]) -> Optional[s
 # Wild encounter tiles (train)
 # ---------------------------------------------------------------------------
 
-# Tiles a step can roll a wild Pokémon on, by metatile behavior (pokeemerald
-# sTileBitAttributes, TILE_FLAG_HAS_ENCOUNTERS): the grass family anywhere, and the cave
-# floor on underground maps. Sand and the Abandoned Ship's indoor tiles carry the flag
-# too, but beaches and the ship's corridors have no land Pokémon, and a step loop there
-# would wait out its whole budget for nothing.
 WILD_WALKABLE = (".", "~")
-_UNDERGROUND = "MAP_TYPE_UNDERGROUND"
 
 
-def is_underground(map_dir: str) -> bool:
-    return _raw_map_json(map_dir).get("map_type") == _UNDERGROUND if map_dir else False
+def _land_encounter_behaviors() -> frozenset:
+    """Behaviors a step on foot rolls a wild Pokémon on: pokeemerald
+    MetatileBehavior_IsLandWildEncounter, TILE_FLAG_HAS_ENCOUNTERS without
+    TILE_FLAG_SURFABLE (sTileBitAttributes). MB_LONG_GRASS_SOUTH_EDGE and MB_SAND carry no
+    encounter flag; a step there rolls nothing."""
+    from pokemon_env.enums import MetatileBehavior as MB
+
+    return frozenset(
+        int(b)
+        for b in (
+            MB.TALL_GRASS, MB.LONG_GRASS, MB.UNUSED_05, MB.DEEP_SAND, MB.CAVE,
+            MB.INDOOR_ENCOUNTER, MB.ASHGRASS, MB.FOOTPRINTS,
+        )
+    )
 
 
-def encounter_tiles(grid, raw_tiles, underground: bool) -> set:
-    """(x, y) of every walkable tile where stepping can start a wild battle.
+# The ROM's own table of wild Pokémon per map (US Emerald, pret .sym gWildMonHeaders;
+# src/wild_encounter.c, src/data/wild_encounters.h). struct WildPokemonHeader {u8 mapGroup,
+# mapNum, pad[2]; const struct WildPokemonInfo *landMonsInfo, *waterMonsInfo,
+# *rockSmashMonsInfo, *fishingMonsInfo} (20 bytes), ended by MAP_UNDEFINED (group 0xFF).
+# struct WildPokemonInfo {u8 encounterRate, pad[3]; const struct WildPokemon *wildPokemon};
+# struct WildPokemon {u8 minLevel, maxLevel; u16 species}: 12 land slots, 5 water slots.
+# StandardWildEncounter rolls on land only when the map's header has landMonsInfo: the
+# old "a cave has wild Pokémon" guess knew neither that nor their levels.
+G_WILD_MON_HEADERS = 0x08552D48
+WILD_HEADER_SIZE = 20
+WILD_HEADER_COUNT_MAX = 200  # the table has 124 headers; a bound in case the end is missed
+LAND_WILD_COUNT, WATER_WILD_COUNT = 12, 5
 
-    raw_tiles are porymap's (tile id, behavior, collision, elevation) per cell; without
-    them (an ASCII override map) only '~' counts.
+
+@dataclass(frozen=True)
+class WildArea:
+    """One kind of wild encounter on a map (land or water)."""
+
+    rate: int  # encounterRate: WildEncounterCheck rolls rate * 16 in 2880 per step
+    min_level: int
+    max_level: int
+    species: Tuple[int, ...]  # species id per slot
+
+    @property
+    def levels(self) -> str:
+        return f"Lv{self.min_level}" if self.min_level == self.max_level else f"Lv{self.min_level}-{self.max_level}"
+
+
+@dataclass(frozen=True)
+class MapWild:
+    land: Optional[WildArea]
+    water: Optional[WildArea]
+
+
+_WILD_TABLE: Optional[Dict[str, MapWild]] = None
+
+
+def _read_wild_area(reader, pointer: int, slots: int) -> Optional[WildArea]:
+    if not pointer:
+        return None
+    info = bytes(reader._read_bytes(pointer, 8))
+    mons = bytes(reader._read_bytes(int.from_bytes(info[4:8], "little"), 4 * slots))
+    entries = [(mons[4 * i], mons[4 * i + 1], int.from_bytes(mons[4 * i + 2:4 * i + 4], "little")) for i in range(slots)]
+    return WildArea(
+        rate=info[0],
+        min_level=min(lo for lo, _, _ in entries),
+        max_level=max(hi for _, hi, _ in entries),
+        species=tuple(s for _, _, s in entries),
+    )
+
+
+def wild_table(reader) -> Dict[str, MapWild]:
+    """{map directory: MapWild} for every map in gWildMonHeaders, read from the ROM once.
+
+    `reader` is the emulator's memory reader (call it under the memory lock). Altering
+    Cave has 9 headers for one map; GetCurrentMapWildMonHeaderId takes the first plus
+    VAR_ALTERING_CAVE_WILD_SET, which only Mystery Gift changes, so the first is kept.
     """
-    from pokemon_env.enums import MetatileBehavior
+    global _WILD_TABLE
+    if _WILD_TABLE is not None:
+        return _WILD_TABLE
+    from utils.mapping.porymap_state import decomp_map_at
 
-    behaviors = {
-        int(MetatileBehavior.TALL_GRASS),
-        int(MetatileBehavior.LONG_GRASS),
-        int(MetatileBehavior.LONG_GRASS_SOUTH_EDGE),
-        int(MetatileBehavior.ASHGRASS),
-    }
-    if underground:
-        behaviors.add(int(MetatileBehavior.CAVE))
+    table: Dict[str, MapWild] = {}
+    for i in range(WILD_HEADER_COUNT_MAX):
+        header = bytes(reader._read_bytes(G_WILD_MON_HEADERS + i * WILD_HEADER_SIZE, WILD_HEADER_SIZE))
+        if header[0] == 0xFF:
+            break
+        found = decomp_map_at(header[0], header[1])
+        if found is None or found[0] in table:
+            continue
+        land = int.from_bytes(header[4:8], "little")
+        water = int.from_bytes(header[8:12], "little")
+        table[found[0]] = MapWild(
+            land=_read_wild_area(reader, land, LAND_WILD_COUNT),
+            water=_read_wild_area(reader, water, WATER_WILD_COUNT),
+        )
+    _WILD_TABLE = table
+    return table
+
+
+def _loaded_wild_table() -> Dict[str, MapWild]:
+    if _WILD_TABLE is None:
+        raise RuntimeError("wild_table(reader) must be read before the wild Pokémon of other maps are looked up")
+    return _WILD_TABLE
+
+
+def land_wild(map_dir: str) -> Optional[WildArea]:
+    """The land Pokémon of a map (data/maps directory), None when it has none."""
+    found = _loaded_wild_table().get(map_dir)
+    return found.land if found is not None else None
+
+
+def encounter_tiles(grid, raw_tiles, land_mons: bool) -> set:
+    """(x, y) of every walkable tile where a step on foot can start a wild battle.
+
+    land_mons: the map's wild header has land Pokémon (land_wild); without them no tile
+    counts. raw_tiles are (tile id, behavior, collision, elevation) per cell, live ones on
+    a map a script redrew (dynamic_map_overlay); without them (an ASCII override map)
+    only '~' counts.
+    """
+    if not land_mons:
+        return set()
+    behaviors = _land_encounter_behaviors()
     tiles = set()
     for y, row in enumerate(grid or []):
         raw_row = raw_tiles[y] if raw_tiles and y < len(raw_tiles) else None
@@ -2450,17 +2547,25 @@ ENCOUNTER_CANDIDATES = 40
 def wild_encounter_spots(env) -> dict:
     """The nearest encounter-tile pairs on the player's map, in navigate_to's frame.
 
-    {"pairs": [((x, y), (x, y)), ...], "coord_offset": (ox, oy) or None, "map_dir": str};
-    "pairs" is empty when the map has no tall grass and isn't a cave.
+    {"pairs": [((x, y), (x, y)), ...], "coord_offset": (ox, oy) or None, "map_dir": str,
+    "land": WildArea or None}; "pairs" is empty when no tile here can start a battle on
+    foot, and "land" is None when the map has no land Pokémon at all (gWildMonHeaders).
     """
+    from utils.mapping.porymap_state import decomp_map_at
+
+    reader = env.memory_reader
+    table = wild_table(reader)
+    # The map by its live group and number, as GetCurrentMapWildMonHeaderId looks it up.
+    found = decomp_map_at(*reader._read_current_map())
+    land = table[found[0]].land if found is not None and found[0] in table else None
     state, coord_offset, source = load_pathfinding_state(env)
     porymap = (state.get("map") or {}).get("porymap") or {}
     grid = porymap.get("grid") or []
     position = (state.get("player") or {}).get("position") or {}
     ox, oy = coord_offset or (0, 0)
     start = (int(position.get("x", 0)) - ox, int(position.get("y", 0)) - oy)
-    map_dir = source.get("porymap_map_name", "")
-    tiles = encounter_tiles(grid, porymap.get("raw_tiles"), is_underground(map_dir))
+    map_dir = found[0] if found is not None else source.get("porymap_map_name", "")
+    tiles = encounter_tiles(grid, porymap.get("raw_tiles"), land is not None)
     occupied = frozenset(
         (int(o["current_x"]) - ox, int(o["current_y"]) - oy) for o in porymap.get("runtime_objects") or []
     ) - {start}
@@ -2486,24 +2591,26 @@ def wild_encounter_spots(env) -> dict:
         "unreachable": bool(candidates) and not pairs,
         "coord_offset": coord_offset,
         "map_dir": map_dir,
+        "land": land,
     }
 
 
 @lru_cache(maxsize=None)
 def map_has_wild_encounters(map_dir: str) -> bool:
-    """Whether a map (data/maps directory) has tall grass or is a cave, from the decomp."""
+    """Whether a map (data/maps directory) has land Pokémon (gWildMonHeaders) and tiles a
+    step on foot rolls them on, in its map file's layout. wild_table must be read first."""
     from pokemon_env.porymap_paths import get_porymap_root
     from utils.mapping.porymap_json_builder import build_json_map
 
     root = get_porymap_root()
-    if not root or not map_dir:
+    if not root or not map_dir or land_wild(map_dir) is None:
         return False
     try:
         built = build_json_map(map_dir, root, include_grid=True, include_ascii=False) or {}
     except Exception as e:  # a broken map must not take the hint down with it
         logger.warning(f"Could not read {map_dir} for wild encounters: {e}")
         return False
-    return bool(encounter_tiles(built.get("grid"), built.get("raw_tiles"), is_underground(map_dir)))
+    return bool(encounter_tiles(built.get("grid"), built.get("raw_tiles"), True))
 
 
 @lru_cache(maxsize=1)
@@ -2515,7 +2622,8 @@ def _map_dirs_by_name() -> dict:
 
 
 def way_to_wild_encounters(location_name: str, position: Optional[Tuple[int, int]]) -> str:
-    """The way on foot to the nearest map with tall grass or a cave floor."""
+    """The way on foot to the nearest map with wild Pokémon on land, and their levels.
+    wild_table must be read first."""
     from utils.state_formatter import ROM_TO_PORYMAP_MAP
 
     paths = _walk_paths(
@@ -2525,16 +2633,18 @@ def way_to_wild_encounters(location_name: str, position: Optional[Tuple[int, int
         other_parts_of_here=True,
     )
     if not paths:
-        return "no tall grass or cave can be reached on foot from here."
+        return "no map with wild Pokémon on land can be reached on foot from here."
     # Equally near, the player's own map wins: its Pokémon are the ones an objective
     # there wants (Marill on Route 117, not Rusturf Tunnel's Whismur).
     path = min(paths, key=lambda p: (len(p), p[-1][1] != location_name))
     place = path[-1][1]
+    land = land_wild(_map_dirs_by_name().get(place, ""))
+    levels = f" ({land.levels})" if land is not None else ""
     if len(path) == 1:
-        return f'{place} has wild Pokémon: go_to_exit("{path[0][0]}"), then call train again.'
+        return f'{place} has wild Pokémon{levels}: go_to_exit("{path[0][0]}"), then call train again.'
     way = " → ".join(name for _, name in path)
     return (
-        f"the nearest wild Pokémon are on {place}; the way on foot: {way}. "
+        f"the nearest wild Pokémon are on {place}{levels}; the way on foot: {way}. "
         f'go_to_exit("{path[0][0]}") takes the first step; call train again there.'
     )
 

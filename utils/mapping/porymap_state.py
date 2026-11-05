@@ -670,18 +670,19 @@ def _static_tiles(map_dir: str) -> Tuple[Tuple[tuple, ...], ...]:
 
 
 @lru_cache(maxsize=None)
-def layout_tiles(map_dir: str) -> Tuple[Tuple[tuple, ...], ...]:
+def layout_tiles(map_dir: str, layout: str = "") -> Tuple[Tuple[tuple, ...], ...]:
     """A map's tiles from the decomp's own layout, (tile id, behavior, collision,
     elevation) per cell by row; () when it can't be read. Never an ASCII override: an
     override draws only walls and floor (RustboroCity's draws its gym door as plain
-    floor) and keeps no elevation."""
+    floor) and keeps no elevation. `layout` (a LAYOUT_* id) reads that layout instead of
+    the map file's: the one a script swapped in (dynamic_map_overlay.swapped_layout)."""
     from utils.mapping.pokeemerald_parser import PokeemeraldLayoutParser, PokeemeraldMapLoader
 
     root = _get_pokeemerald_root()
     if not root or not map_dir:
         return ()
     try:
-        layout = PokeemeraldMapLoader(Path(root)).get_layout_name_from_map(map_dir)
+        layout = layout or PokeemeraldMapLoader(Path(root)).get_layout_name_from_map(map_dir)
         tiles = PokeemeraldLayoutParser(Path(root)).get_metatiles_with_behavior(layout) if layout else None
     except Exception as e:  # unreadable: callers fall back to what they did without tiles
         logger.warning(f"Porymap: could not read tiles for {map_dir}: {e}")

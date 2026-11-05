@@ -5322,9 +5322,12 @@ async def _start_surf(tile, source: str) -> Optional[str]:
     from server.field_control import DIALOGUE_CHOICE, DIRECTION_DELTAS, dialogue_status, player_surfing
     from utils.state_formatter import ROM_TO_PORYMAP_MAP
 
+    from utils.mapping.dynamic_map_overlay import swapped_layout
+
     if not tile or _mem(player_surfing) or not game_tools.can_surf():
         return None
-    if not game_tools.surf_start_tile(ROM_TO_PORYMAP_MAP.get(_location_name(), ""), tile):
+    swapped = _mem(swapped_layout) or {}
+    if not game_tools.surf_start_tile(ROM_TO_PORYMAP_MAP.get(_location_name(), ""), tile, swapped.get("id", "")):
         return None
     if not await _await_game(_player_can_walk, MACRO_MENU_FRAMES):
         logger.warning(f"{source}: at the water {tuple(tile)} but the player can't act ({_field_snapshot()})")
@@ -7439,8 +7442,10 @@ TRAIN_FINISH_BATTLE_S = 90.0
 # Partner turns in one wild battle before giving up on it; a partner ten levels up
 # needs one to three.
 TRAIN_MAX_TURNS = 12
-# Steps between two encounter tiles without a battle before stopping (a map whose
-# grass has no wild Pokémon, or very bad luck).
+# Steps between two encounter tiles without a battle before stopping. A map with no land
+# Pokémon is refused up front (gWildMonHeaders); this catches very bad luck, or tiles
+# that don't roll after all (seen live on Shoal Cave's tide-swapped floor before train
+# read the live layout).
 TRAIN_MAX_QUIET_STEPS = 300
 # Presses in a row that did not reach the other tile (a person standing on it, or a
 # press that only turned the player) before trying the next pair of tiles.
@@ -7449,14 +7454,37 @@ TRAIN_MAX_STUCK = 4
 TRAIN_QUESTION_ENDS = ("question", "learn_move", "evolution", "menu")
 
 
+# _train_party: reads of a party caught mid-update before giving up, a short wait apart
+# (the game loop runs frames in between).
+TRAIN_PARTY_READS = 30
+TRAIN_PARTY_READ_WAIT_S = 0.02
+
+
 def _train_party() -> List[Tuple[int, Any]]:
     """[(personality, PokemonData)] in party order; the personality names a Pokémon
-    even when two share a species."""
+    even when two share a species.
+
+    Seen live (2026-11-05): train failed with "Error in train: 3677367865", the
+    trainee's personality missing from the party at a battle's start. The server log
+    had "Failed to read Pokemon at slot 3: 40996 is not a valid Move" bursts: the
+    game's GetMonData/SetMonData decrypt a Pokémon's data in place and encrypt it again
+    (pret pokemon.c DecryptBoxMon), so a read between frames can land in the middle,
+    and read_party_pokemon leaves that slot out. Zipped with the personalities, every
+    Pokémon after it got the next one's data and the last personality was dropped. The
+    party is read again until every slot reads; if it never does, this raises rather
+    than pair a personality with another Pokémon's data.
+    """
     from server import menu_state as ms
 
-    with memory_lock:
-        reader = env.memory_reader
-        return list(zip(ms.party_personalities(reader), reader.read_party_pokemon() or []))
+    for _ in range(TRAIN_PARTY_READS):
+        with memory_lock:
+            reader = env.memory_reader
+            pids = ms.party_personalities(reader)
+            party = reader.read_party_pokemon() or []
+        if len(party) == len(pids):
+            return list(zip(pids, party))
+        time.sleep(TRAIN_PARTY_READ_WAIT_S)
+    raise RuntimeError(f"the party read {len(party)} of {len(pids)} Pokémon {TRAIN_PARTY_READS} times in a row")
 
 
 def _train_member(party: List[Tuple[int, Any]], wanted: Any) -> Optional[int]:
@@ -7496,14 +7524,84 @@ def _train_partner(party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: O
     return _train_partner_pick(party, trainee_pid, wanted_pid)[0]
 
 
+def _train_rotation_pick(
+    reader, party: List[Tuple[int, Any]], trainee_pid: int, able: List[int], out: set, target: Dict[str, Any],
+    rotation: List[int],
+) -> Optional[Dict[str, Any]]:
+    """pick_fighter's choice among the partners that have not fought yet in this round of
+    `rotation` (personalities in the order they fought for this train call), or None.
+
+    David (2026-11-05): fighters spread out, not the same one every battle. Seen live
+    (MAGMA HIDEOUT): AZUMARILL fought every battle of a 10-minute call and the bag's
+    medicine all went on it. Only a pick that wins comfortably (pick_fighter's own bar),
+    above the trainee's level, and is no HM carrier that sits out (hm_carriers) counts;
+    otherwise the usual pick stands. When everyone who qualifies has fought, a new round
+    starts, with only the last one sitting out the next battle.
+    """
+    from pokemon_env import hm_carriers
+
+    trainee = dict(party).get(trainee_pid)
+    for first_try in (True, False):
+        skip = set(rotation) if first_try else set(rotation[-1:])
+        if not skip:
+            continue
+        pick = reader.pick_fighter(target, out | skip, switching_in=True)
+        if (
+            pick is not None
+            and pick["comfortable"]
+            and pick["slot"] - 1 in able
+            and not hm_carriers.sits_out(pick["name"])
+            and (trainee is None or pick["level"] > trainee.level)
+        ):
+            names = [dict(party)[pid].species_name.upper() for pid in rotation if pid in dict(party)]
+            pick = dict(pick, why=f"{pick['why']}; taking turns ({', '.join(dict.fromkeys(names))} fought already)")
+            return pick
+        if first_try:
+            del rotation[:-1]  # everyone who qualifies has fought: a new round
+    return None
+
+
+def _train_rotation_turn(
+    party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: Optional[int], rotation: Optional[List[int]],
+    record: Dict[str, Any],
+) -> Optional[Tuple[int, str]]:
+    """(party index, why) of the teammate to switch in on the battle's first decision
+    because the one out (not the trainee) has fought in this round of `rotation` already;
+    None to fight on.
+    Never with a partner asked for, nor once this battle has had a switch or a turn."""
+    from server import menu_state as ms
+
+    if wanted_pid is not None or not rotation or record["turns"] or record["switched"] or record.get("rotated"):
+        return None
+    active = _mem(ms.active_battler_personality)
+    if active == trainee_pid or active not in rotation:
+        return None
+    able = [
+        i for i, (pid, mon) in enumerate(party)
+        if pid != trainee_pid and not mon.is_egg and mon.max_hp and mon.current_hp * 2 > mon.max_hp
+    ]
+    with memory_lock:
+        reader = env.memory_reader
+        view = reader.read_battle_view() if reader.is_in_battle() else None
+        target = (view or {}).get("target")
+        if not (target and target.get("hp")):
+            return None
+        out = {pid for i, (pid, _) in enumerate(party) if i not in able}
+        pick = _train_rotation_pick(reader, party, trainee_pid, able, out, target, rotation)
+    if pick is None or party[pick["slot"] - 1][0] == active:
+        return None
+    return pick["slot"] - 1, pick["why"]
+
+
 def _train_partner_pick(
-    party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: Optional[int]
+    party: List[Tuple[int, Any]], trainee_pid: int, wanted_pid: Optional[int], rotation: Optional[List[int]] = None
 ) -> Tuple[Optional[int], str]:
     """_train_partner with why it was chosen. In a battle: reader.pick_fighter against the
     foe out, the one rule for who fights (David, 2026-11-04: "It keeps using breloom to
     train... In many cases, Combusken is plenty strong": the lowest level that wins
-    comfortably), among teammates above half HP; if none of them wins, the one that
-    knocks it out in the fewest hits. Outside a battle, the highest-level one."""
+    comfortably), among teammates above half HP, taking turns with the partners of
+    earlier battles in `rotation` (_train_rotation_pick); if none of them wins, the one
+    that knocks it out in the fewest hits. Outside a battle, the highest-level one."""
     able = [
         i for i, (pid, mon) in enumerate(party)
         if pid != trainee_pid and not mon.is_egg and mon.max_hp and mon.current_hp * 2 > mon.max_hp
@@ -7518,6 +7616,10 @@ def _train_partner_pick(
         target = (view or {}).get("target")
         if target and target.get("hp"):
             out = {pid for i, (pid, _) in enumerate(party) if i not in able}
+            if rotation:
+                turn = _train_rotation_pick(reader, party, trainee_pid, able, out, target, rotation)
+                if turn is not None:
+                    return turn["slot"] - 1, turn["why"]
             pick = reader.pick_fighter(target, out, switching_in=True)
             if pick is not None and pick["slot"] - 1 in able:
                 return pick["slot"] - 1, pick["why"]
@@ -7527,7 +7629,8 @@ def _train_partner_pick(
 
 
 def _train_weakness(
-    partner_index: Optional[int], trainee_pid: Optional[int] = None, wanted_partner_pid: Optional[int] = None
+    partner_index: Optional[int], trainee_pid: Optional[int] = None, wanted_partner_pid: Optional[int] = None,
+    party: Optional[List[Tuple[int, Any]]] = None,
 ) -> List[str]:
     """The team-weak reasons (read_team_condition), with the partner's PP as the one that
     counts: the trainee leads but never attacks. And the two train itself relies on,
@@ -7535,15 +7638,30 @@ def _train_weakness(
     the foe's first hit, and the partner it wants (the one asked for, else the
     highest-level teammate). A fainted bystander alone no longer makes the team weak
     (assess_team_condition), but with its strongest partner down train would grind with
-    a weaker one, so a trip to heal those two is still worth it."""
-    from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
+    a weaker one, so a trip to heal those two is still worth it. `party`: judge this
+    [(personality, PokemonData)] instead of the party now (_train_bag_heals_enough)."""
+    from pokemon_env.enums import Move
+    from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE, assess_team_condition
 
-    with memory_lock:
-        condition = env.memory_reader.read_team_condition(lead_index=partner_index)
+    if party is None:
+        with memory_lock:
+            condition = env.memory_reader.read_team_condition(lead_index=partner_index)
+    else:
+        # read_team_condition's own steps, on the given party.
+        mons_now = [mon for _, mon in party]
+        if partner_index is not None and 0 <= partner_index < len(mons_now):
+            mons_now = [mons_now[partner_index]] + mons_now[:partner_index] + mons_now[partner_index + 1:]
+
+        def move_data(name: str) -> Optional[Dict[str, int]]:
+            move_id = Move[name].value if name in Move.__members__ else 0
+            with memory_lock:
+                return env.memory_reader._rom_battle_move(move_id) if move_id else None
+
+        condition = assess_team_condition(mons_now, move_data)
     reasons = list(condition["reasons"])
     if trainee_pid is None:
         return reasons
-    party = _train_party()
+    party = party if party is not None else _train_party()
     mons = dict(party)
     wanted = wanted_partner_pid if wanted_partner_pid in mons else max(
         (pid for pid, mon in party if pid != trainee_pid and not mon.is_egg),
@@ -7579,25 +7697,87 @@ def _mon_text(mon) -> str:
     return f"{mon.species_name.upper()} Lv{mon.level} HP {mon.current_hp}/{mon.max_hp}"
 
 
+def _trainee_threat(party: List[Tuple[int, Any]], trainee_pid: int, view: Optional[Dict[str, Any]]) -> Optional[str]:
+    """'GEODUDE's MAGNITUDE is 2x on MANECTRIC' when the foe out has a damaging move
+    super-effective on the trainee, else None. The foe's own moves (gBattleMons[1], the
+    battle view's target move_ids), not its species' typical ones.
+
+    Seen live (2026-11-05, MAGMA HIDEOUT): train(LOWEST) ended with BLAZIKEN 0/121 and
+    MANECTRIC 0/111, both weak to the wild GEODUDE/GRAVELER's MAGNITUDE and ROCK THROW.
+    A trainee facing such a foe is never left out or sent in: it earns from the bench
+    with the Exp. Share, or not in this battle.
+    """
+    from server import menu_state as ms
+
+    trainee = dict(party).get(trainee_pid)
+    target = (view or {}).get("target")
+    if trainee is None or not target:
+        return None
+    with memory_lock:
+        reader = env.memory_reader
+        types = reader.party_mon_types(trainee)
+        for move_id in target.get("move_ids") or []:
+            if not move_id:
+                continue
+            data = reader._rom_battle_move(move_id)
+            effect = reader.type_effectiveness(data["type"], types)
+            if data["power"] and effect > 1:
+                return (
+                    f"{str(target.get('name', '?')).upper()}'s {ms._move_text(move_id)} is {effect:g}x on "
+                    f"{trainee.species_name.upper()}"
+                )
+    return None
+
+
+def _train_note_faints(record: Dict[str, Any], hp_seen: Dict[int, int], party: List[Tuple[int, Any]]) -> None:
+    """Add to record["fainted"] each party Pokémon whose HP went from above 0 to 0 since
+    hp_seen, with the foe and move that last hit our battler (menu_state.last_hit), and
+    update hp_seen. Seen live (2026-11-05): a train call ended with BLAZIKEN and
+    MANECTRIC fainted, and neither its summary nor the log said how."""
+    from server import menu_state as ms
+
+    for pid, mon in party:
+        if hp_seen.get(pid, 0) > 0 and mon.current_hp == 0:
+            with memory_lock:
+                reader = env.memory_reader
+                attacker, move_id = ms.last_hit(reader, 0)
+                # pret MOVEEND_UPDATE_LAST_MOVES leaves gLastHitBy alone when the hit
+                # knocks the target out; in a single battle the foe is battler 1.
+                attacker = attacker if attacker in (1, 3) else 1
+                base = ms.G_BATTLE_MONS + attacker * ms.BATTLE_MON_SIZE
+                foe = reader._battle_species_name(reader._read_u16(base)).upper()
+                level = reader._read_u8(base + 0x2A)
+            landed = move_id and move_id != 0xFFFF
+            hit = f"last hit by {foe} Lv{level}'s {ms._move_text(move_id)}" if landed else f"against {foe} Lv{level}"
+            text = f"{mon.species_name.upper()} fainted ({hit})"
+            record["fainted"].append(text)
+            logger.warning(f"🏋️ train: {text}")
+        hp_seen[pid] = mon.current_hp
+
+
 async def _train_battle(
     trainee_pid: int, wanted_partner_pid: Optional[int], deadline: float,
-    catch: Optional[Tuple[str, int]] = None,
+    catch: Optional[Tuple[str, int]] = None, rotation: Optional[List[int]] = None,
 ) -> Tuple[Dict[str, Any], Optional[Tuple[str, str]]]:
     """Fight the wild battle in progress for the trainee: switch it out for the partner on
     its first turn (switch_pokemon), then the best move each turn (use_move, which plays
     the text out). A trainee with the advantage (_trainee_advantage) fights itself until
     it drops to half HP. Returns (record of the battle, stop) where stop is (code, why)
     or None. With catch=(species, min level), a wild one of those at that level stops it
-    before the first move, with the catch plan (_catch_plan).
+    before the first move, with the catch plan (_catch_plan). `rotation`: the partners of
+    this call's battles so far, in order; the one that fights here is added to it.
     """
     from server import menu_state as ms
 
     source = "train"
     before = dict(_train_party())
-    trainee_name = before[trainee_pid].species_name.upper()
+    # _train re-picks a trainee that left the party; one missing here still gets its
+    # battle finished, by whoever is out.
+    trainee_name = before[trainee_pid].species_name.upper() if trainee_pid in before else "?"
     view = _read_battle_view()
     foes = [f"{m['name'].upper()} Lv{m['level']}" for m in (view or {}).get("opponents") or []]
-    record: Dict[str, Any] = {"opponents": foes, "turns": 0, "switched": False, "trainee_fought": False}
+    record: Dict[str, Any] = {"opponents": foes, "turns": 0, "switched": False, "trainee_fought": False, "fainted": []}
+    hp_seen = {pid: mon.current_hp for pid, mon in before.items()}
     partner_pid = None
     stop: Optional[Tuple[str, str]] = None
     if view is not None and view["is_trainer"]:
@@ -7637,15 +7817,25 @@ async def _train_battle(
                 stop = ("catch_target", f"a wild {catch[0]} Lv{found['level']} appeared. " + _catch_plan(view, found))
                 break
         party = _train_party()
-        advantage = _trainee_advantage(view) if view is not None else None
-        if _mem(ms.active_battler_personality) == trainee_pid and advantage is not None:
+        _train_note_faints(record, hp_seen, party)
+        active = _mem(ms.active_battler_personality)
+        # Trapped (Fire Spin, Mean Look, Arena Trap...): no switch or escape can work, so
+        # the one out fights it out with its best move (the last branch).
+        trap = _mem(ms.battler_trap)
+        if trap is not None and record.get("trapped") != trap.why:
+            record["trapped"] = trap.why
+            logger.info(f"🏋️ train: trapped by {trap.why}, fighting")
+        # The trainee is never left out against a foe with a move super-effective on it.
+        threat = _trainee_threat(party, trainee_pid, view)
+        advantage = _trainee_advantage(view) if view is not None and threat is None else None
+        if trap is None and active == trainee_pid and advantage is not None:
             # The foe is weak to the trainee and can't hit it hard: it fights itself, and
             # is switched out as soon as it drops to half HP (checked every turn).
             result = await mcp_use_move({"move": advantage["slot"], "reasoning": f"train: {advantage['name']}"})
             record["turns"] += 1
             record["trainee_fought"] = True
-        elif _mem(ms.active_battler_personality) == trainee_pid:
-            index, why = _train_partner_pick(party, trainee_pid, wanted_partner_pid)
+        elif trap is None and active == trainee_pid:
+            index, why = _train_partner_pick(party, trainee_pid, wanted_partner_pid, rotation)
             if index is None:
                 stop = (
                     "no_partner",
@@ -7654,14 +7844,18 @@ async def _train_battle(
                 )
                 break
             partner_pid = party[index][0]
-            record["partner_why"] = why
+            record["partner_why"] = why + (f"; {trainee_name} out at once: {threat}" if threat else "")
             result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {trainee_name} must not fight"})
             record["switched"] = record["switched"] or bool(result.get("success"))
         elif (
-            not record.get("trainee_sent_in")
+            trap is None
+            and trainee_pid in dict(party)
+            and not record.get("trainee_sent_in")
             # Holding the Exp. Share it earns EXP from the bench (David's rule: the weakest
             # holds it once we have it), so it never needs to come in.
             and dict(party)[trainee_pid].held_item != ms.ITEM_EXP_SHARE
+            # Never in against a foe that hits it super-effectively: it stays on the bench.
+            and threat is None
             and not record["switched"]  # it was out already (switched out for the partner)
             and not record["trainee_fought"]
             and _train_can_take_a_turn(party, trainee_pid)
@@ -7679,14 +7873,26 @@ async def _train_battle(
             record["trainee_sent_in"] = True
             index = next(i for i, (pid, _) in enumerate(party) if pid == trainee_pid)
             result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {trainee_name} joins for the EXP"})
+        elif trap is None and (turn := _train_rotation_turn(party, trainee_pid, wanted_partner_pid, rotation, record)) is not None:
+            # The one out has fought in this round already (a trainee on the bench with the
+            # Exp. Share leaves the lead in every battle): another that wins comfortably
+            # takes this one (_train_rotation_pick).
+            index, why = turn
+            record["rotated"] = True
+            record["partner_why"] = why
+            result = await mcp_switch_pokemon({"pokemon": index + 1, "reasoning": f"train: {party[index][1].species_name.upper()} takes a turn"})
         else:
-            partner_pid = _mem(ms.active_battler_personality)
+            if active == trainee_pid:
+                record["trainee_fought"] = True  # trapped: it fights it out
+            else:
+                partner_pid = active
             best = view.get("best_move") if view else None
             if not best:
                 name = view["player"]["name"].upper() if view and view.get("player") else "Your Pokémon"
                 stop = ("no_moves", f"{name} has no damaging move with PP left: heal first ({_heal_way()}).")
                 break
-            result = await mcp_use_move({"move": best["slot"], "reasoning": f"train: {best['name']}"})
+            why = f"trapped by {trap.why}, fighting: {best['name']}" if trap is not None else best["name"]
+            result = await mcp_use_move({"move": best["slot"], "reasoning": f"train: {why}"})
             record["turns"] += 1
         end = result.get("end")
         if not result.get("success"):
@@ -7697,7 +7903,17 @@ async def _train_battle(
             stop = (end, result.get("summary") or "")
         elif end not in ("action", "over"):
             stop = ("unexpected", result.get("summary") or f"the battle stopped ({end})")
-    after = dict(_train_party())
+    after_party = _train_party()
+    _train_note_faints(record, hp_seen, after_party)
+    after = dict(after_party)
+    if trainee_pid not in before:
+        record.update({
+            "outcome": "unfinished" if _read_battle_view() is not None else "over", "trainee": trainee_name,
+            "level_before": 0, "level_after": 0, "exp_gained": 0, "trainee_hp_before": 0, "trainee_hp": 0,
+            "trainee_max_hp": 0,
+        })
+        logger.info(f"🏋️ train battle (no trainee): {record} stop={stop}")
+        return record, stop
     trainee_before, trainee_after = before[trainee_pid], after.get(trainee_pid, before[trainee_pid])
     outcome = "unfinished" if _read_battle_view() is not None else ms.outcome_name(_mem(ms.read_battle_flow).outcome)
     record.update({
@@ -7710,6 +7926,8 @@ async def _train_battle(
         "trainee_hp": trainee_after.current_hp,
         "trainee_max_hp": trainee_after.max_hp,
     })
+    if rotation is not None and partner_pid in before and partner_pid != trainee_pid:
+        rotation.append(partner_pid)
     if partner_pid in after and partner_pid in before:
         record.update({
             "partner": after[partner_pid].species_name.upper(),
@@ -7755,30 +7973,85 @@ TRAIN_LOWEST = "LOWEST"
 # Plain-text boxes (Match Calls, signs) train reads through in one call before it hands
 # back: a text that keeps coming back is someone talking, for the model to see.
 TRAIN_MAX_TEXT_READS = 6
+# Medicine train never spends (MEDICINE ids: FULL RESTORE, MAX POTION, REVIVE, MAX
+# REVIVE): David (2026-11-05) keeps them for gym and boss fights. Seen live (MAGMA
+# HIDEOUT): one 10-minute train call used his FULL RESTORE, 5 SUPER POTIONs and a REVIVE,
+# all on AZUMARILL as the partner; later one used the last REVIVE and then walked to the
+# Pokémon Center anyway ("What a waste!"). PP items and RARE CANDY aren't medicine here.
+TRAIN_RARE_MEDICINE = frozenset({19, 20, 24, 25})
 
 
-async def _train_heal_from_bag() -> Optional[str]:
-    """Heal the members that make the team weak (fainted, under half HP) or carry a status
-    with the bag's medicine, cheapest first (_heal_with_medicine). Returns the note for
-    the summary ('used SUPER POTION on AZUMARILL (32→82 HP); 9 SUPER POTIONs left'), or
-    None when nothing was used.
+def _request_flag(value: Any) -> bool:
+    """A yes/no tool argument: True, 1, "true", "yes" (models send any of these)."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "on")
+    return bool(value)
 
-    emerald-new (2026-11-04), David's "Potions + Jagged Pass": train stopped with "the
-    team is weak (AZUMARILL 32/82 HP)" on Jagged Pass and walked to Lavaridge below the
-    one-way ledges, a 10-15 minute loop back; the bag is the heal that keeps it training.
-    PP can't be restored this way: a team weak for PP still goes to a Pokémon Center.
-    """
+
+def _train_needy(party: List[Any]) -> List[int]:
+    """Party slots the bag would heal: under TEAM_LOW_HP_SHARE of their HP, or a status."""
     from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
 
-    with memory_lock:
-        party = env.memory_reader.read_party_pokemon() or []
-    needy = [
+    return [
         i for i, p in enumerate(party)
         if not p.is_egg and (p.current_hp < p.max_hp * TEAM_LOW_HP_SHARE or int(p.status) & STATUS_ANY)
     ]
+
+
+def _train_bag_heals_enough(
+    partner_index: Optional[int], trainee_pid: int, wanted_partner_pid: Optional[int]
+) -> bool:
+    """Whether the medicine train may use (never TRAIN_RARE_MEDICINE) would leave the team
+    no longer weak (_train_weakness), worked out on a copy of the party before anything is
+    used, the way _heal_with_medicine would spend it. When it wouldn't (a fainted Pokémon
+    that matters, PP low, too few Potions) a Pokémon Center trip is due anyway, and train
+    uses no bag item at all (David, 2026-11-05: "It just used a revive and then went to
+    the pokemon center. What a waste!")."""
+    import dataclasses
+
+    from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
+
+    pids_party = _train_party()
+    party = [mon for _, mon in pids_party]
+    bag = {i: n for i, n in _bag_counts().items() if i not in TRAIN_RARE_MEDICINE}
+    for index in _train_needy(party):
+        mon = party[index]
+        for _ in range(MEDICINE_MAX_USES_PER_MON):
+            item_id = _medicine_for(mon, bag)
+            if item_id is None:
+                break
+            hp, cures, _, _ = MEDICINE[item_id]
+            weak = mon.current_hp < mon.max_hp * TEAM_LOW_HP_SHARE or int(mon.status) & STATUS_ANY
+            if not weak and mon.max_hp - mon.current_hp < hp:
+                break
+            mon = dataclasses.replace(
+                mon,
+                current_hp=min(mon.max_hp, mon.current_hp + hp) if mon.current_hp else 0,
+                status=int(mon.status) & ~cures,
+            )
+            bag[item_id] -= 1
+        party[index] = mon
+    healed = [(pid, mon) for (pid, _), mon in zip(pids_party, party)]
+    return not _train_weakness(partner_index, trainee_pid, wanted_partner_pid, healed)
+
+
+async def _train_heal_from_bag() -> Optional[str]:
+    """Heal the members that make the team weak (under half HP) or carry a status with
+    the bag's medicine, cheapest first (_heal_with_medicine), never TRAIN_RARE_MEDICINE.
+    Returns the note for the summary ('used SUPER POTION on AZUMARILL (32→82 HP); 9 SUPER
+    POTIONs left'), or None when nothing was used.
+
+    Only with train(heal_with_items=True) and only when that heals the team enough
+    (_train_bag_heals_enough): by default train heals at a Pokémon Center. emerald-new
+    (2026-11-04), David's "Potions + Jagged Pass": the walk to Lavaridge below the one-way
+    ledges was a 10-15 minute loop back, which is when the bag is worth it.
+    """
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    needy = _train_needy(party)
     if not needy:
         return None
-    lines, used, error = await _heal_with_medicine(needy, "train")
+    lines, used, error = await _heal_with_medicine(needy, "train", TRAIN_RARE_MEDICINE)
     if not lines:
         return f"no medicine in the bag helped ({error})" if error else None
     note = "used " + ", ".join(lines) + "; " + _left_text(used)
@@ -7833,6 +8106,13 @@ def _train_summary(battles: List[Dict[str, Any]], steps: int, elapsed: float, wh
             chosen.setdefault(b["partner"], b["partner_why"])
     if chosen:
         text += ". Partners: " + "; ".join(f"{name} ({reason})" for name, reason in chosen.items())
+    traps = list(dict.fromkeys(b["trapped"] for b in battles if b.get("trapped")))
+    if traps:
+        text += f". Trapped by {', '.join(traps)}: fought it out"
+    # Every faint, with what did it (_train_note_faints).
+    faints = [f for b in battles for f in b.get("fainted") or []]
+    if faints:
+        text += ". Fainted: " + "; ".join(faints)
     return f"{text}. Stopped: {why}"
 
 
@@ -7846,16 +8126,25 @@ async def mcp_train(request: dict = None):
     switch_pokemon("COMBUSKEN"), use_move until it ends), and the pause after each battle
     was the model deciding where to walk next. None of that needs a decision.
 
-    Outside a battle it walks to the nearest two side-by-side encounter tiles (tall
-    grass, or any cave floor) and steps between them until a battle starts. In a wild
-    battle the trainee goes out on turn 1 for the partner (switch_pokemon), which then
-    uses its best move each turn (use_move); both share the EXP. Against a foe it beats
-    with a super-effective move and that can't hit it super-effectively, the trainee
-    fights itself while above half HP (_trainee_advantage). It returns to the model
-    for anything that is a decision or a surprise: until_level reached, the team weak
-    (the TEAM IS WEAK check, with the partner's PP), a question (learn a move, evolve,
-    "Use next POKéMON?"), a trainer battle, the time limit, or a walk or menu that did
-    not go as expected. The game runs at turbo speed for the whole call.
+    Outside a battle it walks to the nearest two side-by-side encounter tiles (tiles that
+    roll for the map's land Pokémon in the ROM's gWildMonHeaders, on the layout drawn now)
+    and steps between them until a battle starts; a map with no land Pokémon is refused
+    up front, with the nearest one that has some and its levels. In a wild battle the
+    trainee goes out on turn 1 for the partner (switch_pokemon), which then uses its best
+    move each turn (use_move); both share the EXP. Partners take turns battle by battle
+    among the teammates that win comfortably (_train_rotation_pick). Against a foe it
+    beats with a super-effective move and that can't hit it super-effectively, the
+    trainee fights itself while above half HP (_trainee_advantage), never against a foe
+    with a move super-effective on it (_trainee_threat); trapped, the one out fights it
+    out; every faint is reported with the move that did it. A weak team is healed at a
+    Pokémon Center (once per call). The bag's Potions and status cures only with
+    heal_with_items=True, and only when they heal the team enough that no Center trip is
+    due (_train_bag_heals_enough); FULL RESTORE, MAX POTION, REVIVE and MAX REVIVE never
+    (TRAIN_RARE_MEDICINE). It returns to the model for
+    anything that is a decision or a surprise: until_level reached, the team weak (the
+    TEAM IS WEAK check, with the partner's PP), a question (learn a move, evolve, "Use
+    next POKéMON?"), a trainer battle, the time limit, or a walk or menu that did not go
+    as expected. The game runs at turbo speed for the whole call.
     """
     if env is None:
         return {"success": False, "error": "Emulator not initialized"}
@@ -7903,6 +8192,9 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             catch = (str(request["catch"]).strip().upper(), int(request.get("catch_min_level") or 1))
         except (TypeError, ValueError):
             return _refusal(f"catch_min_level must be a level number, not {request.get('catch_min_level')!r}.")
+    # The bag's Potions only when asked (never its TRAIN_RARE_MEDICINE): otherwise a weak
+    # team heals at a Pokémon Center.
+    heal_with_items = _request_flag(request.get("heal_with_items"))
 
     party = _train_party()
     listing = ", ".join(f"{i + 1}. {_mon_text(mon)}" for i, (_, mon) in enumerate(party))
@@ -7959,14 +8251,24 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                     f"{location} has tall grass, but none of it can be walked to from {where}: {way}",
                     stopped_because="no_grass",
                 )
-            return _refusal(f"No tall grass here ({location}), and it isn't a cave: {way}", stopped_because="no_grass")
+            if spots.get("land") is None:
+                # The ROM's gWildMonHeaders: no landMonsInfo, so no step on foot here can
+                # meet a wild Pokémon, whatever its floor looks like.
+                return _refusal(f"{location} has no wild Pokémon on land: {way}", stopped_because="no_grass")
+            # Land Pokémon, but none of the tiles drawn now rolls for them (a script may
+            # have redrawn the map: Shoal Cave's tides turn cave floor into water).
+            return _refusal(
+                f"{location} has wild Pokémon on land ({spots['land'].levels}), but no tile here can meet them now: {way}",
+                stopped_because="no_grass",
+            )
     partner_index = _train_partner(party, trainee_pid, partner_pid)
     weak = _train_weakness(partner_index, trainee_pid, partner_pid)
     heal_notes: List[str] = []
     trips = 0  # Pokémon Center trips (TRAIN_MAX_HEALS); healing from the bag isn't counted
     origin = _location_name()
-    if weak and not in_battle:
-        # The bag first: a Pokémon Center may be a long walk (below one-way ledges).
+    if weak and not in_battle and heal_with_items and _train_bag_heals_enough(partner_index, trainee_pid, partner_pid):
+        # The bag first when allowed and enough: a Pokémon Center may be a long walk
+        # (below one-way ledges).
         note = await _train_heal_from_bag()
         if note:
             heal_notes.append(note)
@@ -8026,13 +8328,23 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
     started = time.monotonic()
     deadline = started + minutes * 60
     battles: List[Dict[str, Any]] = []
+    rotation: List[int] = []  # who fought, battle by battle: partners take turns (_train_rotation_pick)
     stop: Optional[Tuple[str, str]] = None
     steps = stuck = pair_index = 0
     quiet_steps = texts_read = 0
     last_walk = ""
     while stop is None:
         if _mem(lambda r: r.is_in_battle()):
-            record, stop = await _train_battle(trainee_pid, partner_pid, deadline + TRAIN_FINISH_BATTLE_S, catch)
+            party = _train_party()
+            if lowest and trainee_pid not in dict(party):
+                # The party rule's pick again (a trainee gone from the party still lets
+                # the battle be fought; _train_battle finishes it either way).
+                pick = _party_rule_target([mon for _, mon in party])
+                if pick is not None:
+                    trainee_pid, trainee_name = party[pick][0], party[pick][1].species_name.upper()
+            record, stop = await _train_battle(
+                trainee_pid, partner_pid, deadline + TRAIN_FINISH_BATTLE_S, catch, rotation
+            )
             battles.append(record)
             quiet_steps = 0
             if lowest:
@@ -8046,6 +8358,10 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
                 stop = _train_stop_after_battle(trainee_pid, partner_pid, until_level, deadline, minutes, lowest)
             if stop is not None and stop[0] == "team_weak":
                 await _await_game(_player_can_walk, MACRO_TEXT_FRAMES)  # the battle's end, back on the map
+            if (
+                stop is not None and stop[0] == "team_weak" and heal_with_items
+                and _train_bag_heals_enough(_train_partner(_train_party(), trainee_pid, partner_pid), trainee_pid, partner_pid)
+            ):
                 note = await _train_heal_from_bag()
                 if note:
                     heal_notes.append(note)
@@ -8160,6 +8476,9 @@ async def _train(request: Dict[str, Any]) -> Dict[str, Any]:
             for pid, mon in _train_party() if pid in levels_before and mon.level != levels_before[pid][1]
         ]
         summary += f" Levels: {', '.join(grew)}." if grew else " No Pokémon levelled up."
+    if spots is not None and spots.get("land") is not None:
+        # The map's levels (gWildMonHeaders), to judge the place against the trainee's.
+        summary += f" Wild Pokémon here: {spots['land'].levels}."
     if heal_notes:
         summary = f"On the way: {'; '.join(heal_notes)}. {summary}"
     logger.info(f"🏋️ train: {summary}")
@@ -10143,6 +10462,13 @@ async def _wild_run_rule(view: Dict[str, Any], whys: List[str]) -> Optional[Dict
     if key in _battle_rules_done:
         whys.append("the escape already failed in this battle")
         return None
+    from server import menu_state as ms
+
+    trap = _mem(ms.battler_trap)
+    if trap is not None and not trap.can_run:
+        # Seen live (2026-11-05): wild TORKOAL's FIRE SPIN, and "Can't escape!".
+        whys.append(f"trapped by {trap.why}, fighting")
+        return None
     why = _wild_run_exception(view, _objective_guidance_seen)
     if why:
         whys.append(f"not running: {why}")
@@ -10176,9 +10502,16 @@ async def _danger_switch_rule(view: Dict[str, Any], whys: List[str]) -> Optional
     when nobody else wins, and then the choice is the model's.
     """
     from pokemon_env import hm_carriers
+    from server import menu_state as ms
 
     danger = view.get("danger")
     if view.get("menu") != "action" or not danger:
+        return None
+    trap = _mem(ms.battler_trap)
+    if trap is not None:
+        # Seen live (2026-11-05): FIRE SPIN; SHIFT left the party menu open ("SABLEYE
+        # can't be switched out!").
+        whys.append(f"trapped by {trap.why}, fighting")
         return None
     pick = danger.get("switch")
     if not pick:
@@ -10398,10 +10731,12 @@ def _left_text(used: List[int]) -> str:
     return ", ".join(f"{counts.get(i, 0)} {_item_name(i)}{'' if counts.get(i, 0) == 1 else 's'} left" for i in dict.fromkeys(used))
 
 
-async def _heal_with_medicine(indexes: List[int], source: str) -> Tuple[List[str], List[int], Optional[str]]:
+async def _heal_with_medicine(
+    indexes: List[int], source: str, exclude: frozenset = frozenset()
+) -> Tuple[List[str], List[int], Optional[str]]:
     """Use bag medicine on each of these party slots until it needs no more or nothing in
-    the bag helps (_medicine_for). Returns (lines like 'SUPER POTION on X (32→82 HP)',
-    the item ids used, why it stopped early or None)."""
+    the bag helps (_medicine_for), never the items in `exclude`. Returns (lines like
+    'SUPER POTION on X (32→82 HP)', the item ids used, why it stopped early or None)."""
     from pokemon_env.memory_reader import TEAM_LOW_HP_SHARE
 
     lines: List[str] = []
@@ -10411,7 +10746,7 @@ async def _heal_with_medicine(indexes: List[int], source: str) -> Tuple[List[str
             mon = _party_mon(index)
             if mon is None:
                 break
-            item_id = _medicine_for(mon, _bag_counts())
+            item_id = _medicine_for(mon, {i: n for i, n in _bag_counts().items() if i not in exclude})
             if item_id is None:
                 break
             weak = mon.current_hp < mon.max_hp * TEAM_LOW_HP_SHARE or int(mon.status) & STATUS_ANY
