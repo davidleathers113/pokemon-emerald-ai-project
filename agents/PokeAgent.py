@@ -178,7 +178,7 @@ MACRO_TOOLS = (
 # Battle calls decided for one match-up (who is out on each side): they carry the
 # get_game_state battle_key the model saw. Seen live: switch_pokemon("BRELOOM"), chosen
 # vs MIGHTYENA, ran vs ZUBAT after presses from the /play page played two turns.
-BATTLE_DECISION_TOOLS = ("use_move", "switch_pokemon", "throw_ball")
+BATTLE_DECISION_TOOLS = ("use_move", "switch_pokemon", "throw_ball", "use_item")
 # Tools that press buttons and answer after the presses ran.
 PRESSING_TOOLS = ("press_buttons", "navigate_to", "go_to_exit", "use_move") + MACRO_TOOLS
 # HTTP timeout for a pressing tool: a long walk plus a door warp, or a macro reading a

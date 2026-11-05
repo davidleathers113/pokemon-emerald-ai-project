@@ -26,6 +26,7 @@ from pokemon_env.emerald_utils import (
 from .enums import MetatileBehavior, StatusCondition, Tileset, PokemonType, PokemonSpecies, Move, Badge, MapLocation
 from .types import PokemonData
 from . import hm_carriers
+from utils.medicine import MEDICINE, medicine_for
 from utils.ocr_dialogue import create_ocr_detector
 from utils import state_formatter
 from utils.mapping import map_stitcher_singleton
@@ -64,6 +65,28 @@ TEAM_LOW_PP_SHARE = 0.25
 # via emerald-new: "≥40% HP left at the expected KO").
 COMFORT_HP_SHARE = 0.4
 G_ENEMY_PARTY = 0x02023BC0  # gEnemyParty: the trainer's Pokémon, struct Pokemon like the player's
+
+# The moves each battler used this battle (note_battle_moves). pret symbols (US):
+# gLastMoves, a u16 per battler. battle_script_commands.c Cmd_moveend
+# (MOVEEND_UPDATE_LAST_MOVES) sets it to the move the battler just used (MOVE_UNAVAILABLE
+# when it disobeyed); battle_main.c BattleStartClearSetData, SwitchInClearSetData and
+# FaintClearSetData clear it, so a slot only holds a move of the Pokémon out there.
+G_LAST_MOVES = 0x02024248
+MOVE_UNAVAILABLE = 0xFFFF
+# A type multiplier at or above this, from a damaging move a foe on the field has used,
+# keeps a Pokémon from being sent in while another choice exists.
+SEEN_MOVE_WEAK = 2.0
+# struct BattlePokemon statStages[8] (+0x18), pret include/constants/pokemon.h STAT_*;
+# 6 is no change. Short names for the battle summary ("XATU +1 SpAtk +1 SpDef").
+STAT_STAGE_NAMES = ("HP", "Atk", "Def", "Spe", "SpAtk", "SpDef", "Acc", "Eva")
+STAT_STAGE_NEUTRAL = 6
+
+# The battle view's item line (_battle_item_hint) also speaks up when at most this many
+# party Pokémon are still healthy (able to fight and at or above TEAM_LOW_HP_SHARE).
+ITEM_HINT_HEALTHY_LEFT = 2
+# gMultiUsePlayerCursor: the battler the double battle's target cursor is on
+# (battle_controller_player.c HandleInputChooseTarget).
+G_MULTI_USE_PLAYER_CURSOR = 0x03005D74
 
 # Status moves that can't work (status_move_failure). pret include/constants/
 # battle_move_effects.h, include/constants/battle.h; gStatuses3 from pret's symbols
@@ -1859,8 +1882,98 @@ class PokemonEmeraldReader:
         hits_taken = hits - 1 if faster else hits
         return {"hit": hit, "move_id": move_id, "taken": taken, "hp": hp, "hits": hits, "left": hp - taken * hits_taken}
 
+    def battle_moves_used(self, personality: int) -> List[int]:
+        """Move ids the battler with this personality has used this battle (note_battle_moves)."""
+        return list((getattr(self, "_battle_moves_used", None) or {}).get(personality, []))
+
+    def forget_battle_moves(self) -> None:
+        """Drop what note_battle_moves remembered: a loaded save is another moment."""
+        self._battle_moves_used = {}
+
+    def note_battle_moves(self) -> None:
+        """Remember each move a battler uses this battle (gLastMoves), per Pokémon
+        (struct BattlePokemon +0x48 personality); outside a battle, forget them all.
+
+        Seen live (TATE & LIZA, 2026-11-05): CLAYDOL used EARTHQUAKE and XATU a Calm-Mind
+        boosted PSYCHIC, turn after turn, and the replacements were chosen with no idea of
+        either ("the best matchup left"): BRELOOM came in and fainted to the next PSYCHIC.
+        A battler's gLastMoves slot holds its move from when the move ends until its next
+        one (or until it switches out or faints), so a read every frame, which the server
+        does (server/app.py step_environment), misses none; read_battle_view reads it too.
+        """
+        used = getattr(self, "_battle_moves_used", None)
+        if used is None:
+            used = self._battle_moves_used = {}
+        if not self.is_in_battle():
+            used.clear()
+            return
+        raw = bytes(self.read_memory(G_LAST_MOVES, 8))
+        for battler in range(4):
+            move = raw[2 * battler] | raw[2 * battler + 1] << 8
+            if move in (0, MOVE_UNAVAILABLE):
+                continue
+            personality = self._read_u32(self.addresses.BATTLE_MONS + battler * self.addresses.BATTLE_MON_SIZE + 0x48)
+            moves = used.setdefault(personality, [])
+            if move not in moves:
+                moves.append(move)
+
+    def seen_hits(self, cand: Dict[str, Any], foes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """How each damaging move the foes on the field have used this battle would land on
+        cand (a battle-view or _party_battle_mon mon): [{"foe", "move", "multiplier",
+        "damage"}], the worst multiplier first. The multiplier is the type chart's, 0 where
+        estimate_damage finds an immunity (a Flying type or LEVITATE against EARTHQUAKE, the
+        absorbing abilities, WONDER GUARD); damage counts the foe's stat stages."""
+        hits = []
+        for foe in foes:
+            if not foe or foe.get("hp", 0) <= 0:
+                continue
+            for move_id in self.battle_moves_used(foe.get("personality", 0)):
+                data = self._rom_battle_move(move_id)
+                if not is_attack(data):
+                    continue
+                damage = self.estimate_damage(foe, cand, move_id)
+                multiplier = self.type_effectiveness(data["type"], cand["type_ids"]) if damage else 0.0
+                try:
+                    name = Move(move_id).name.replace("_", " ")
+                except ValueError:
+                    name = f"MOVE {move_id}"
+                hits.append({"foe": str(foe["name"]).upper(), "move": name, "multiplier": multiplier, "damage": damage})
+        return sorted(hits, key=lambda h: (-h["multiplier"], -h["damage"]))
+
+    @staticmethod
+    def _weak_text(weak: Dict[str, List[str]], seen: Dict[str, List[str]]) -> str:
+        """'BLAZIKEN and MANECTRIC: weak to EARTHQUAKE (CLAYDOL used it)' for each move."""
+        return "; ".join(
+            f"{' and '.join(names)}: weak to {move} ({' and '.join(seen[move])} used it)" for move, names in weak.items()
+        )
+
+    def _seen_move_screen(self, able, foes: List[Dict[str, Any]]):
+        """Split candidates [(index, mon)] by the damaging moves the foes on the field have
+        used: (kept, why), where kept drops every one weak (SEEN_MOVE_WEAK) to one of them
+        while another choice exists, and why says what was avoided ('' when nothing was)."""
+        seen: Dict[str, List[str]] = {}
+        weak: Dict[str, List[str]] = {}
+        safe = []
+        for index, mon in able:
+            hits = self.seen_hits(self._party_battle_mon(index, mon), foes)
+            bad = [h for h in hits if h["multiplier"] >= SEEN_MOVE_WEAK]
+            name = mon.species_name.upper()
+            for h in bad:
+                users, names = seen.setdefault(h["move"], []), weak.setdefault(h["move"], [])
+                if h["foe"] not in users:
+                    users.append(h["foe"])
+                if name not in names:
+                    names.append(name)
+            if not bad:
+                safe.append((index, mon))
+        if not weak:
+            return able, ""
+        if not safe:
+            return able, f"no choice avoids the foes' moves ({self._weak_text(weak, seen)})"
+        return safe, f"skipped {self._weak_text(weak, seen)}"
+
     def pick_fighter(
-        self, target: Dict[str, Any], out: set, switching_in: bool, accept=None
+        self, target: Dict[str, Any], out: set, switching_in: bool, accept=None, foes: Optional[List[Dict[str, Any]]] = None
     ) -> Optional[Dict[str, Any]]:
         """The teammate to send against target, by one rule for every choice of who comes
         in (a switch, a replacement, train's partner), or None if none wins.
@@ -1873,6 +1986,11 @@ class PokemonEmeraldReader:
         bigger margin. Only when none does, the one that wins fastest, keeping the most HP.
         accept(exchange) narrows the candidates further. The result says why ("wins in 2,
         keeps 70% HP; BRELOOM not needed").
+
+        foes (default [target]) are the foes on the field: a teammate weak (2x or more) to a
+        damaging move one of them has used this battle (seen_hits) is not sent in while
+        another choice exists, and the why names the move. Seen live (TATE & LIZA): the
+        exchange looked at one foe only, and BRELOOM came in under XATU's PSYCHIC.
         """
         party = self.read_party_pokemon() or []
         able = [
@@ -1884,6 +2002,7 @@ class PokemonEmeraldReader:
             return None
         # The strongest that could come in: "BRELOOM not needed" names it, never the one out.
         top = max(able, key=lambda im: im[1].level)[1]
+        able, avoided = self._seen_move_screen(able, foes if foes is not None else [target])
         options = []
         for index, mon in able:
             cand = self._party_battle_mon(index, mon)
@@ -1909,6 +2028,8 @@ class PokemonEmeraldReader:
             why += "; nobody wins comfortably"
         elif top.level > mon.level:
             why += f"; {top.species_name.upper()} not needed"
+        if avoided:
+            why += f"; {avoided}"
         data = self._rom_battle_move(ex["move_id"])
         try:
             move_name = Move(ex["move_id"]).name.replace("_", " ")
@@ -1935,7 +2056,8 @@ class PokemonEmeraldReader:
         return math.ceil(target["hp"] / hit) if hit else math.inf
 
     def _better_switch(
-        self, player: Dict[str, Any], target: Dict[str, Any], best: Dict[str, Any], player_battlers: List[int]
+        self, player: Dict[str, Any], target: Dict[str, Any], best: Dict[str, Any], player_battlers: List[int],
+        foes: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """A teammate that clearly does better against this foe than the Pokémon out, or None.
 
@@ -1951,7 +2073,7 @@ class PokemonEmeraldReader:
         # Which of those comes in: pick_fighter, the one rule for who fights.
         return self.pick_fighter(
             target, self._out_personalities(player_battlers), switching_in=True,
-            accept=lambda ex: ex["hit"] >= 2 * best["damage"],
+            accept=lambda ex: ex["hit"] >= 2 * best["damage"], foes=foes,
         )
 
     def _out_personalities(self, player_battlers: List[int]) -> set:
@@ -1961,32 +2083,47 @@ class PokemonEmeraldReader:
             for b in player_battlers
         }
 
-    def _switch_hint(self, target: Optional[Dict[str, Any]], player_battlers: List[int]) -> Optional[Dict[str, Any]]:
-        """The party Pokémon to send in when the one battling has no damaging move with PP:
-        able to fight (HP > 0, not an Egg), not the one out, with a damaging move with PP,
-        the best counter_score against the target. None if nobody qualifies.
+    def _switch_hint(
+        self, target: Optional[Dict[str, Any]], player_battlers: List[int], foes: Optional[List[Dict[str, Any]]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """The party Pokémon to send in when the one battling has no damaging move with PP
+        (or, for a replacement, when nobody wins the exchange): able to fight (HP > 0, not
+        an Egg), not the one out, with a damaging move with PP, the best counter_score
+        against the target. None if nobody qualifies.
 
         Seen live: BRELOOM's three attacks were at 0 PP; the view said only "switch
         Pokémon", and the model used LEECH SEED on an already seeded WINGULL 5 times.
+
+        foes (the foes on the field, default [target]): as in pick_fighter, one weak to a
+        damaging move they have used (seen_hits) is left out while another qualifies, and
+        among the rest one that a seen move would knock out in a hit comes last. Seen live
+        (TATE & LIZA): "the best matchup left" by types alone sent BRELOOM in front of
+        XATU's boosted PSYCHIC. "why" says what was avoided ("" when nothing was).
         """
         party = self.read_party_pokemon() or []
-        # struct BattlePokemon +0x48 personality: the player's Pokémon out now (2 in doubles).
-        out = {
-            self._read_u32(self.addresses.BATTLE_MONS + b * self.addresses.BATTLE_MON_SIZE + 0x48)
-            for b in player_battlers
-        }
+        out = self._out_personalities(player_battlers)
         foe_types = (target or {}).get("type_ids") or []
-        best = None
+        able = []
         for index, mon in enumerate(party):
             personality = self._read_u32(self.addresses.PARTY_BASE + index * self.addresses.PARTY_POKEMON_SIZE)
             if mon.is_egg or mon.current_hp == 0 or personality in out:
                 continue
+            if any(pp and self.attack_type(move) is not None for move, pp in zip(mon.moves or [], mon.move_pp or [])):
+                able.append((index, mon))
+        if not able:
+            return None
+        field = foes if foes is not None else ([target] if target else [])
+        able, avoided = self._seen_move_screen(able, field)
+        best = None
+        for index, mon in able:
             score = self.counter_score(mon, foe_types) if foe_types else 0.0
-            has_attack = any(
-                pp and self.attack_type(move) is not None for move, pp in zip(mon.moves or [], mon.move_pp or [])
-            )
-            if has_attack and (best is None or score > best["score"]):
-                best = {"slot": index + 1, "name": mon.species_name.upper(), "score": score}
+            cand = self._party_battle_mon(index, mon)
+            # A seen move that takes all its HP in one hit: it would only come in to faint.
+            one_hit = any(h["damage"] >= cand["hp"] for h in self.seen_hits(cand, field))
+            key = (not one_hit, score)
+            if best is None or key > best["key"]:
+                best = {"slot": index + 1, "name": mon.species_name.upper(), "score": score, "key": key, "why": avoided}
+        best.pop("key")
         return best
 
     @staticmethod
@@ -2022,7 +2159,8 @@ class PokemonEmeraldReader:
         return self.effective_speed(ours) > self.effective_speed(foe)
 
     def _danger(
-        self, player: Dict[str, Any], target: Dict[str, Any], best: Optional[Dict[str, Any]], player_battlers: List[int]
+        self, player: Dict[str, Any], target: Dict[str, Any], best: Optional[Dict[str, Any]], player_battlers: List[int],
+        foes: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """The foe's hit that wins the exchange against the Pokémon out, and the teammate
         that would win it instead, or None when the Pokémon out wins.
@@ -2044,7 +2182,7 @@ class PokemonEmeraldReader:
         if not self._loses_race(our_hits, foe_hits, 1 if first else 0, 0 if first else 1):
             return None
         # The teammate that wins it instead, by pick_fighter (the one rule for who fights).
-        choice = self.pick_fighter(target, self._out_personalities(player_battlers), switching_in=True)
+        choice = self.pick_fighter(target, self._out_personalities(player_battlers), switching_in=True, foes=foes)
         foe_data = self._rom_battle_move(foe_move)
         try:
             foe_move_name = Move(foe_move).name.replace("_", " ")
@@ -2116,7 +2254,7 @@ class PokemonEmeraldReader:
                 type_names.append(PokemonType(type_id).name)
             except ValueError:
                 type_names.append(f"TYPE{type_id}")
-        return {
+        mon = {
             "battler": battler,
             "species_id": species_id,
             "name": self._battle_species_name(species_id),
@@ -2140,6 +2278,169 @@ class PokemonEmeraldReader:
             "stat_stages": [b - 256 if b >= 128 else b for b in bytes(self.read_memory(base + 0x18, 8))],
             "ability": self._read_u8(base + 0x20),
             "ability_name": self.ability_name(self._read_u8(base + 0x20)),
+            "personality": self._read_u32(base + 0x48),
+        }
+        mon["stage_changes"] = self.stage_changes(mon)
+        return mon
+
+    @staticmethod
+    def stage_changes(mon: Dict[str, Any]) -> List[Tuple[str, int]]:
+        """[("SpAtk", 1), ("SpDef", 1)]: the stats whose stage is not neutral, in pret's
+        STAT_* order (HP has no stage). Seen live (TATE & LIZA): XATU's CALM MIND went
+        unmentioned while it swept the team at +1 and more."""
+        stages = mon.get("stat_stages") or []
+        return [
+            (STAT_STAGE_NAMES[i], stage - STAT_STAGE_NEUTRAL)
+            for i, stage in enumerate(stages[:len(STAT_STAGE_NAMES)])
+            if i and stage != STAT_STAGE_NEUTRAL
+        ]
+
+    def _foe_threat(self, foe: Dict[str, Any], ours: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """How dangerous a foe on the field is: its raised stat stages ("boosted", the sum
+        of the stages above neutral) and its hardest hit on one of our Pokémon out
+        (estimate_damage over its real moves with PP, both sides' stages applied), as the
+        share of that Pokémon's HP and whether it knocks it out."""
+        boosted = sum(change for _, change in self.stage_changes(foe) if change > 0)
+        worst = None
+        for mon in ours:
+            if not mon or mon["hp"] <= 0:
+                continue
+            hit, move_id = self._best_hit(foe, mon)
+            if not hit:
+                continue
+            share = hit / mon["hp"]
+            if worst is None or share > worst["share"]:
+                try:
+                    move = Move(move_id).name.replace("_", " ")
+                except ValueError:
+                    move = f"MOVE {move_id}"
+                worst = {
+                    "victim": str(mon["name"]).upper(), "victim_battler": mon["battler"], "victim_hp": mon["hp"],
+                    "move": move, "damage": round(hit, 1), "share": share, "ko": hit >= mon["hp"],
+                }
+        return {"foe": foe, "boosted": boosted, "hit": worst}
+
+    def _choose_target(
+        self, player: Optional[Dict[str, Any]], opponents: List[Dict[str, Any]], ours: List[Dict[str, Any]]
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """The foe to attack, and why when there was a choice ("" otherwise).
+
+        Seen live (TATE & LIZA, 2026-11-05): the double battle's target cursor starts on the
+        left foe (pret battle_controller_player.c HandleInputChooseMove:
+        B_POSITION_OPPONENT_LEFT), the view's target was the first foe standing, and every
+        attack went into CLAYDOL, which a HYPER POTION healed, while XATU used CALM MIND and
+        swept the team with PSYCHIC at 94/116 HP. Now the bigger threat goes first: a foe
+        that is boosted or can knock one of ours out this turn (_foe_threat) before one that
+        is neither; both before either; then the bigger boost, then the harder hit. Only a
+        foe the Pokémon choosing can hurt is picked, while there is one.
+        """
+        standing = [mon for mon in opponents if mon["hp"] > 0]
+        if len(standing) < 2:
+            return (standing[0] if standing else (opponents[0] if opponents else None)), ""
+        threats = [self._foe_threat(foe, ours) for foe in standing]
+
+        def rank(t: Dict[str, Any]) -> Tuple[int, int, float]:
+            ko = bool(t["hit"] and t["hit"]["ko"])
+            return (int(ko) + int(t["boosted"] > 0), t["boosted"], t["hit"]["share"] if t["hit"] else 0.0)
+
+        ordered = sorted(threats, key=rank, reverse=True)
+        hurtable = [t for t in ordered if player and self._best_hit(player, t["foe"])[0] > 0]
+        chosen = (hurtable or ordered)[0]
+        return chosen["foe"], self._threat_text(chosen, [t for t in ordered if t is not chosen])
+
+    def _threat_text(self, chosen: Dict[str, Any], others: List[Dict[str, Any]]) -> str:
+        """'XATU (+1 SpAtk +1 SpDef; PSYCHIC ~60 of AZUMARILL's 74 HP) before CLAYDOL
+        (EARTHQUAKE ~31 of AZUMARILL's 74 HP)'."""
+
+        def one(t: Dict[str, Any]) -> str:
+            parts = []
+            stages = " ".join(f"{change:+d} {name}" for name, change in self.stage_changes(t["foe"]))
+            if stages:
+                parts.append(stages)
+            hit = t["hit"]
+            if hit:
+                knocks = ", a knock-out" if hit["ko"] else ""
+                parts.append(f"{hit['move']} ~{round(hit['damage'])} of {hit['victim']}'s {hit['victim_hp']} HP{knocks}")
+            return f"{str(t['foe']['name']).upper()} ({'; '.join(parts) or 'no boosts, no hit on yours'})"
+
+        text = one(chosen)
+        if others:
+            text += " before " + ", ".join(one(t) for t in others)
+        return text
+
+    def _battle_item_hint(
+        self, ours: List[Dict[str, Any]], opponents: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Medicine from the bag worth a turn now, for the model to decide on (use_item), or
+        None. Seen live (TATE & LIZA, 2026-11-05): 3 REVIVEs and 5 SUPER POTIONs stayed in
+        the bag while the party fell one by one; the battle state listed only the Poké Balls.
+
+        Two cases. One of ours out can be knocked out this turn by a foe's best hit
+        (estimate_damage, stages applied): the cheapest HP medicine that lifts it above that
+        hit (none when no item does: healing into a knock-out wastes the turn). The party is
+        down to ITEM_HINT_HEALTHY_LEFT healthy Pokémon (able to fight, at or above
+        TEAM_LOW_HP_SHARE): a revive for the highest-level fainted one, else medicine for
+        the lowest one that can still fight. {"uses": [{"item", "pokemon", "why"}],
+        "medicine": [(name, count)], "healthy": count}.
+        """
+        bag: Dict[int, int] = {}
+        for item in self.read_full_inventory().get("items", []):
+            bag[item["item_id"]] = bag.get(item["item_id"], 0) + int(item.get("quantity") or 0)
+        medicine = {i: n for i, n in bag.items() if i in MEDICINE and n > 0}
+        if not medicine:
+            return None
+        party = self.read_party_pokemon() or []
+        personalities = [
+            self._read_u32(self.addresses.PARTY_BASE + i * self.addresses.PARTY_POKEMON_SIZE) for i in range(len(party))
+        ]
+        standing = [foe for foe in opponents if foe["hp"] > 0]
+
+        def name_of(item_id: int) -> str:
+            return str(_item_id_to_name(item_id)).upper()
+
+        uses: List[Dict[str, str]] = []
+        for mon in ours:
+            if not mon or mon["hp"] <= 0 or mon.get("personality") not in personalities:
+                continue
+            hits = [(self._best_hit(foe, mon), foe) for foe in standing]
+            (hit, move_id), foe = max(hits, key=lambda h: h[0][0], default=((0.0, 0), None))
+            if foe is None or hit < mon["hp"]:
+                continue
+            lifts = [i for i in medicine if MEDICINE[i][0] > 0 and min(mon["max_hp"], mon["hp"] + MEDICINE[i][0]) > hit]
+            if not lifts:
+                continue
+            item_id = min(lifts, key=lambda i: MEDICINE[i][3])
+            try:
+                move = Move(move_id).name.replace("_", " ")
+            except ValueError:
+                move = f"MOVE {move_id}"
+            name = str(mon["name"]).upper()
+            uses.append({
+                "item": name_of(item_id), "pokemon": name,
+                "why": f"{str(foe['name']).upper()}'s {move} (~{round(hit)}) can knock {name} out at {mon['hp']} HP",
+            })
+        members = [p for p in party if not p.is_egg]
+        healthy = [p for p in members if p.current_hp > 0 and p.current_hp >= p.max_hp * TEAM_LOW_HP_SHARE]
+        if len(members) > ITEM_HINT_HEALTHY_LEFT and len(healthy) <= ITEM_HINT_HEALTHY_LEFT:
+            named = {u["pokemon"] for u in uses}
+            fainted = sorted((p for p in members if p.current_hp == 0), key=lambda p: -p.level)
+            hurt = sorted((p for p in members if 0 < p.current_hp < p.max_hp), key=lambda p: p.current_hp / p.max_hp)
+            for mon in fainted[:1] or hurt[:1]:
+                item_id = medicine_for(mon, medicine)
+                name = mon.species_name.upper()
+                if item_id is None or name in named:
+                    continue
+                state = "fainted" if mon.current_hp == 0 else f"{mon.current_hp}/{mon.max_hp} HP"
+                uses.append({
+                    "item": name_of(item_id), "pokemon": name,
+                    "why": f"only {len(healthy)} of your Pokémon can still fight well; {name} is {state}",
+                })
+        if not uses:
+            return None
+        return {
+            "uses": uses,
+            "medicine": [(name_of(i), n) for i, n in medicine.items()],
+            "healthy": len(healthy),
         }
 
     def read_battle_view(self) -> Optional[Dict[str, Any]]:
@@ -2155,6 +2456,7 @@ class PokemonEmeraldReader:
         """
         if not self.is_in_battle():
             return None
+        self.note_battle_moves()
         flags = self._read_u32(self.addresses.BATTLE_TYPE_FLAGS)
         double = bool(flags & BATTLE_TYPE_DOUBLE) or self._read_u8(self.addresses.BATTLERS_COUNT) >= 4
         player_battlers, opponent_battlers = ([0, 2], [1, 3]) if double else ([0], [1])
@@ -2168,8 +2470,17 @@ class PokemonEmeraldReader:
                 break
 
         player = self._read_battle_mon(chooser)
+        ours = [mon for mon in (self._read_battle_mon(b) for b in player_battlers) if mon]
         opponents = [mon for mon in (self._read_battle_mon(b) for b in opponent_battlers) if mon]
-        target = next((mon for mon in opponents if mon["hp"] > 0), opponents[0] if opponents else None)
+        for mon in opponents:
+            mon["used_moves"] = []
+            for move_id in self.battle_moves_used(mon["personality"]):
+                try:
+                    mon["used_moves"].append(Move(move_id).name.replace("_", " "))
+                except ValueError:
+                    mon["used_moves"].append(f"MOVE {move_id}")
+        foes = [mon for mon in opponents if mon["hp"] > 0]
+        target, target_why = self._choose_target(player, opponents, ours)
 
         moves = []
         if player:
@@ -2211,11 +2522,14 @@ class PokemonEmeraldReader:
                 })
         scored = [m for m in moves if m["expected"] > 0]
         best = max(scored, key=lambda m: (m["expected"], m["damage"], -m["slot"])) if scored else None
-        switch_hint = self._switch_hint(target, player_battlers) if moves and best is None else None
-        better_switch = self._better_switch(player, target, best, player_battlers) if player and target and best else None
-        danger = self._danger(player, target, best, player_battlers) if player and target and moves else None
+        switch_hint = self._switch_hint(target, player_battlers, foes) if moves and best is None else None
+        better_switch = (
+            self._better_switch(player, target, best, player_battlers, foes) if player and target and best else None
+        )
+        danger = self._danger(player, target, best, player_battlers, foes) if player and target and moves else None
         if danger:
             better_switch = None  # the danger line names the switch that wins the exchange
+        item_hint = self._battle_item_hint(ours, opponents) if menu == "action" else None
 
         action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3
         return {
@@ -2230,11 +2544,13 @@ class PokemonEmeraldReader:
             "player": player,
             "opponents": opponents,
             "target": target,
+            "target_why": target_why,
             "moves": moves,
             "best_move": best,
             "switch_hint": switch_hint,
             "better_switch": better_switch,
             "danger": danger,
+            "item_hint": item_hint,
         }
 
     def read_team_condition(self, lead_index: Optional[int] = None) -> Dict[str, Any]:

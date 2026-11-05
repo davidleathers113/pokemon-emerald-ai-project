@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.anticheat import AntiCheatTracker
 from utils.json_utils import normalize_replan_edits
 from utils.llm_provider_ui import infer_llm_provider_family
+from utils.medicine import MEDICINE, STATUS_ANY, medicine_for as _medicine_for
 
 # Set up logging - reduced verbosity for multiprocess mode
 logging.basicConfig(level=logging.WARNING)
@@ -222,6 +223,18 @@ def _turbo():
 battle_message_log: "deque" = None  # created on first use (collections.deque, maxlen 64)
 _frames_run = 0
 _last_battle_message_raw = b""
+
+
+def _record_battle_moves() -> None:
+    """Called under memory_lock after every emulated frame: the moves each foe uses this
+    battle (reader.note_battle_moves; a move stays in gLastMoves only until the battler's
+    next one), for the replacements and switches that avoid them."""
+    if game_type != "emerald" or env is None or getattr(env, "memory_reader", None) is None:
+        return
+    try:
+        env.memory_reader.note_battle_moves()
+    except Exception as e:  # a missed move must never stop the game loop
+        logger.debug(f"battle move record failed: {e}")
 
 
 def _record_battle_message() -> None:
@@ -789,6 +802,7 @@ def step_environment(actions_pressed):
         env.run_frame_with_buttons(actions_pressed)
         last_frame_monotonic = time.monotonic()
         _record_battle_message()
+        _record_battle_moves()
 
         # Do lightweight area transition detection inside the lock
         if hasattr(env, "memory_reader") and env.memory_reader:
@@ -6212,9 +6226,77 @@ def _effect_text(move: Dict[str, Any], target: Optional[Dict[str, Any]]) -> str:
     if move.get("conditional"):
         return "only returns a hit taken"
     against = f" vs {'/'.join(target['types'])}" if target else ""
-    if move["effectiveness"] == 0:
+    effectiveness = move["effectiveness"]
+    if target and target.get("type_ids"):
+        # The foe aimed at may not be the view's target (use_move's target).
+        with memory_lock:
+            move_type = env.memory_reader._rom_battle_move(move["id"])["type"]
+            effectiveness = env.memory_reader.type_effectiveness(move_type, target["type_ids"])
+    if effectiveness == 0:
         return f"no effect{against}"
-    return f"{move['effectiveness']:g}x{against}"
+    return f"{effectiveness:g}x{against}"
+
+
+def _aim_target(view: Dict[str, Any], wanted: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """(the foe use_move aims at, None) or (None, why not). wanted names a foe on the field
+    (e.g. 'XATU'); without it, the view's target: in a double battle the bigger threat
+    (memory_reader._choose_target), not the foe the target cursor starts on."""
+    from server import menu_state as ms
+
+    standing = [foe for foe in view.get("opponents") or [] if foe["hp"] > 0]
+    if wanted is None or str(wanted).strip() == "":
+        return view.get("target"), None
+    key = ms.name_key(wanted)
+    match = next((foe for foe in standing if ms.name_key(foe["name"]) == key), None)
+    if match is None:
+        names = ", ".join(str(foe["name"]).upper() for foe in standing) or "none"
+        return None, f"{wanted} is not a foe on the field (foes standing: {names})."
+    return match, None
+
+
+# Target-cursor order in a double battle: pret battle_controller_player.c
+# sTargetIdentities (PLAYER_LEFT, PLAYER_RIGHT, OPPONENT_RIGHT, OPPONENT_LEFT, as battler
+# ids 0, 2, 3, 1). RIGHT/DOWN walks it forward and LEFT/UP back, skipping absent battlers.
+TARGET_CURSOR_ORDER = (0, 2, 3, 1)
+
+
+async def _aim_at(battler: int, move: str) -> bool:
+    """With the double battle's target menu up, put its cursor (gMultiUsePlayerCursor, the
+    battler A confirms: pret HandleInputChooseTarget) on `battler`, one press at a time,
+    each read back. Seen live (TATE & LIZA): the menu opens on the left foe and use_move
+    confirmed it every time, so every attack went into CLAYDOL while XATU swept."""
+    from pokemon_env.memory_reader import G_MULTI_USE_PLAYER_CURSOR
+
+    def cursor() -> int:
+        return _mem(lambda r: r._read_u8(G_MULTI_USE_PLAYER_CURSOR))
+
+    for _ in range(len(TARGET_CURSOR_ORDER)):
+        at = cursor()
+        if at == battler or at not in TARGET_CURSOR_ORDER or battler not in TARGET_CURSOR_ORDER:
+            break
+        ahead = (TARGET_CURSOR_ORDER.index(battler) - TARGET_CURSOR_ORDER.index(at)) % len(TARGET_CURSOR_ORDER)
+        await _press_battle_buttons(["RIGHT" if ahead <= 2 else "LEFT"], move)
+        await _await_game(lambda at=at: cursor() != at, MACRO_MENU_FRAMES)
+    return cursor() == battler
+
+
+def _target_cursor_name() -> str:
+    """The foe (or ally) the double battle's target cursor is on, upper-case."""
+    from pokemon_env.memory_reader import G_MULTI_USE_PLAYER_CURSOR
+
+    def read(r):
+        mon = r._read_battle_mon(r._read_u8(G_MULTI_USE_PLAYER_CURSOR) & 3)
+        return str(mon["name"]).upper() if mon else ""
+
+    return _mem(read)
+
+
+def _aim_text(aimed: bool, aim: Dict[str, Any], wanted: Any) -> str:
+    """'aimed at XATU' for use_move's summary (the battle state's Target line says why)."""
+    name = str(aim["name"]).upper()
+    if not aimed:
+        return f"could not move the target cursor to {name}; confirmed {_target_cursor_name() or 'where it was'}"
+    return f"aimed at {name}" + (", as asked" if wanted else "")
 
 
 @app.post("/mcp/use_move")
@@ -6261,8 +6343,12 @@ async def mcp_use_move(request: dict):
         if move["pp"] == 0:
             message = f"{move['name']} has no PP left. Your moves: {listing}."
             return {"success": False, "error": message, "summary": message}
+        wanted_target = request.get("target")
+        aim, why_not = _aim_target(view, wanted_target)
+        if why_not:
+            return _refusal(f"{why_not} Nothing was used.")
         with memory_lock:
-            useless = env.memory_reader.status_move_failure(move["id"], view.get("target"))
+            useless = env.memory_reader.status_move_failure(move["id"], aim)
         if useless:
             hint = view.get("switch_hint")
             instead = (
@@ -6298,17 +6384,20 @@ async def mcp_use_move(request: dict):
             move = next((m for m in view["moves"] if m["id"] == move["id"]), move)
             if move["pp"] == 0:
                 return _refusal(f"{move['name']} has no PP left. {_battle_report(played)}")
+            # The foe asked for may have fainted in that turn: the view's target then.
+            aim = _aim_target(view, wanted_target)[0] or view.get("target")
             menu = view["menu"]
         if menu == "target":
-            # A move was already picked and the double battle's target cursor is up:
-            # confirm it (it starts on an opposing Pokémon) and play the turn out.
+            # A move was already picked and the double battle's target cursor is up: put
+            # it on the foe to hit (_aim_at), confirm, and play the turn out.
+            aimed = _aim_text(await _aim_at(aim["battler"], "target"), aim, wanted_target) if aim else ""
             await _press_battle_buttons(["A"], "target")
             played = await _play_out_battle("use_move")
             return {
                 "success": True,
                 "summary": (
-                    "A target menu was open for the move already chosen: confirmed the target "
-                    f"the cursor was on. {_battle_report(played)}"
+                    f"A target menu was open for the move already chosen: {aimed or 'confirmed the target the cursor was on'}. "
+                    f"{_battle_report(played)}"
                 ),
                 "status": {"action": "YOUR_TURN", "over": "BATTLE_OVER"}.get(played["end"], "STOPPED"),
                 "end": played["end"],
@@ -6317,7 +6406,7 @@ async def mcp_use_move(request: dict):
             message = "The move-reorder mode is on (SELECT was pressed): press B, then use_move again."
             return {"success": False, "error": message, "summary": message}
 
-        before_player, target = view["player"], view["target"]
+        before_player, target = view["player"], aim
         if menu == "action":
             await _press_battle_buttons(_grid_presses(view["action_cursor"], 0) + ["A"], move["name"])
             view = await _await_battle_menu(("move",), BATTLE_MENU_WAIT_FRAMES)
@@ -6352,10 +6441,13 @@ async def mcp_use_move(request: dict):
         if view is not None and view["menu"] == "target":
             # Seen live: in a double battle (PLUSLE and MINUN) use_move stopped here with
             # "choose the target with LEFT/RIGHT and press A"; the model's presses never
-            # confirmed one and both foes stayed at 40/40 for seven minutes. The cursor
-            # starts on an opposing Pokémon, so A confirms a valid target.
+            # confirmed one and both foes stayed at 40/40 for seven minutes. Then (TATE &
+            # LIZA) A on the cursor's first foe sent every attack into CLAYDOL while XATU
+            # swept: the cursor goes to the foe to hit first (_aim_at).
+            aimed = _aim_text(await _aim_at(target["battler"], move["name"]), target, wanted_target) if target else ""
+            result["target"] = _target_cursor_name()  # the battler A confirms
             await _press_battle_buttons(["A"], move["name"])
-            summary += " (Double battle: confirmed the target the cursor was on.)"
+            summary += f" (Double battle: {aimed or 'confirmed the target the cursor was on'}.)"
         played = await _play_out_battle("use_move")
         logger.info(f"⚔️ use_move turn: {played['end']} {_turn_text(played['texts'])}")
         result.update(
@@ -7101,7 +7193,13 @@ def _replacement() -> Optional[Dict[str, Any]]:
     reader.pick_fighter, the one rule for who fights (David, 2026-11-04: not BRELOOM every
     time; the lowest level that wins comfortably). A replacement takes no free hit coming
     in. When nobody wins the exchange, the battle view's switch hint (best counter_score
-    among those with a damaging move with PP)."""
+    among those with a damaging move with PP).
+
+    Against the view's target (the bigger threat in a double battle), with every foe on
+    the field's used moves counted: one weak to a damaging move they have used is not sent
+    in while another choice exists, and the why names the move. Seen live (TATE & LIZA,
+    2026-11-05): "the best matchup left; nobody wins the exchange" sent BRELOOM in front of
+    XATU's boosted PSYCHIC, and it fainted to the next one."""
     from server import menu_state as ms
 
     with memory_lock:
@@ -7109,12 +7207,15 @@ def _replacement() -> Optional[Dict[str, Any]]:
         view = reader.read_battle_view() or {}
         battlers = [0, 2] if view.get("is_double") else [0]
         target = view.get("target")
-        hint = reader.pick_fighter(target, reader._out_personalities(battlers), switching_in=False) if target else None
+        foes = [foe for foe in view.get("opponents") or [] if foe["hp"] > 0]
+        out = reader._out_personalities(battlers)
+        hint = reader.pick_fighter(target, out, switching_in=False, foes=foes) if target else None
         if hint is None:
-            hint = reader._switch_hint(target, battlers)
+            hint = reader._switch_hint(target, battlers, foes)
             if hint is None:
                 return None
-            hint = {**hint, "why": "the best matchup left; nobody wins the exchange"}
+            avoided = f"; {hint['why']}" if hint.get("why") else ""
+            hint = {**hint, "why": f"the best matchup left; nobody wins the exchange{avoided}"}
         personalities = ms.party_personalities(reader)
     if hint["slot"] > len(personalities):
         return None
@@ -10158,66 +10259,14 @@ def _note_wild_battles(guidance: Dict[str, Any]) -> str:
 
 # -- medicine from the bag: use_item, and train healing on the spot -------------------
 
-# pret include/constants/items.h ids, the HP each restores (src/data/items.h holdEffectParam;
-# MEDICINE_FULL = all of it), the status1 bits it cures, whether it revives, and its Poké
-# Mart price (used only to pick the cheapest that does the job). Herbs are left out: they
-# lower friendship. STATUS1_TOXIC_POISON (0x80) is cured with POISON.
-MEDICINE_FULL = 10 ** 6
-STATUS_SLEEP, STATUS_POISON, STATUS_BURN, STATUS_FREEZE, STATUS_PARALYSIS = 0x7, 0x88, 0x10, 0x20, 0x40
-STATUS_ANY = STATUS_SLEEP | STATUS_POISON | STATUS_BURN | STATUS_FREEZE | STATUS_PARALYSIS
-MEDICINE: Dict[int, Tuple[int, int, bool, int]] = {
-    # item id: (HP restored, status cured, revives, price)
-    13: (20, 0, False, 300),                         # POTION
-    14: (0, STATUS_POISON, False, 100),              # ANTIDOTE
-    15: (0, STATUS_BURN, False, 250),                # BURN HEAL
-    16: (0, STATUS_FREEZE, False, 250),              # ICE HEAL
-    17: (0, STATUS_SLEEP, False, 250),               # AWAKENING
-    18: (0, STATUS_PARALYSIS, False, 200),           # PARALYZE HEAL
-    19: (MEDICINE_FULL, STATUS_ANY, False, 3000),    # FULL RESTORE
-    20: (MEDICINE_FULL, 0, False, 2500),             # MAX POTION
-    21: (200, 0, False, 1200),                       # HYPER POTION
-    22: (50, 0, False, 700),                         # SUPER POTION
-    23: (0, STATUS_ANY, False, 600),                 # FULL HEAL
-    24: (0, 0, True, 1500),                          # REVIVE (to half HP)
-    25: (0, 0, True, 4000),                          # MAX REVIVE (full HP)
-    26: (50, 0, False, 200),                         # FRESH WATER
-    27: (60, 0, False, 300),                         # SODA POP
-    28: (80, 0, False, 350),                         # LEMONADE
-    29: (100, 0, False, 500),                        # MOOMOO MILK
-}
+# The medicine table and the pick live in utils/medicine.py (imported at the top as
+# MEDICINE, STATUS_ANY and _medicine_for): the battle view's item line
+# (memory_reader._battle_item_hint) names the same items use_item uses.
+
 # Items one use_item pass may spend on one Pokémon (Potions on a big HP bar add up).
 MEDICINE_MAX_USES_PER_MON = 6
 # Presses through the bag's medicine texts ("X's HP was restored by N points.").
 MEDICINE_TEXT_PRESSES = 8
-
-
-def _medicine_for(mon, bag: Dict[int, int]) -> Optional[int]:
-    """The item a Pokémon needs most from what the bag holds ({item id: count}), else None.
-
-    Fainted: the cheapest revive. A status: the cheapest item that cures it. Missing HP:
-    the cheapest item that restores all of it; when none does, the one restoring the most
-    (cheapest of those). emerald-new (2026-11-04), David's "Potions + Jagged Pass": train
-    heals with the cheapest item that does the job before it walks to a Pokémon Center.
-    """
-    have = {i: MEDICINE[i] for i, n in bag.items() if n > 0 and i in MEDICINE}
-    if mon.is_egg or not mon.max_hp:
-        return None
-    if mon.current_hp == 0:
-        revives = [i for i, (_, _, revive, _) in have.items() if revive]
-        return min(revives, key=lambda i: have[i][3], default=None)
-    status = int(mon.status) & STATUS_ANY
-    if status:
-        cures = [i for i, (_, cured, _, _) in have.items() if cured & status]
-        if cures:
-            return min(cures, key=lambda i: have[i][3])
-    missing = mon.max_hp - mon.current_hp
-    if missing <= 0:
-        return None
-    heals = [i for i, (hp, _, _, _) in have.items() if hp > 0]
-    enough = [i for i in heals if have[i][0] >= missing]
-    if enough:
-        return min(enough, key=lambda i: have[i][3])
-    return min(heals, key=lambda i: (-have[i][0], have[i][3]), default=None)
 
 
 def _bag_counts() -> Dict[int, int]:
@@ -10496,6 +10545,160 @@ async def _use_field_item(item_id: int, source: str) -> Tuple[Optional[str], str
     return await _use_repel(item_id, source)
 
 
+def _medicine_refusal(mon, item_id: int) -> Optional[str]:
+    """Why this medicine would do nothing for this Pokémon (pret ItemUseCB_Medicine says
+    "It won't have any effect." and keeps it), or None."""
+    hp, cures, revives, _ = MEDICINE[item_id]
+    name, item = mon.species_name.upper(), _item_name(item_id)
+    if revives and mon.current_hp > 0:
+        return f"{name} hasn't fainted ({_hp_status_text(mon)}): a {item} only works on a fainted Pokémon"
+    if not revives and mon.current_hp == 0:
+        return f"{name} has fainted: only a REVIVE or MAX REVIVE brings it back, not a {item}"
+    heals = hp > 0 and mon.current_hp < mon.max_hp
+    if not revives and not heals and not cures & int(mon.status):
+        return f"{name} ({_hp_status_text(mon)}) needs nothing a {item} does"
+    return None
+
+
+async def _use_item_in_battle(request: dict) -> Dict[str, Any]:
+    """use_item during a battle: FIGHT/BAG/POKEMON/RUN → BAG → ITEMS → the medicine → USE
+    → the Pokémon, as the turn of the Pokémon choosing now (in a double battle, that
+    battler's turn; its partner still chooses its own), then the turn is played out as
+    use_move's is. Only medicine (MEDICINE) is used here.
+
+    Seen live (TATE & LIZA, 2026-11-05): 3 REVIVEs and 5 SUPER POTIONs stayed in the bag
+    while the party fell; use_item worked outside battle only. pret item_use.c
+    ItemUseInBattle_Medicine opens the battle's party menu (party_menu.c
+    ChooseMonForInBattleItem); ItemUseCB_Medicine spends the item and the menu closes
+    back to the battle (CB2_SetUpExitToBattleScreen), or says "It won't have any effect."
+    and goes back to the bag with nothing spent, which is reported, not retried.
+    """
+    from pokemon_env.memory_reader import BATTLE_TYPE_FRONTIER, BATTLE_TYPE_LINK, BATTLE_TYPE_SAFARI
+    from server import menu_state as ms
+
+    source = "use_item"
+    view = _read_battle_view()
+    if view is None:
+        return _refusal("The battle is over: call use_item again to use it outside battle.")
+    moved_on = _battle_moved_on(request, "use_item")
+    if moved_on:
+        return moved_on
+    flags = _battle_type_flags()
+    if flags & (BATTLE_TYPE_SAFARI | BATTLE_TYPE_LINK | BATTLE_TYPE_FRONTIER):
+        return _refusal("Items from the bag can't be used in this battle (Safari Zone, link or Frontier).")
+    wanted_item, wanted_mon = str(request.get("item") or "").strip(), request.get("pokemon")
+    if wanted_mon is None or str(wanted_mon).strip() == "":
+        return _refusal('pokemon is required, e.g. use_item("REVIVE", "BRELOOM"), or no item for the cheapest that helps.')
+    with memory_lock:
+        party = env.memory_reader.read_party_pokemon() or []
+    index = _train_member([(0, p) for p in party], wanted_mon)
+    if index is None:
+        names = ", ".join(f"{i + 1}. {p.species_name.upper()}" for i, p in enumerate(party))
+        return _refusal(f"{wanted_mon} is not in your party ({names}), or it is an egg.")
+    mon = party[index]
+    name = mon.species_name.upper()
+    personality = _mem(ms.party_personalities)[index]
+    counts = _bag_counts()
+    medicine = ", ".join(f"{_item_name(i)} x{n}" for i, n in counts.items() if i in MEDICINE and n > 0) or "none"
+    if wanted_item:
+        key = ms.name_key(wanted_item)
+        item_id = next((i for i, n in counts.items() if n > 0 and ms.name_key(_item_name(i)) == key), None)
+        if item_id is None:
+            return _refusal(f"There is no {wanted_item} in the ITEMS pocket. Medicine in the bag: {medicine}.")
+        if item_id not in MEDICINE:
+            return _refusal(f"In a battle use_item uses medicine only; {_item_name(item_id)} is not. Medicine in the bag: {medicine}.")
+    else:
+        item_id = _medicine_for(mon, counts)
+        if item_id is None:
+            return _refusal(f"{name} ({_hp_status_text(mon)}) needs nothing the bag has. Medicine in the bag: {medicine}.")
+    useless = _medicine_refusal(mon, item_id)
+    if useless:
+        return _refusal(f"Not used: {useless}. Medicine in the bag: {medicine}.")
+    chooser = str(view["player"]["name"]).upper() if view.get("player") else "your Pokémon"
+    chosen_for = _battle_key()
+    view, refusal = await _ready_for_battle_action("use_item", source)
+    if refusal:
+        return refusal
+    if _matchup_changed(chosen_for, _battle_key()):
+        return _refusal(
+            f"Nothing was used: the battle changed while the text before it played out. "
+            f"It is now {_matchup_text(_read_battle_view())}: choose again.",
+            status="BATTLE_CHANGED",
+        )
+    chooser = str(view["player"]["name"]).upper() if view.get("player") else chooser
+
+    async def give_up(message: str) -> Dict[str, Any]:
+        back = await _back_to_battle_menu(source)
+        tail = " Back at the battle menu; nothing was used." if back else " Could not get back to the battle menu: look at the screen."
+        return _refusal(message + tail)
+
+    before_count = counts.get(item_id, 0)
+    item = _item_name(item_id)
+    with _turbo():
+        error = await _choose_battle_action(ms.ACTION_BAG, source)
+        if error:
+            return _refusal(error)
+        if not await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES * 2):
+            return await give_up("Chose BAG but the bag did not open.")
+        for press in ms.pocket_presses(_mem(ms.bag_pocket), ms.ITEMS_POCKET):
+            await _macro_press([press], source)
+            await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES)
+        listed = _mem(lambda r: ms.bag_pocket_item_ids(r, ms.ITEMS_POCKET))
+        if _mem(ms.bag_pocket) != ms.ITEMS_POCKET or item_id not in listed:
+            return await give_up(f"Could not find the {item} in the ITEMS pocket.")
+        if not await _step_cursor(lambda r: ms.bag_cursor_index(r, ms.ITEMS_POCKET), listed.index(item_id), source):
+            return await give_up(f"Could not put the bag cursor on the {item}.")
+        await _macro_press(["A"], source)
+        if not await _await_game(lambda: _mem(lambda r: ms.task_running(r, *ms.TASK_BAG_CONTEXT)), MACRO_MENU_FRAMES):
+            return await give_up(f"Pressed A on the {item} but its USE menu did not open.")
+        if _mem(lambda r: r._read_u16(ms.G_SPECIAL_VAR_ITEM_ID)) != item_id or _mem(ms.read_menu_cursor).cursor != 0:
+            return await give_up(f"The bag's menu is not USE on the {item}.")
+        await _macro_press(["A"], source)  # USE: the bag fades to the battle's party menu
+        if not await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES * 3):
+            return await give_up(f"Chose USE on the {item} but the party menu did not open.")
+        # The battle's party menu lists gPlayerParty in battle order (pret party_menu.c
+        # UpdatePartyToBattleOrder), not the order read before. Seen in a test on a double
+        # battle: the REVIVE meant for BRELOOM (slot 5) went to BLAZIKEN, slot 5 there.
+        shown = _mem(ms.party_personalities)
+        if personality not in shown:
+            return await give_up(f"{name} is not listed in the party menu.")
+        if not await _step_cursor(ms.party_menu_slot, shown.index(personality), source):
+            return await give_up(f"Could not put the party cursor on {name}.")
+        await _macro_press(["A"], source)
+
+        def spent() -> bool:
+            return _bag_counts().get(item_id, 0) < before_count
+
+        def back_in_battle() -> bool:
+            return bool(_mem(ms.callback2_is, ms.CB2_BATTLE_MAIN))
+
+        # The HP bar fills and "X's HP was restored by N points." prints, then the menu
+        # closes to the battle; or "It won't have any effect." and back to the bag.
+        pressed = False
+        for _ in range(MEDICINE_TEXT_PRESSES):
+            if await _await_game(lambda: back_in_battle() or _mem(_bag_ready), MACRO_MENU_FRAMES):
+                break
+            if pressed and _mem(_party_ready) and not spent():
+                break  # back at the chooser: A here would choose again
+            if _mem(ms.text_waiting_for_button):
+                await _macro_press(["A"], source)
+                pressed = True
+    if not spent():
+        return await give_up(f"The {item} was not used on {name} ({_hp_status_text(mon)}): the game says it would have no effect.")
+    with memory_lock:
+        reader = env.memory_reader
+        after = dict(zip(ms.party_personalities(reader), reader.read_party_pokemon() or [])).get(personality, mon)
+    line = _medicine_line(name, item_id, mon, after)
+    played = await _play_out_battle(source)
+    logger.info(f"💊 use_item in battle: {line}; {played['end']} {_turn_text(played['texts'])}")
+    return {
+        "success": True,
+        "status": "USED",
+        "summary": f"Used {line} as {chooser}'s turn; {_left_text([item_id])}. {_battle_report(played)}",
+        "end": played["end"],
+    }
+
+
 @app.post("/mcp/use_item")
 async def mcp_use_item(request: dict = None):
     """MCP Tool: outside battle, use an item from the bag: a medicine on a party Pokémon,
@@ -10513,6 +10716,8 @@ async def mcp_use_item(request: dict = None):
 
     source = "use_item"
     request = request or {}
+    if game_type == "emerald" and _mem(lambda r: r.is_in_battle()):
+        return await _use_item_in_battle(request)
     wanted_item, wanted_mon = str(request.get("item") or "").strip(), request.get("pokemon")
     field_item = _field_item(wanted_item)
     if field_item is not None:

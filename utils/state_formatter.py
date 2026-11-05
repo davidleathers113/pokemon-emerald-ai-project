@@ -339,7 +339,12 @@ def _battle_mon_line(mon):
     status = f", {mon['status']}" if mon.get('status', 'OK') != 'OK' else ""
     # The game's own ability for the Pokémon out (gBattleMons): LEVITATE, HUGE POWER...
     ability = f", {mon['ability_name']}" if mon.get('ability_name') else ""
-    return f"{mon['name'].upper()} Lv{mon['level']} ({'/'.join(mon['types'])}), {hp}{status}{ability}"
+    # Seen live (TATE & LIZA, 2026-11-05): XATU used CALM MIND twice and swept the team
+    # with PSYCHIC; nothing here said it was boosted, or what CLAYDOL had used.
+    stages = " ".join(f"{change:+d} {name}" for name, change in mon.get('stage_changes') or [])
+    stages = f", {stages}" if stages and mon['hp'] > 0 else ""
+    used = f", used {', '.join(mon['used_moves'])}" if mon.get('used_moves') and mon['hp'] > 0 else ""
+    return f"{mon['name'].upper()} Lv{mon['level']} ({'/'.join(mon['types'])}), {hp}{status}{ability}{stages}{used}"
 
 
 def _effectiveness_label(move):
@@ -390,8 +395,14 @@ def format_battle_view(view):
         lines.append("Text or an animation is playing: press A to continue.")
 
     target = view.get('target')
+    if view.get('target_why'):
+        # Seen live (TATE & LIZA): every attack went into CLAYDOL, the foe the target
+        # cursor starts on, while a Calm-Mind boosted XATU swept the team.
+        lines.append(f"Target: {view['target_why']}.")
     if moves:
         against = f" vs {'/'.join(target['types'])}" if target else ""
+        if target and view['is_double']:
+            against = f" vs {target['name'].upper()} {'/'.join(target['types'])}"
         lines.append(f"Moves (slot name type power PP effect{against}, ~HP one hit takes):")
         for m in moves:
             power = m['power'] if m['power'] else "-"
@@ -401,7 +412,10 @@ def format_battle_view(view):
             lines.append(f"  {m['slot']} {m['name']} {m['type']} {power} PP{m['pp']} {_effectiveness_label(m)}{hits}")
     best = view.get('best_move')
     if best:
-        lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\").")
+        aim = ""
+        if target and view['is_double'] and sum(1 for o in view['opponents'] if o['hp'] > 0) > 1:
+            aim = f", target=\"{target['name'].upper()}\""
+        lines.append(f"Best move now: {best['name']} (slot {best['slot']}) — call use_move(\"{best['name']}\"{aim}).")
         better = view.get('better_switch')
         if better:
             # Seen live vs Wattson's MAGNETON: 0.5x moves 14 times, never a switch.
@@ -447,6 +461,17 @@ def format_battle_view(view):
         lines.append(
             f"{player['name'].upper()} is low on HP ({player['hp']}/{player['max_hp']}): "
             "run_from_battle() or switch_pokemon() is safer than attacking."
+        )
+    items = view.get('item_hint')
+    if items:
+        # Seen live (TATE & LIZA): 3 REVIVEs and 5 SUPER POTIONs stayed in the bag while
+        # the party fell; the battle state listed only the Poké Balls.
+        calls = "; ".join(
+            f"use_item(\"{u['item']}\", \"{u['pokemon']}\") ({u['why']})" for u in items['uses']
+        )
+        stock = ", ".join(f"{name} x{count}" for name, count in items['medicine'])
+        lines.append(
+            f"ITEMS: {calls}. It takes {player['name'].upper()}'s turn. Medicine in the bag: {stock}."
         )
     return lines
 

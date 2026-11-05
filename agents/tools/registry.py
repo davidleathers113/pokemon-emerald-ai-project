@@ -582,7 +582,9 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "moves the cursor to the move and confirms it, then reads through the turn's "
             "text. Answers at your next turn, when the battle ends, or at a question, "
             "quoting what happened and both sides' HP. The battle section names the best "
-            "move. Fails without pressing anything if the move has no PP."
+            "move. Fails without pressing anything if the move has no PP. In a double "
+            "battle it hits the foe named by target, else the one the battle section's "
+            "Target line names (the bigger threat)."
         ),
         "parameters": {
             "type_": "OBJECT",
@@ -590,6 +592,10 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
                 "move": {
                     "type_": "STRING",
                     "description": "The move's name as listed in the battle section (e.g. 'EMBER'), or its slot number 1-4.",
+                },
+                "target": {
+                    "type_": "STRING",
+                    "description": "Double battles only, optional: the foe to hit, e.g. 'XATU'.",
                 },
                 "reasoning": {
                     "type_": "STRING",
@@ -810,10 +816,12 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "name": "use_item",
         "scaffolds": GUIDE_SCAFFOLDS,
         "description": (
-            "Outside battle: use an item from the bag, in one call. Medicine (Potion, Super "
-            "Potion, Antidote, Revive...) goes on a party Pokemon: leave item empty to use the "
-            "cheapest one that heals it. ESCAPE ROPE (caves and dungeons only) and REPEL / "
-            "SUPER REPEL / MAX REPEL take no Pokemon."
+            "Use an item from the bag, in one call. Medicine (Potion, Super Potion, "
+            "Antidote, Revive...) goes on a party Pokemon: leave item empty to use the "
+            "cheapest one that heals it. In a battle only medicine, as the turn of the "
+            "Pokemon choosing now (the battle section's ITEMS line suggests one), e.g. REVIVE "
+            "on a fainted one. Outside battle, ESCAPE ROPE (caves and dungeons only) and "
+            "REPEL / SUPER REPEL / MAX REPEL take no Pokemon."
         ),
         "parameters": {
             "type_": "OBJECT",

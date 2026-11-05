@@ -796,6 +796,8 @@ class EmeraldEmulator:
             # Reset dialog tracking and invalidate map cache when loading new state
             if self.memory_reader:
                 self.memory_reader.reset_dialog_tracking()
+                # The foes' moves remembered in a battle belong to the moment before the load.
+                self.memory_reader.forget_battle_moves()
                 # Don't clear buffer address on state load to avoid expensive rescans
                 self.memory_reader.invalidate_map_cache(clear_buffer_address=False)
 
