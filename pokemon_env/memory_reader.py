@@ -1519,7 +1519,11 @@ class PokemonEmeraldReader:
             cache = self._battle_move_cache = {}
         if move_id not in cache:
             raw = bytes(self.read_memory(self.addresses.ROM_BATTLE_MOVES + 12 * move_id, 12))
-            cache[move_id] = {"effect": raw[0], "power": raw[1], "type": raw[2], "accuracy": raw[3], "pp": raw[4]}
+            cache[move_id] = {
+                "effect": raw[0], "power": raw[1], "type": raw[2], "accuracy": raw[3], "pp": raw[4],
+                # pret struct BattleMove +7: s8 priority (QUICK ATTACK, MACH PUNCH +1; PROTECT +3).
+                "priority": raw[7] - 256 if raw[7] >= 128 else raw[7],
+            }
         return cache[move_id]
 
     def _type_chart(self) -> List[Tuple[int, int, int]]:
@@ -1851,12 +1855,12 @@ class PokemonEmeraldReader:
         hit, move_id = self._best_hit(cand, target)
         if not hit:
             return None
-        taken = self._best_hit(target, cand)[0]
+        taken, foe_move = self._best_hit(target, cand)
         hp = cand["hp"] - (taken if switching_in else 0)
         if hp <= 0:
             return None
         hits = math.ceil(target["hp"] / hit)
-        faster = cand["stats"].get("speed", 0) > target["stats"].get("speed", 0)
+        faster = self.strikes_first(cand, move_id, target, foe_move)
         hits_taken = hits - 1 if faster else hits
         return {"hit": hit, "move_id": move_id, "taken": taken, "hp": hp, "hits": hits, "left": hp - taken * hits_taken}
 
@@ -1991,6 +1995,32 @@ class PokemonEmeraldReader:
         moves first (the faster side hits first each turn; a tie is counted against us)."""
         return foe_hits < our_hits or (foe_hits == our_hits and foe_speed >= our_speed)
 
+    @staticmethod
+    def effective_speed(mon: Dict[str, Any]) -> int:
+        """The speed the turn order uses (pret battle_main.c GetWhoStrikesFirst): the stat
+        times its stat-stage ratio (gStatStageRatios), a quarter while paralyzed. Weather
+        abilities, Macho Brace and Quick Claw's random turns are left out."""
+        speed = int((mon.get("stats") or {}).get("speed", 0))
+        stages = mon.get("stat_stages") or []
+        num, den = STAT_STAGE_RATIOS[max(0, min(12, stages[3] if len(stages) > 3 else 6))]  # STAT_SPEED = 3
+        speed = speed * num // den
+        return speed // 4 if mon.get("status") == "PARALYSIS" else speed
+
+    def strikes_first(self, ours: Dict[str, Any], our_move: int, foe: Dict[str, Any], foe_move: int) -> bool:
+        """Does `ours` move before `foe` when each uses that move? pret GetWhoStrikesFirst:
+        the higher move priority first (QUICK ATTACK, MACH PUNCH), else the higher speed
+        (effective_speed); a tie is counted against us.
+
+        Seen live (Winona, 2026-11-04): MANECTRIC fainted to ALTARIA and the harness sent in
+        BRELOOM, "wins in 1, keeps 100% HP": its raw Speed was above ALTARIA's, but ALTARIA
+        had used DRAGON DANCE (+1 Speed), struck first with AERIAL ACE (4x) and knocked it out.
+        """
+        ours_first = self._rom_battle_move(our_move)["priority"] if our_move else 0
+        theirs_first = self._rom_battle_move(foe_move)["priority"] if foe_move else 0
+        if ours_first != theirs_first:
+            return ours_first > theirs_first
+        return self.effective_speed(ours) > self.effective_speed(foe)
+
     def _danger(
         self, player: Dict[str, Any], target: Dict[str, Any], best: Optional[Dict[str, Any]], player_battlers: List[int]
     ) -> Optional[Dict[str, Any]]:
@@ -2009,8 +2039,9 @@ class PokemonEmeraldReader:
             return None
         our_hits = math.ceil(target["hp"] / best["damage"]) if best and best.get("damage") else math.inf
         foe_hits = math.ceil(player["hp"] / foe_hit)
-        foe_speed = target["stats"].get("speed", 0)
-        if not self._loses_race(our_hits, foe_hits, player["stats"].get("speed", 0), foe_speed):
+        # Turn order as pret decides it (strikes_first: priority, then staged speed).
+        first = self.strikes_first(player, (best or {}).get("id", 0), target, foe_move)
+        if not self._loses_race(our_hits, foe_hits, 1 if first else 0, 0 if first else 1):
             return None
         # The teammate that wins it instead, by pick_fighter (the one rule for who fights).
         choice = self.pick_fighter(target, self._out_personalities(player_battlers), switching_in=True)

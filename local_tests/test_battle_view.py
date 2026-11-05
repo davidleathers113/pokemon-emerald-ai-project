@@ -493,6 +493,48 @@ def test_the_lowest_level_teammate_that_wins_comfortably_comes_in():
     assert pick and pick["name"] == "BRELOOM" and "not needed" not in pick["why"], pick
 
 
+def test_turn_order_counts_stat_stages_and_priority():
+    """Seen live (Winona, 2026-11-04): MANECTRIC fainted to ALTARIA and the harness sent in
+    BRELOOM, "wins in 1, keeps 100% HP". Its raw Speed was above ALTARIA's, but ALTARIA had
+    used DRAGON DANCE (+1 Speed), struck first with AERIAL ACE (4x on Grass/Fighting) and
+    knocked it out. Turn order is pret GetWhoStrikesFirst: priority, then the staged speed.
+    RAM: Isaac's foe (gBattleMons[1]) made a Flying foe at 1 HP with AERIAL ACE only, its
+    speed one below BRELOOM's; then its speed stage (+0x18 + STAT_SPEED 3) raised to +1."""
+    from pokemon_env.enums import Move
+
+    s = server()
+    s.load(ISAAC)
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        party = reader.read_party_pokemon()
+        index = next(i for i, p in enumerate(party) if p.species_name.upper() == "BRELOOM")
+        breloom = reader._party_battle_mon(index, party[index])
+    _poke(s, 8, FOE + 0x21, 2)  # FLYING
+    _poke(s, 8, FOE + 0x22, 2)
+    _poke(s, 16, FOE + 0x28, 1)
+    _poke(s, 8, FOE + 0x2A, 40)  # level 40, attack 200: AERIAL ACE 4x knocks BRELOOM out
+    _poke(s, 16, FOE + 0x2, 200)
+    _poke(s, 16, FOE + 0x6, breloom["stats"]["speed"] - 1)
+    _poke(s, 16, FOE + 0x0C, Move["AERIAL_ACE"].value)
+    for slot in (1, 2, 3):
+        _poke(s, 16, FOE + 0x0C + 2 * slot, 0)
+    _poke(s, 8, FOE + 0x24, 20)
+    with s.srv.memory_lock:
+        target = reader._read_battle_mon(1)
+        before = reader._exchange(breloom, target, switching_in=False)
+    assert before and before["left"] > 0, before  # BRELOOM is faster and wins in one
+    _poke(s, 8, FOE + 0x18 + 3, 7)  # DRAGON DANCE: Speed +1 (stage 6 is neutral)
+    with s.srv.memory_lock:
+        target = reader._read_battle_mon(1)
+        after = reader._exchange(breloom, target, switching_in=False)
+        assert reader.effective_speed(target) > reader.effective_speed(breloom)
+    assert after is None or after["left"] <= 0, after  # AERIAL ACE lands first
+    # Priority beats speed: MACH PUNCH (+1) goes first against the faster foe.
+    with s.srv.memory_lock:
+        assert reader.strikes_first(breloom, Move["MACH_PUNCH"].value, target, Move["AERIAL_ACE"].value)
+        assert not reader.strikes_first(breloom, Move["HEADBUTT"].value, target, Move["AERIAL_ACE"].value)
+
+
 def test_a_battle_call_for_a_matchup_that_changed_is_refused():
     """Seen live (Maxie, 15:40 UTC): switch_pokemon("BRELOOM") was chosen for SABLEYE vs
     MIGHTYENA; presses from the /play page played two turns while the model thought, and

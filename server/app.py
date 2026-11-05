@@ -3528,18 +3528,15 @@ def _trainee_advantage(view: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     with memory_lock:
         reader = env.memory_reader
-        foe_best = max(
-            (reader.estimate_damage(target, player, move) for move, pp in zip(target["move_ids"], target["pp"]) if move and pp),
-            default=0.0,
-        )
+        foe_best, foe_move = reader._best_hit(target, player)
+        # Who moves first counts too (_loses_race): a faster trainee that needs as many hits
+        # as the foe lands the last one first. Seen live (2026-11-04): AZUMARILL (Water, 4x
+        # on NUMEL) left two of three Jagged Pass battles to BRELOOM and shared the EXP.
+        # Turn order as pret decides it (strikes_first: priority, then staged speed).
+        first = reader.strikes_first(player, best.get("id", 0), target, foe_move)
     hits_needed = math.ceil(target["hp"] / best["damage"])
     hits_taken = math.ceil(player["hp"] / foe_best) if foe_best else math.inf
-    # Who moves first counts too (_loses_race): a faster trainee that needs as many hits
-    # as the foe lands the last one first. Seen live (2026-11-04): AZUMARILL (Water, 4x
-    # on NUMEL) left two of three Jagged Pass battles to BRELOOM and shared the EXP.
-    loses = env.memory_reader._loses_race(
-        hits_needed, hits_taken, player.get("stats", {}).get("speed", 0), target.get("stats", {}).get("speed", 0)
-    )
+    loses = env.memory_reader._loses_race(hits_needed, hits_taken, 1 if first else 0, 0 if first else 1)
     return best if hits_needed <= TRAINEE_SOLO_HITS and not loses else None
 
 
