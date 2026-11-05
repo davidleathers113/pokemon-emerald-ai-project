@@ -5302,6 +5302,10 @@ SURF_MAX_STEPS = 4
 # Fresh plans one navigate_to makes when a walk through rotating gates ends off its plan
 # (mcp_navigate_to); a gate the model doesn't know about can't keep it walking forever.
 GATE_REPLANS = 3
+# Story scenes one navigate_to or go_to_exit walks into to clear the way
+# (game_tools.scene_clears) before it stops and reports: a scene that leaves its people
+# standing must not be walked into again and again.
+SCENE_REPLANS = 2
 
 
 async def _start_surf(tile, source: str) -> Optional[str]:
@@ -5563,7 +5567,8 @@ async def mcp_go_to_exit(request: dict):
         snap = start
         pushes, push_trouble = 0, None
         puzzle_crossed = False
-        for _attempt in range(7 + STRENGTH_MAX_PUSHES):
+        scenes = 0
+        for _attempt in range(7 + STRENGTH_MAX_PUSHES + SCENE_REPLANS):
             # Seen live: go_to_exit("METEOR FALLS 1F 1R") from ROUTE 114 went through the
             # door, then planned again from inside METEOR FALLS and answered "No exit of
             # METEOR FALLS 1F 1R matches 'METEOR FALLS 1F 1R'". A retry only makes sense
@@ -5653,6 +5658,17 @@ async def mcp_go_to_exit(request: dict):
                     break
                 cleared.append(said)
                 pushes += 1
+                continue
+            # The way went through a story scene that takes the people in the way off
+            # (game_tools.scene_clears): the game stopped the walk there. Let the scene
+            # play, then plan again from where it left the player.
+            if plan.get("scene") and not walk_clean and scenes < SCENE_REPLANS:
+                scenes += 1
+                await _settle_after_interruption()
+                snap = _field_snapshot()
+                if _mem(lambda r: r.is_in_battle()) or not _player_can_walk():
+                    break
+                cleared.append(f"a scene played at {tuple(plan['scene'])}")
                 continue
             snap = await _await_exit(plan, before, WARP_FRAMES if plan["kind"] == "warp" else EDGE_FRAMES)
             # A rock or tree on the way that the party can clear: clear it, plan again.
@@ -12299,6 +12315,20 @@ async def mcp_navigate_to(request: dict):
                         else f"Landed from the water at {landed}."
                     )
                     again = await mcp_navigate_to({**request, "_surfed": surf_steps + 1})
+                    again["summary"] = f"{note} {again.get('summary') or again.get('error', '')}".strip()
+                    return told(again)
+            # The way went through a story scene that takes the people in the way off
+            # (game_tools.scene_clears): the game stopped the walk there. Let it play,
+            # then walk on from where it left the player.
+            scenes_before = int(request.get("_scenes", 0))
+            stopped = report is not None and not (
+                report.get("done") and not report.get("blocked") and not report.get("interrupted")
+            )
+            if result.get("scene") and stopped and scenes_before < SCENE_REPLANS:
+                await _settle_after_interruption()
+                if _player_can_walk() and not _mem(lambda r: r.is_in_battle()):
+                    again = await mcp_navigate_to({**request, "_scenes": scenes_before + 1})
+                    note = f"A scene played at {tuple(result['scene'])} and cleared the way."
                     again["summary"] = f"{note} {again.get('summary') or again.get('error', '')}".strip()
                     return told(again)
 

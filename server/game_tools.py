@@ -372,6 +372,11 @@ def load_pathfinding_state(env) -> tuple:
                         # Floor switches and scene triggers that would fire if stepped on:
                         # walks go round them unless that is the only way (find_path).
                         state["map"]["porymap"]["triggers"] = active_triggers(env, porymap_map_name)
+                        # Story scenes that take people out of the way when they play:
+                        # walks blocked only by those people go through the scene.
+                        state["map"]["porymap"]["scenes"] = scene_clears(
+                            env, porymap_map_name, state["map"]["porymap"]["objects"], coord_offset
+                        )
                         # A rotating tile puzzle's switches are never walked over: a press
                         # moves statues, so only the puzzle's plan steps on one (puzzle_route).
                         ox, oy = coord_offset or (0, 0)
@@ -740,6 +745,10 @@ def navigate_to_direct(
         }
         result.update(push_plan(start, buttons, pushes))
         result["buttons"] = jump_presses(start, result["buttons"], map_data.get("raw_tiles"))
+        if pathfinder.last_scene is not None:
+            # The walk goes through a story scene that clears the way: the game stops it
+            # there, and the caller plans again once the scene has played.
+            result["scene"] = list(pathfinder.last_scene)
         if map_data.get("rotating_gates") is not None:
             # The gates as the plan leaves them: the walk checks the game agrees.
             result["gates_after"] = list(pathfinder.last_gate_orientations or ())
@@ -1282,24 +1291,63 @@ def active_triggers(env, map_dir: str) -> List[Tuple[int, int]]:
     flipped the barriers back. Already spent triggers (Birch's ROUTE 110 scene once
     VAR_REGISTER_BIRCH_STATE has moved on) stay walkable.
     """
-    out = []
+    return [
+        (int(event.get("x", -1)), int(event.get("y", -1)))
+        for event in _raw_map_json(map_dir).get("coord_events") or []
+        if event.get("type") == "trigger" and _trigger_fires(env, event, unknown=True)
+    ]
+
+
+def _trigger_fires(env, event: dict, unknown: bool) -> bool:
+    """Whether a coord-event trigger runs its script when stepped on now (pret: when
+    VarGet(var) == var_value); `unknown` when its var can't be resolved or read."""
+    var_id = _var_ids().get(str(event.get("var", "")))
+    try:
+        wanted = int(str(event.get("var_value", "0")), 0)
+    except ValueError:
+        return unknown
+    if var_id is None or env is None:
+        return unknown
+    try:
+        value = env.memory_reader.read_game_var(var_id)
+    except Exception as e:  # unreadable var: the caller's guess
+        logger.debug(f"trigger var {event.get('var')} unreadable: {e}")
+        return unknown
+    return unknown if value is None else value == wanted
+
+
+def scene_clears(env, map_dir: str, objects: list, coord_offset=None) -> List[dict]:
+    """[{"tiles": its trigger tiles, "clears": the tiles it frees}, ...] for each
+    coord-event script that plays when stepped on now and `removeobject`s people of this
+    map: the tiles are where those people (objects, placed where they stand and in walk
+    coordinates, as load_pathfinding_state has them) stand now. The planner walks into
+    such a scene when those people wall the only way (pathfinding _through_scene).
+
+    pret MossdeepCity_EventScript_TeamMagmaEnterSpaceCenter: Maxie and four grunts stand
+    across the street until the scene in front of them walks them into the Space Center
+    and removes them. A var that can't be read counts as not playing here: a person
+    planned away who then stays would end the walk at them.
+    """
+    ox, oy = coord_offset or (0, 0)
+    by_script: Dict[str, List[Tuple[int, int]]] = {}
     for event in _raw_map_json(map_dir).get("coord_events") or []:
-        if event.get("type") != "trigger":
-            continue
-        var_id = _var_ids().get(str(event.get("var", "")))
-        try:
-            wanted = int(str(event.get("var_value", "0")), 0)
-        except ValueError:
-            wanted = None
-        fires = True
-        if var_id is not None and wanted is not None and env is not None:
-            try:
-                value = env.memory_reader.read_game_var(var_id)
-                fires = value is None or value == wanted
-            except Exception as e:  # unreadable var: treat as live, the safer guess
-                logger.debug(f"trigger var {event.get('var')} unreadable: {e}")
-        if fires:
-            out.append((int(event.get("x", -1)), int(event.get("y", -1))))
+        if event.get("type") == "trigger" and _trigger_fires(env, event, unknown=False):
+            tile = (int(event.get("x", -1)) - ox, int(event.get("y", -1)) - oy)
+            by_script.setdefault(str(event.get("script", "")), []).append(tile)
+    out = []
+    for script, tiles in by_script.items():
+        removed = {
+            line.partition(" ")[2].split(",")[0].strip()
+            for line in _script_lines(map_dir, script)
+            if line.partition(" ")[0] == "removeobject"
+        } - set(_PLAYER_IDS)
+        clears = [
+            (int(obj.get("x", -1)), int(obj.get("y", -1)))
+            for obj in objects
+            if (obj.get("local_id") and obj.get("local_id") in removed) or str(obj.get("event_id", "")) in removed
+        ]
+        if clears:
+            out.append({"tiles": tiles, "clears": clears})
     return out
 
 
@@ -3128,6 +3176,9 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     surf = bool(state.get("map", {}).get("porymap", {}).get("surf"))
     # The boulder pushes of each route found (push_plan), by its end tile.
     pushes_to: dict = {}
+    # The story scene each route found walks into to clear the way (pathfinding
+    # _through_scene), by its end tile.
+    scenes_to: dict = {}
 
     def route_to(tile):
         if tile == start:
@@ -3138,6 +3189,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
         pushes = list(pathfinder.last_pushes)
         if buttons and planned_end(start, buttons, pushes) == tile:
             pushes_to[tile] = pushes
+            scenes_to[tile] = pathfinder.last_scene
             return buttons
         return None
 
@@ -3236,6 +3288,9 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     # A route that pushes boulders is walked to its first push only (push_plan): the
     # caller pushes, then plans again. Its edge press is kept for the last plan.
     best.update(push_plan(start, best["buttons"], pushes_to.get(tuple(best["target"])) or []))
+    if scenes_to.get(tuple(best["target"])) is not None:
+        # The walk stops in a story scene that clears the way; the caller plans again.
+        best["scene"] = list(scenes_to[tuple(best["target"])])
     raw_tiles = state.get("map", {}).get("porymap", {}).get("raw_tiles")
     best["buttons"] = jump_presses(start, best["buttons"], raw_tiles)
     best.update({

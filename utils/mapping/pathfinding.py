@@ -337,6 +337,9 @@ class Pathfinder:
         # movement check would call an interruption).
         self.last_pushes: List[Dict] = []
         self.last_path_buttons: List[str] = []
+        # The story scene tile the last path found walks onto to clear people out of the
+        # way (_through_scene), or None: the walk stops there while the scene plays.
+        self.last_scene: Optional[Tuple[int, int]] = None
 
     def find_path(
         self,
@@ -372,6 +375,7 @@ class Pathfinder:
         self.last_gate_orientations = None
         self.last_pushes = []
         self.last_path_buttons = []
+        self.last_scene = None
 
         # CRITICAL: Require porymap data - no fallback allowed
         if not map_data:
@@ -592,6 +596,15 @@ class Pathfinder:
             result = self._astar(start, goal, blocked, map_data, max_distance)
         else:
             blocked = blocked | triggers  # the variance candidates below avoid them too
+        # People a story scene takes away wall the way only until the scene plays: walk
+        # into the scene, then on past where they stood (_through_scene). Not among
+        # rotating gates or pushable boulders, whose search states the two legs would lose.
+        if isinstance(result, tuple) and map_data.get("scenes") and map_data.get("rotating_gates") is None and not (
+            boulders and map_data.get("strength")
+        ):
+            through = self._through_scene(start, goal, blocked, map_data, max_distance)
+            if through is not None:
+                result, variance = through, None
 
         if isinstance(result, tuple):
             # A* returned (None, best_node) - no complete path but found closest point
@@ -668,6 +681,9 @@ class Pathfinder:
                     "raw_warps": porymap.get("raw_warps", []),
                     # Coord-event triggers that would fire now (game_tools.active_triggers).
                     "triggers": porymap.get("triggers", []),
+                    # Story scenes that would play now and the people each one takes
+                    # away (game_tools.scene_clears): find_path walks into the scene.
+                    "scenes": porymap.get("scenes") or [],
                     # Floor switches of a rotating tile puzzle: never walked over (find_path).
                     "puzzle_switches": porymap.get("puzzle_switches", []),
                     # Rocks/trees the party can clear (game_tools.clearable_obstacles).
@@ -1859,6 +1875,44 @@ class Pathfinder:
     def _heuristic(self, pos1: Tuple[int, int], pos2: Tuple[int, int]) -> float:
         """Calculate heuristic distance (Manhattan distance for grid movement)."""
         return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+
+    def _through_scene(self, start, goal, blocked, map_data, max_distance) -> Optional[List[Tuple[int, int]]]:
+        """The shortest walk that steps onto a tile of a story scene that plays now and
+        then goes on with the people that scene removes gone, or None. Sets last_scene to
+        the scene tile walked onto (the walk stops there while the scene plays).
+
+        pret MossdeepCity_EventScript_TeamMagmaEnterSpaceCenter: after the Mind Badge
+        (VAR_MOSSDEEP_CITY_STATE 1) Maxie and four grunts stand across the street at
+        (44,23)-(45,25), and the coord events at (40-42,21-26) in front of them play the
+        scene that walks them into the Space Center and `removeobject`s them. Seen live
+        (2026-11-05): navigate_to(64,15) from (39,15) answered "No path found" and
+        go_to("Mossdeep Space Center") "no walkable path"; walked by hand, the scene
+        played at (40,25) and the street was open.
+        """
+        best = None
+        for scene in map_data.get("scenes") or []:
+            clears = {tuple(t) for t in scene.get("clears") or []}
+            if not clears:
+                continue
+            for tile in {tuple(t) for t in scene.get("tiles") or []} - {start}:
+                if tile in blocked:
+                    continue
+                to_scene = self._astar(start, tile, blocked, map_data, max_distance)
+                if not isinstance(to_scene, list):
+                    continue
+                # The walker's elevation on the scene tile is that tile's own (_astar
+                # starts there from the tile, as it is not the player's live tile).
+                beyond = self._astar(tile, goal, blocked - clears, map_data, max_distance)
+                if not isinstance(beyond, list):
+                    continue
+                walk = to_scene + beyond[1:]
+                if best is None or len(walk) < len(best[0]):
+                    best = (walk, tile)
+        if best is None:
+            return None
+        self.last_scene = best[1]
+        self.last_pushes, self.last_path_buttons = [], []
+        return best[0]
 
     def _reconstruct_path(self, node: Node) -> List[Tuple[int, int]]:
         """Reconstruct the path from start to goal."""

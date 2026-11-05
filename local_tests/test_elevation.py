@@ -168,6 +168,57 @@ def test_route_areas_follow_elevation():
     assert route120[(27, 67)] == route120[(22, 67)]
 
 
+def test_every_same_size_override_walks_on_the_layouts_own_tiles():
+    """Every ASCII override the size of its pret layout (ascii_map_loader.MAP_OVERRIDES) is
+    walked on map.bin's own words, cell for cell (pret: metatile id = word & 0x3FF,
+    collision = (word >> 10) & 3, elevation = word >> 12), except its doors and warps, which
+    keep the override's tile with the layout's elevation (override_walk_tiles).
+
+    Checked after the live MOSSDEEP CITY "No path found" to the Space Center (2026-11-05):
+    the planner's tiles there were right, and Team Magma walling the street was the cause
+    (test_scene_walls)."""
+    import json
+    import struct
+
+    from utils.mapping.ascii_map_loader import MAP_OVERRIDES
+    from utils.mapping.porymap_json_builder import build_json_map
+    from utils.mapping.porymap_state import _get_pokeemerald_root
+
+    root = _get_pokeemerald_root()
+    layouts = {
+        entry["id"]: entry
+        for entry in json.loads((root / "data" / "layouts" / "layouts.json").read_text())["layouts"]
+        if "id" in entry
+    }
+    checked, differ = [], []
+    for name in MAP_OVERRIDES:
+        map_json = root / "data" / "maps" / name / "map.json"
+        if not map_json.exists():
+            continue  # an override of a map pret doesn't have (PetalburgCity_Gym_Lobby)
+        data = json.loads(map_json.read_text())
+        layout = layouts[data["layout"]]
+        width, height = layout["width"], layout["height"]
+        words = struct.unpack(f"<{width * height}H", (root / layout["blockdata_filepath"]).read_bytes()[: width * height * 2])
+        built = build_json_map(name, root, include_grid=True, include_ascii=False, badge_count=8)
+        tiles, grid = built["raw_tiles"], built["grid"]
+        if len(tiles) != height or any(len(row) != width for row in tiles):
+            continue  # not the layout's size: walked on the override's own tiles
+        checked.append(name)
+        warps = {(int(w["x"]), int(w["y"])) for w in data.get("warp_events") or []}
+        for y in range(height):
+            for x in range(width):
+                word = words[y * width + x]
+                tile = tiles[y][x]
+                if (x, y) in warps or grid[y][x] in ("D", "S"):
+                    if tile[3] != word >> 12:
+                        differ.append((name, (x, y), tile, word))
+                elif (tile[0], tile[2], tile[3]) != (word & 0x3FF, (word >> 10) & 3, word >> 12):
+                    differ.append((name, (x, y), tile, word))
+    print("   ", len(checked), "same-size overrides:", ", ".join(checked))
+    assert "MossdeepCity" in checked and "FortreeCity" in checked, checked
+    assert not differ, differ[:10]
+
+
 # --- the walks on the live fixtures ---------------------------------------------------
 
 
