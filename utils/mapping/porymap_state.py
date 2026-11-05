@@ -961,13 +961,152 @@ def _map_trainers(map_dir: str) -> Tuple[Tuple[int, int, str, int], ...]:
             # all missing here.
             trainer = next((word for word in words[1:3] if word in ids), None)
             if words and words[0].startswith("trainerbattle") and trainer:
-                name = trainer[len("TRAINER_"):]
-                # TRAINER_ROXANNE_1 -> ROXANNE: the number is the rematch tier.
-                head, _, tail = name.rpartition("_")
-                if head and tail.isdigit():
-                    name = head
-                out.append((int(obj.get("x", 0)), int(obj.get("y", 0)), name.replace("_", " "), ids[trainer]))
+                out.append((int(obj.get("x", 0)), int(obj.get("y", 0)), trainer_name(trainer), ids[trainer]))
                 break
+    return tuple(out)
+
+
+def trainer_name(trainer_const: str) -> str:
+    """TRAINER_TATE_AND_LIZA_1 -> TATE AND LIZA: the number is the rematch tier."""
+    name = trainer_const[len("TRAINER_"):] if trainer_const.startswith("TRAINER_") else trainer_const
+    head, _, tail = name.rpartition("_")
+    if head and tail.isdigit():
+        name = head
+    return name.replace("_", " ")
+
+
+@lru_cache(maxsize=1)
+def trainer_names() -> Dict[Tuple[str, ...], Tuple[int, ...]]:
+    """("TATE", "AND", "LIZA") -> every trainer id under that name (pret opponents.h; the
+    rematch tiers TRAINER_TATE_AND_LIZA_1..5 share one name)."""
+    names: Dict[Tuple[str, ...], List[int]] = {}
+    for const, trainer_id in _trainer_ids().items():
+        if trainer_id:  # TRAINER_NONE
+            names.setdefault(tuple(trainer_name(const).split()), []).append(trainer_id)
+    return {name: tuple(ids) for name, ids in names.items()}
+
+
+def _script_labels(text: str) -> Dict[str, List[str]]:
+    """label -> its lines, for a pret scripts.inc: a script starts at a `Label::` line (a
+    `Label:` local one too) at the start of a line and runs to the next."""
+    labels: Dict[str, List[str]] = {}
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.endswith(":") and not line[:1].isspace() and stripped.rstrip(":") and " " not in stripped:
+            current = stripped.rstrip(":")
+            labels[current] = []
+        elif current is not None:
+            labels[current].append(stripped)
+    return labels
+
+
+def _map_script_labels(map_dir: str) -> Dict[str, List[str]]:
+    """_script_labels of map_dir's scripts.inc and its sibling floors' (pret keeps
+    LavaridgeTown_Gym_B1F's scripts in LavaridgeTown_Gym_1F/scripts.inc)."""
+    root = _get_pokeemerald_root()
+    if not root or not map_dir:
+        return {}
+    map_path = Path(root) / "data" / "maps" / map_dir
+    paths = [map_path / "scripts.inc"]
+    stem = map_dir.rpartition("_")[0]
+    if stem:
+        paths += [p for p in sorted(map_path.parent.glob(f"{stem}_*/scripts.inc")) if p.parent != map_path]
+    labels: Dict[str, List[str]] = {}
+    for path in paths:
+        try:
+            labels.update(_script_labels(path.read_text(encoding="utf-8")))
+        except OSError:
+            continue
+    return labels
+
+
+def _badge_set_in(lines: List[str]) -> Optional[int]:
+    """N of the first `setflag FLAG_BADGE0N_GET` among lines, else None."""
+    for line in lines:
+        words = line.split()
+        if len(words) == 2 and words[0] == "setflag" and words[1].startswith("FLAG_BADGE") and words[1].endswith("_GET"):
+            number = words[1][len("FLAG_BADGE"):-len("_GET")]
+            if number.isdigit():
+                return int(number)
+    return None
+
+
+def _battle_trainer(line: str, ids: Dict[str, int]) -> Optional[str]:
+    """The TRAINER_ constant a `trainerbattle...` line starts a battle with, else None
+    (it comes first, or after the battle type in the generic macro: _map_trainers)."""
+    words = line.replace(",", " ").split()
+    if not words or not words[0].startswith("trainerbattle"):
+        return None
+    return next((word for word in words[1:3] if word in ids), None)
+
+
+@lru_cache(maxsize=1)
+def gym_leaders() -> Dict[int, Tuple[str, int, str]]:
+    """trainer id -> (name, badge number, map dir) of every trainer whose win gives a badge.
+
+    Read from pret's map scripts, not listed by hand: a gym leader's trainerbattle names
+    the script that runs after the win, and that script sets the badge
+    (MossdeepCity_Gym_EventScript_TateAndLizaDefeated: `setflag FLAG_BADGE07_GET`); Norman's
+    win runs on in the same script (PetalburgCity_Gym_EventScript_NormanBattle).
+    """
+    root = _get_pokeemerald_root()
+    if not root:
+        return {}
+    ids = _trainer_ids()
+    leaders: Dict[int, Tuple[str, int, str]] = {}
+    for path in sorted((Path(root) / "data" / "maps").glob("*/scripts.inc")):
+        try:
+            labels = _script_labels(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        for body in labels.values():
+            for line in body:
+                trainer = _battle_trainer(line, ids)
+                if trainer is None or ids[trainer] in leaders:
+                    continue
+                after_win = [labels[word] for word in line.replace(",", " ").split() if word in labels]
+                badge = next((b for b in map(_badge_set_in, [body, *after_win]) if b), None)
+                if badge:
+                    leaders[ids[trainer]] = (trainer_name(trainer), badge, path.parent.name)
+    return leaders
+
+
+@lru_cache(maxsize=64)
+def gym_leader_objects(map_dir: str) -> Tuple[Tuple[int, int, str, int, int], ...]:
+    """(x, y, name, trainer id, badge number) of each object on map_dir whose script starts
+    a gym leader's battle (gym_leaders), by itself or through the scripts it goes to or
+    calls: pret PetalburgCity_Gym_EventScript_Norman picks NormanBattle by
+    VAR_PETALBURG_GYM_STATE. Map-file tiles: the leaders never move."""
+    leaders = gym_leaders()
+    labels = _map_script_labels(map_dir)
+    root = _get_pokeemerald_root()
+    if not leaders or not labels or not root:
+        return ()
+    try:
+        with open(Path(root) / "data" / "maps" / map_dir / "map.json", encoding="utf-8") as fh:
+            objects = json.load(fh).get("object_events") or []
+    except (OSError, ValueError):
+        return ()
+    ids = _trainer_ids()
+    out = []
+    for obj in objects:
+        seen, todo = set(), [str(obj.get("script") or "")]
+        found = None
+        while todo and found is None:
+            label = todo.pop()
+            if label in seen or label not in labels:
+                continue
+            seen.add(label)
+            for line in labels[label]:
+                trainer = _battle_trainer(line, ids)
+                if trainer is not None and ids[trainer] in leaders:
+                    found = ids[trainer]
+                    break
+                todo += [word for word in line.replace(",", " ").split() if word in labels]
+        if found is not None:
+            name, badge, _ = leaders[found]
+            out.append((int(obj.get("x", 0)), int(obj.get("y", 0)), name, found, badge))
     return tuple(out)
 
 

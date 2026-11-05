@@ -1155,6 +1155,48 @@ SYSTEM_FLAGS = 0x860  # include/constants/flags.h: (TRAINER_FLAGS_END + 1)
 
 
 @lru_cache(maxsize=1)
+def _flag_ids_resolved() -> dict:
+    """Every flag in include/constants/flags.h, the "(BASE + 0xN)" ones too (FLAG_BADGE07_GET
+    is (SYSTEM_FLAGS + 0xD)), where _flag_ids keeps only plain numbers. SYSTEM_FLAGS is
+    seeded: flags.h derives it from MAX_TRAINERS_COUNT, defined elsewhere."""
+    from pokemon_env.porymap_paths import get_porymap_root
+
+    root = get_porymap_root()
+    path = Path(root) / "include" / "constants" / "flags.h" if root else None
+    ids: dict = {"SYSTEM_FLAGS": SYSTEM_FLAGS}
+    if path is None or not path.exists():
+        return ids
+
+    def number(text: str) -> Optional[int]:
+        text = text.strip().strip("()").strip()
+        try:
+            return int(text, 16) if text.lower().startswith("0x") else int(text)
+        except ValueError:
+            return ids.get(text)
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] != "#define" or not parts[1].startswith("FLAG_"):
+            continue
+        value = parts[2].split("//")[0].strip()
+        if value.startswith("(") and value.count("+") == 1 and "-" not in value:
+            base, _, offset = value.strip("()").partition("+")
+            left, right = number(base), number(offset)
+            if left is not None and right is not None:
+                ids[parts[1]] = left + right
+        else:
+            found = number(value)
+            if found is not None:
+                ids[parts[1]] = found
+    return ids
+
+
+def flag_id(name: str) -> Optional[int]:
+    """The id of the flag pret's flags.h calls name (e.g. FLAG_BADGE07_GET), else None."""
+    return _flag_ids_resolved().get(str(name).strip())
+
+
+@lru_cache(maxsize=1)
 def _var_ids() -> dict:
     """VAR_TEMP_0 -> 0x4000, from include/constants/vars.h (copied from pret). Values are
     a number or "(NAME + 0xN)" with NAME defined earlier in the file."""
@@ -2844,7 +2886,8 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     stepped on; the caller handles arrow warps that fire when walked off). Sign doors
     (kind "sign_door"): the nearest tile in front of the door, and "face", the press
     that turns to it. Every warp plan has "warp_tile", and "arrival_here": the tile it
-    lands on when it leads to another spot of this same map, else None.
+    lands on when it leads to another spot of this same map, else None. Every plan has
+    "to", the name of the map the exit leads to (the gym level gate reads it).
 
     avoid: map tiles (raw map coordinates) to treat as blocked, e.g. where a person
     stopped the last walk.
@@ -2922,6 +2965,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                         best = {
                             "kind": "edge",
                             "label": exit_entry["label"],
+                            "to": exit_entry["name"],
                             "target": tile,
                             "buttons": buttons,
                             "final_button": EDGE_BUTTON[exit_entry["direction"]],
@@ -2959,7 +3003,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                     continue
                 way.update({"kind": "warp", "target": tile})
             if best is None or len(buttons) < len(best["buttons"]):
-                best = {**way, "label": exit_entry["label"], "buttons": buttons, "final_button": None}
+                best = {**way, "label": exit_entry["label"], "to": exit_entry["name"], "buttons": buttons, "final_button": None}
 
     if best is None:
         return {

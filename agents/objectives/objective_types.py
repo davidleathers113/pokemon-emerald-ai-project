@@ -32,6 +32,11 @@ class DirectObjective:
         optional: Whether this objective is optional (can be skipped)
         recommended_battling_objectives: List of battling objective IDs recommended before this objective
         prerequisite_story_objective: Story objective ID that must be reached before this battling objective shows
+        requires_flag: Optional game flag that must be set before complete_direct_objective
+            accepts this objective: a flags.h name ("FLAG_BADGE07_GET"), a trainer whose win
+            sets TRAINER_FLAGS_START + its id ("TRAINER_TATE_AND_LIZA_1"), or a flag number.
+            Without it, battle objectives are checked by their condition or the trainer
+            their description names (server/app.py _objective_win_requirement).
     """
     id: str
     description: str
@@ -47,6 +52,7 @@ class DirectObjective:
     optional: bool = False
     recommended_battling_objectives: List[str] = field(default_factory=list)
     prerequisite_story_objective: Optional[str] = None
+    requires_flag: Optional[Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a JSON-compatible dict for persistence."""
@@ -73,6 +79,8 @@ class DirectObjective:
             d["recommended_battling_objectives"] = self.recommended_battling_objectives
         if self.prerequisite_story_objective is not None:
             d["prerequisite_story_objective"] = self.prerequisite_story_objective
+        if self.requires_flag is not None:
+            d["requires_flag"] = self.requires_flag
         return d
 
     @classmethod
@@ -106,4 +114,5 @@ class DirectObjective:
             optional=data.get("optional", False),
             recommended_battling_objectives=data.get("recommended_battling_objectives", []),
             prerequisite_story_objective=data.get("prerequisite_story_objective"),
+            requires_flag=data.get("requires_flag"),
         )

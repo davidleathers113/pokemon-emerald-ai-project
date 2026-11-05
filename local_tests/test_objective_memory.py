@@ -659,6 +659,87 @@ def test_arrived_at_tells_the_halves_of_a_route_apart():
     assert not arrived_at("ROUTE 110", None, "Route 11")
 
 
+# Inside MOSSDEEP CITY GYM before TATE & LIZA: six badges, FLAG_BADGE07_GET (the Mind Badge)
+# not set. pret include/constants/flags.h: FLAG_BADGE07_GET is (SYSTEM_FLAGS + 0xD), 0x86D;
+# TRAINER_FLAGS_START is 0x500, and opponents.h has TRAINER_SIDNEY 261.
+MOSSDEEP_GYM = Path(__file__).resolve().parent / "test_mossdeep_gym_statue.state"
+FLAG_BADGE07_GET = 0x86D
+
+
+def _set_flag(s, flag):
+    """Set one event flag in SaveBlock1 (RAM only; the fixture is untouched)."""
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        flags = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR) + reader.addresses.SAVE_BLOCK1_FLAGS_OFFSET
+        s.srv.env.core.memory.u8[flags + flag // 8] |= 1 << (flag % 8)
+        reader._invalidate_mem_cache()
+
+
+def _complete(s, objective_id, extra=None):
+    """complete_direct_objective on the full categorized sequence, its story index on
+    objective_id (or on `extra`, a new objective inserted there): (result, manager)."""
+    from agents.objectives.direct_objectives import DirectObjectiveManager
+
+    m = DirectObjectiveManager()
+    m.load_categorized_full_game_sequence()
+    m.story_index = next(i for i, o in enumerate(m.story_sequence) if o.id == objective_id)
+    if extra is not None:
+        assert m.insert_objective("story", m.story_index, extra)["success"]
+        objective_id = extra["id"]
+    before = s.srv.direct_objectives_manager
+    s.srv.direct_objectives_manager = m
+    try:
+        return s.call("mcp_complete_direct_objective", {"objective_id": objective_id, "reasoning": "test"}), m
+    finally:
+        s.srv.direct_objectives_manager = before
+
+
+def test_a_gym_battle_completes_only_once_the_badge_is_won():
+    """Seen live (2026-11-05): mossdeep_153 "Battle Gym Leaders Tate & Liza for Mind Badge"
+    was completed during their intro dialogue; the battle was then lost."""
+    s = server()
+    s.load(MOSSDEEP_GYM, wild_encounters=False)
+    r, m = _complete(s, "mossdeep_153")
+    print("   ", r.get("error"))
+    assert r["success"] is False, r
+    assert "FLAG_BADGE07_GET" in r["error"] and "the battle isn't won yet" in r["error"], r
+    assert m.story_sequence[m.story_index].id == "mossdeep_153" and not m.story_sequence[m.story_index].completed
+    _set_flag(s, FLAG_BADGE07_GET)  # the win, as the gym's script records it
+    r, m = _complete(s, "mossdeep_153")
+    assert r["success"] is True, r
+    assert m.story_sequence[m.story_index].id == "mossdeep_154", m.story_sequence[m.story_index].id
+
+
+def test_ordinary_objectives_still_complete():
+    """Not battles: entering the gym, and the TM Tate & Liza hand over (names them, no
+    battle verb). Neither waits on a flag."""
+    s = server()
+    s.load(MOSSDEEP_GYM, wild_encounters=False)
+    for objective_id in ("mossdeep_151", "mossdeep_154"):
+        r, m = _complete(s, objective_id)
+        assert r["success"] is True, (objective_id, r)
+
+
+def test_a_battle_named_only_in_its_text_or_field_waits_for_its_flag():
+    """An objective the model wrote itself has no known condition: the leader or trainer its
+    description names counts (pret opponents.h, the leader's badge from the gym script),
+    and an explicit requires_flag comes first."""
+    s = server()
+    s.load(MOSSDEEP_GYM, wild_encounters=False)
+    r, _ = _complete(s, "mossdeep_153", {
+        "id": "custom_tate", "description": "Defeat Gym Leader Tate & Liza", "action_type": "navigate"})
+    assert r["success"] is False and "FLAG_BADGE07_GET" in r["error"], r
+    r, _ = _complete(s, "mossdeep_153", {"id": "custom_sidney", "description": "Battle Elite Four Sidney"})
+    print("   ", r.get("error"))
+    assert r["success"] is False and "TRAINER_FLAGS_START + 261 (TRAINER_SIDNEY)" in r["error"], r
+    r, _ = _complete(s, "mossdeep_153", {
+        "id": "custom_flag", "description": "Get ready", "requires_flag": "TRAINER_TATE_AND_LIZA_1"})
+    assert r["success"] is False and "TRAINER_FLAGS_START + 271 (TRAINER_TATE_AND_LIZA_1)" in r["error"], r
+    _set_flag(s, 0x500 + 261)
+    r, _ = _complete(s, "mossdeep_153", {"id": "custom_sidney", "description": "Battle Elite Four Sidney"})
+    assert r["success"] is True, r
+
+
 def _run_all():
     import test_movement_feedback as harness
 

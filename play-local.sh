@@ -209,7 +209,9 @@ fi
 # frame only when the text state can't describe the screen), OPENAI_MAX_OUTPUT_TOKENS.
 # WILD_BATTLES=run (the server's default: the harness runs from wild battles, David
 # 2026-11-04 "run from the wild pokemon and focus on fighting the trainers") or fight.
-for var in BRIEF_REASONING SCREENSHOT_POLICY OPENAI_MAX_OUTPUT_TOKENS WILD_BATTLES; do
+# GYM_MIN_LEVELS replaces the server's gym level gate table, e.g.
+# GYM_MIN_LEVELS="MOSSDEEP CITY GYM=50" or GYM_MIN_LEVELS=off.
+for var in BRIEF_REASONING SCREENSHOT_POLICY OPENAI_MAX_OUTPUT_TOKENS WILD_BATTLES GYM_MIN_LEVELS; do
     if [ -n "${!var:-}" ]; then env_args+=(-e "$var"); fi
 done
 

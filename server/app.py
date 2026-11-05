@@ -3540,6 +3540,169 @@ _CONDITION_TRAINERS = {
     "champion_wallace_defeated": ("any", (335,), "Wallace"),
 }
 
+# complete_direct_objective refuses a battle objective until game memory shows the win.
+# Seen live (2026-11-05): before the TATE & LIZA battle the model completed mossdeep_153
+# ("Battle Gym Leaders Tate & Liza for Mind Badge") during their intro dialogue, then lost;
+# with the objective gone, nothing sent it back for the badge.
+# A description is about a battle when one of these words is in it.
+_BATTLE_VERBS = ("BATTLE", "DEFEAT", "BEAT", "FIGHT", "CHALLENGE")
+# Titles skipped between the verb and the name: "Battle Gym Leaders Tate & Liza",
+# "Battle Team Aqua Admin Matt". Anything else ends the search: "Double battle with Steven
+# vs Maxie" is not a battle against Steven.
+_BATTLE_TITLES = frozenset((
+    "THE", "GYM", "LEADER", "LEADERS", "TRAINER", "TRAINERS", "RIVAL", "TEAM", "AQUA", "MAGMA",
+    "ADMIN", "ELITE", "FOUR", "CHAMPION",
+))
+
+
+def _text_words(text: Any) -> List[str]:
+    """Upper-case words of text, '&' read as AND and anything not a letter or digit as a
+    space: "Tate & Liza" -> TATE AND LIZA, as pret's TRAINER_TATE_AND_LIZA_1 spells it."""
+    spaced = "".join(c if c.isalnum() else " " for c in str(text or "").upper().replace("&", " AND "))
+    return spaced.split()
+
+
+def _named_opponent(description: Any) -> Optional[Tuple[str, Tuple[int, ...]]]:
+    """(name, trainer ids) of the trainer a description says to beat: a name from pret
+    opponents.h (porymap_state.trainer_names) right after a battle verb and its titles,
+    the longest that fits; None when there is none."""
+    from utils.mapping.porymap_state import trainer_names
+
+    names = trainer_names()
+    longest = max((len(name) for name in names), default=0)
+    words = _text_words(description)
+    for i, word in enumerate(words):
+        if word not in _BATTLE_VERBS:
+            continue
+        at = i + 1
+        while at < len(words) and words[at] in _BATTLE_TITLES:
+            at += 1
+        for size in range(min(longest, len(words) - at), 0, -1):
+            ids = names.get(tuple(words[at:at + size]))
+            if ids:
+                return " ".join(words[at:at + size]), ids
+    return None
+
+
+def _flag_name(flag: int) -> str:
+    """FLAG_BADGE07_GET, TRAINER_FLAGS_START + 271 (TRAINER_TATE_AND_LIZA_1), or flag 0x11D."""
+    from server import game_tools
+    from utils.mapping.porymap_state import _trainer_ids
+
+    badge = flag - game_tools.FLAG_BADGE01_GET + 1
+    if 1 <= badge <= BADGE_COUNT:
+        return f"FLAG_BADGE{badge:02d}_GET"
+    if _TRAINER_FLAGS_START <= flag < game_tools.SYSTEM_FLAGS:
+        trainer = flag - _TRAINER_FLAGS_START
+        const = next((name for name, i in _trainer_ids().items() if i == trainer), None)
+        return f"TRAINER_FLAGS_START + {trainer}" + (f" ({const})" if const else "")
+    return f"flag 0x{flag:X}"
+
+
+def _flag_from_field(value: Any) -> Optional[int]:
+    """An objective's requires_flag as a flag id: a number ("0x86D" too), a flags.h name,
+    or a TRAINER_ constant (TRAINER_FLAGS_START + its id). None if it names nothing known."""
+    from server import game_tools
+    from utils.mapping.porymap_state import _trainer_ids
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    if text.lower().startswith("0x"):
+        try:
+            return int(text, 16)
+        except ValueError:
+            return None
+    if text.startswith("TRAINER_") and text in _trainer_ids():
+        return _TRAINER_FLAGS_START + _trainer_ids()[text]
+    return game_tools.flag_id(text)
+
+
+def _objective_win_requirement(obj: Any) -> Optional[Tuple[str, Any]]:
+    """(what game memory is missing while it's unmet, reader -> met) for an objective that is
+    about winning a battle, or None for any other objective or a win nothing records.
+
+    In order: the objective's own requires_flag (objective_types.DirectObjective); its
+    completion condition's entry in the tables above (each read from pret); the trainer
+    its description names (_named_opponent), whose badge flag counts for a gym leader
+    (porymap_state.gym_leaders: the flag their win sets). The condition is checked only on
+    an objective whose action is "battle", and a name only right after a battle verb, so
+    "Receive TM04 from Tate & Liza", "Witness Kyogre vs Groudon battle" and "Talk to
+    Wallace - can now challenge Gym" complete as before.
+    """
+    from server import game_tools
+    from utils.mapping.porymap_state import gym_leaders
+
+    explicit = getattr(obj, "requires_flag", None)
+    if explicit is not None and explicit != "":
+        flag = _flag_from_field(explicit)
+        if flag is None:
+            logger.warning(f"objective {getattr(obj, 'id', '?')}: requires_flag {explicit!r} names no known flag")
+        else:
+            return f"{_flag_name(flag)} is not set", lambda r: r._is_event_flag_set(flag)
+    condition = str(getattr(obj, "completion_condition", None) or "")
+    if getattr(obj, "action_type", None) != "battle":
+        condition = ""
+    if condition in _CONDITION_FLAGS:
+        flag, thing = _CONDITION_FLAGS[condition]
+        return f"{_flag_name(flag)} ({thing}) is not set", lambda r: r._is_event_flag_set(flag)
+    if condition in _CONDITION_TRAINERS:
+        mode, ids, who = _CONDITION_TRAINERS[condition]
+        flags = " / ".join(_flag_name(_TRAINER_FLAGS_START + i) for i in ids)
+        need = all if mode == "all" else any
+        return (
+            f"the trainer flag for {who} ({flags}) is not set",
+            lambda r: need(r._is_event_flag_set(_TRAINER_FLAGS_START + i) for i in ids),
+        )
+    if condition in _CONDITION_VARS:
+        var, reached, did = _CONDITION_VARS[condition]
+
+        def var_reached(reader) -> bool:
+            value = reader.read_game_var(var)
+            return value is None or value >= reached  # unreadable proves no loss: don't refuse
+
+        return f"var 0x{var:X} is below {reached} (you have not {did})", var_reached
+    named = _named_opponent(getattr(obj, "description", ""))
+    if named is None:
+        return None
+    name, ids = named
+    leaders = gym_leaders()
+    badge = next((leaders[i][1] for i in ids if i in leaders), None)
+    if badge is not None:
+        flag = game_tools.FLAG_BADGE01_GET + badge - 1
+        return f"{_flag_name(flag)} ({name}'s badge) is not set", lambda r: r._is_event_flag_set(flag)
+    flags = " / ".join(_flag_name(_TRAINER_FLAGS_START + i) for i in ids)
+    return (
+        f"no trainer flag for {name} ({flags}) is set",
+        lambda r: any(r._is_event_flag_set(_TRAINER_FLAGS_START + i) for i in ids),
+    )
+
+
+def _unwon_battle_refusal(obj: Any) -> Optional[Dict[str, Any]]:
+    """complete_direct_objective's refusal for a battle objective game memory shows no win
+    for (_objective_win_requirement), else None."""
+    requirement = _objective_win_requirement(obj)
+    if requirement is None:
+        return None
+    missing, met = requirement
+    try:
+        with memory_lock:
+            won = met(env.memory_reader)
+    except Exception as e:  # memory that can't be read proves nothing: leave it to the agent
+        logger.warning(f"complete_direct_objective: could not read the win for {obj.id}: {e}")
+        return None
+    if won:
+        return None
+    logger.info(f"complete_direct_objective: refused {obj.id}: {missing}")
+    return _refusal(
+        f"Not completed: '{obj.id}' ({obj.description}) needs a battle won, and the battle isn't won yet: "
+        f"game memory says {missing}. Win the battle first (talk to the trainer and fight with use_move), "
+        f'then call complete_direct_objective(objective_id="{obj.id}").',
+        missing=missing,
+    )
+
 
 def _set_grass_cost_for(guidance: Dict[str, Any]) -> None:
     """Walk through tall grass while a training objective is current; go around it otherwise.
@@ -5400,6 +5563,11 @@ async def mcp_go_to_exit(request: dict):
             if not plan.get("success"):
                 plan.setdefault("summary", plan.get("error", "go_to_exit failed"))
                 return plan
+            into = plan.get("to")
+            if into and into != _location_name():
+                refused = _gym_gate_refusal(into, f'go_to_exit("{exit_query}") leads into {into}')
+                if refused:
+                    return refused
 
             before = _field_snapshot()
             was_surfing = _mem(player_surfing)
@@ -8041,6 +8209,97 @@ def _field_refusal(tool: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Gym level gate. David (2026-11-05), after the loss to TATE & LIZA: "no gym rematch until
+# all six party Pokémon are Lv 48+". Gym map (the location name the state shows) -> the
+# level every party Pokémon (eggs aside) must have before go_to, go_to_exit and navigate_to
+# take the player in, and before navigate_to or talk_to go up to its leader once inside
+# (walking out stays allowed). Kept here by gym map, not on an objective: a live run
+# restores its own copy of the objective sequence (objectives.json), which a new field in
+# all_obj_categorized.py would never reach, and the gate must hold whatever is current.
+# To change or remove it: edit this table, or set GYM_MIN_LEVELS in the server's
+# environment, which replaces the table: "MOSSDEEP CITY GYM=50,SOOTOPOLIS CITY GYM 1F=55",
+# or "off" for no gate. A gym with more than one floor lists each floor it gates.
+GYM_MIN_LEVELS: Dict[str, int] = {"MOSSDEEP CITY GYM": 48}
+GYM_MIN_LEVELS_ENV = "GYM_MIN_LEVELS"
+
+
+def _gym_min_levels() -> Dict[str, int]:
+    """GYM_MIN_LEVELS, or the table the GYM_MIN_LEVELS environment variable gives."""
+    raw = os.environ.get(GYM_MIN_LEVELS_ENV, "").strip()
+    if not raw:
+        return {gym.upper(): level for gym, level in GYM_MIN_LEVELS.items()}
+    if raw.lower() in ("off", "none", "0"):
+        return {}
+    table = {}
+    for entry in raw.split(","):
+        gym, _, level = entry.partition("=")
+        if gym.strip() and level.strip().isdigit():
+            table[gym.strip().upper()] = int(level.strip())
+        else:
+            logger.warning(f"{GYM_MIN_LEVELS_ENV}: ignoring {entry!r} (want GYM NAME=LEVEL, comma-separated)")
+    return table
+
+
+def _gym_under_level(gym: str) -> Optional[Tuple[int, List[str]]]:
+    """(the gym's minimum level, "SPECIES LvN" for each party Pokémon under it) while gym is
+    gated and someone is under it; else None."""
+    wanted = _gym_min_levels().get(str(gym or "").upper())
+    if not wanted:
+        return None
+    party = _mem(lambda r: r.read_party_pokemon()) or []
+    under = [f"{str(p.species_name).upper()} Lv{p.level}" for p in party if not p.is_egg and p.level < wanted]
+    return (wanted, under) if under else None
+
+
+def _gym_gate_refusal(gym: str, doing: str, inside: bool = False) -> Optional[Dict[str, Any]]:
+    """The gym level gate's refusal of `doing`, or None while gym is open to this party."""
+    closed = _gym_under_level(gym)
+    if closed is None:
+        return None
+    wanted, under = closed
+    message = (
+        f"Refused: {doing}. No battle in {gym} until every party Pokémon is Lv{wanted} or higher "
+        f"(gym level gate); under Lv{wanted} now: {', '.join(under)}. "
+        + ("You may walk out of the gym (go_to_exit). " if inside else "")
+        + f'Train first, outside the gym: train("LOWEST", until_level={wanted}) trains the lowest-level '
+        f"Pokémon until every one is Lv{wanted}. Then come back."
+    )
+    return _refusal(message, gym_gate={"gym": gym, "min_level": wanted, "under": under})
+
+
+def _gym_gate_on_tile(x: int, y: int, doing: str, near: int) -> Optional[Dict[str, Any]]:
+    """The gym level gate for a walk or talk to (x, y) on this map (walking tools'
+    coordinates): refused when the tile is a door into a gated gym, or, inside one, within
+    `near` tiles of its leader (porymap_state.gym_leader_objects: talking to them starts
+    the battle; they have no line of sight, so walking elsewhere in the gym is left alone).
+    """
+    from server import game_tools
+    from utils.mapping.porymap_state import _readable_map_name, gym_leader_objects
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    if not _gym_min_levels():
+        return None
+    location = _location_name()
+    map_dir = ROM_TO_PORYMAP_MAP.get(location, "")
+    if not map_dir:
+        return None
+    badges = _mem(lambda r: len(r.read_badges() or []))
+    ox, oy = game_tools.map_coord_offset(map_dir, badges)
+    fx, fy = x + ox, y + oy
+    for warp in game_tools._raw_map_json(map_dir).get("warp_events") or []:
+        dest = _readable_map_name(str(warp.get("dest_map", "")))
+        if (int(warp.get("x", -1)), int(warp.get("y", -1))) == (fx, fy) and dest != location:
+            refused = _gym_gate_refusal(dest, f"{doing} is the way into {dest}")
+            if refused:
+                return refused
+    for lx, ly, name, _, _ in gym_leader_objects(map_dir):
+        if abs(lx - fx) + abs(ly - fy) <= near:
+            refused = _gym_gate_refusal(location, f"{doing} goes up to the gym leader {name}", inside=True)
+            if refused:
+                return refused
+    return None
+
+
 HEAL_TRIP_MAX_MAPS = 10
 # _walk_along: scripted scenes (a trainer spotting the player) waited out, each up to
 # MACRO_TEXT_FRAMES, before the walk reports that something has the player's attention.
@@ -8401,6 +8660,14 @@ async def mcp_go_to(request: dict = None):
     position = (snap.x, snap.y) if snap is not None else None
     if game_tools.arrived_at(start, position, target):
         return {"success": True, "status": "ARRIVED", "summary": f"You are already on {start} ({target})."}
+    # The gym level gate, before any walk or flight: refused at the start, not at the gym's
+    # door after the trip. The route is only planned here while some gym is closed.
+    closed = [gym for gym in _gym_min_levels() if _gym_under_level(gym)]
+    if closed:
+        route = await run_in_threadpool(game_tools.place_route, start, position, target) or []
+        gym = next((name for _, name in route if str(name).upper() in closed), None)
+        if gym:
+            return _gym_gate_refusal(gym, f'go_to("{target}") goes into {gym}')
 
     def arrived() -> bool:
         here = _field_snapshot()
@@ -8715,6 +8982,9 @@ async def mcp_talk_to(request: dict = None):
             f"({x},{y}) is a statue, not a person: there is nobody to talk to. It blocks the way like a "
             "person; navigate_to and go_to walk round it, or step on the floor switches that move it."
         )
+    refused = _gym_gate_on_tile(x, y, f"talk_to({x}, {y})", near=0)
+    if refused:
+        return refused
     entered, why = await _cross_to(
         [(x - dx, y - dy) for dx, dy in DIRECTION_DELTAS.values()],
         f"the person at ({x},{y})",
@@ -10950,6 +11220,9 @@ async def mcp_complete_direct_objective(request: dict):
             current_obj = direct_objectives_manager._get_current_objective_for_category(category)
             if not current_obj:
                 return {"success": False, "error": f"No current {category} objective to complete"}
+            refused = _unwon_battle_refusal(current_obj)
+            if refused:
+                return refused
 
             completed_objective_index = getattr(
                 direct_objectives_manager, f"{category}_index"
@@ -10987,6 +11260,9 @@ async def mcp_complete_direct_objective(request: dict):
             current_obj = direct_objectives_manager.get_current_objective()
             if not current_obj:
                 return {"success": False, "error": "No current objective to complete"}
+            refused = _unwon_battle_refusal(current_obj)
+            if refused:
+                return refused
 
             completed_objective_index = direct_objectives_manager.current_index
 
@@ -11261,6 +11537,9 @@ async def mcp_navigate_to(request: dict):
             y = int(y)
         except (ValueError, TypeError):
             return {"success": False, "error": f"Invalid coordinates: x={x}, y={y}"}
+        refused = _gym_gate_on_tile(x, y, f"navigate_to({x}, {y})", near=1)
+        if refused:
+            return refused
 
         # A tile beyond warps of this map (holes, geysers, doors within it): go through
         # them first (_cross_to). Seen live: navigate_to(13,9) in LAVARIDGE TOWN GYM 1F

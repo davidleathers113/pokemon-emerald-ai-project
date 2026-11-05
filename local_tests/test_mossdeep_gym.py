@@ -19,6 +19,7 @@ Fixtures:
   test_mossdeep_gym_statue.state    MOSSDEEP CITY GYM (3,20), the live checkpoint of
                                     2026-11-05: statue 14 at (4,20), BLAKE at (4,21)
   test_mossdeep_gym_entrance.state  MOSSDEEP CITY GYM (6,35), at the entrance
+  test_mossdeep_west_shore.state    MOSSDEEP CITY (16,6), outside (the gym level gate)
 
 RAM write, documented where used: the gym trainers' trainer flags set (beaten), for the
 walk to TATE AND LIZA.
@@ -27,8 +28,10 @@ walk to TATE AND LIZA.
       -v ~/continual-harness/Emerald-GBAdvance:/app/Emerald-GBAdvance:ro -w /app \
       emerald-harness:local local_tests/test_mossdeep_gym.py [name-substring]
 """
+import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -172,11 +175,87 @@ def test_navigate_to_tate_and_liza_goes_through_the_switches_and_pads():
             flag = _TRAINER_FLAGS_START + trainer_id
             s.srv.env.core.memory.u8[flags + flag // 8] |= 1 << (flag % 8)
         reader._invalidate_mem_cache()
-    r = s.call("mcp_navigate_to", {"x": BELOW_TATE[0], "y": BELOW_TATE[1], "variance": "none", "reason": "test"})
+    # The gym level gate (David, 2026-11-05: Lv48 here) refuses walks up to TATE AND LIZA
+    # with this Lv30-42 party; this test is about the way through the puzzle, so it is
+    # lowered for the walk (test_the_gym_level_gate_* cover the gate).
+    with _gym_gate("MOSSDEEP CITY GYM=5"):
+        r = s.call("mcp_navigate_to", {"x": BELOW_TATE[0], "y": BELOW_TATE[1], "variance": "none", "reason": "test"})
     print("   ", r.get("summary") or r.get("error"))
     snap = s.snapshot()
     assert r["success"] and (snap.x, snap.y) == BELOW_TATE, (r, snap)
     assert s.srv._location_name() == "MOSSDEEP CITY GYM", s.srv._location_name()
+
+
+# The gym level gate (server/app.py GYM_MIN_LEVELS: MOSSDEEP CITY GYM 48). David
+# (2026-11-05), after the loss to TATE & LIZA: "no gym rematch until all six party Pokémon
+# are Lv 48+". The fixtures' party is AZUMARILL 40, TROPIUS 30-31, SABLEYE 37, BLAZIKEN 37,
+# BRELOOM 42, MANECTRIC 37.
+WEST_SHORE = HERE / "test_mossdeep_west_shore.state"  # MOSSDEEP CITY (16,6)
+GYM_DOOR = (38, 9)  # pret MossdeepCity map.json warp_events: -> MAP_MOSSDEEP_CITY_GYM
+LEADER = (23, 7)  # TATE (LIZA at (24,7)), MossdeepCity_Gym_EventScript_TateAndLiza
+
+
+@contextmanager
+def _gym_gate(value):
+    """GYM_MIN_LEVELS, the environment override of the gate's table, for one block (None:
+    unset, the table in server/app.py applies)."""
+    old = os.environ.pop("GYM_MIN_LEVELS", None)
+    if value is not None:
+        os.environ["GYM_MIN_LEVELS"] = value
+    try:
+        yield
+    finally:
+        os.environ.pop("GYM_MIN_LEVELS", None)
+        if old is not None:
+            os.environ["GYM_MIN_LEVELS"] = old
+
+
+def _assert_gated(r, *also):
+    print("   ", r.get("error"))
+    assert r["success"] is False, r
+    for part in ("MOSSDEEP CITY GYM", "Lv48", "TROPIUS Lv", 'train("LOWEST", until_level=48)', *also):
+        assert part in r["error"], (part, r["error"])
+    assert "AZUMARILL" in r["error"] and "BRELOOM Lv42" in r["error"], r["error"]
+
+
+def test_the_gym_level_gate_keeps_the_party_out_of_the_gym():
+    """go_to, go_to_exit and navigate_to onto the door: each refused before a step."""
+    s = server()
+    with _gym_gate(None):
+        for endpoint, payload in (
+            ("mcp_go_to", {"place": "Mossdeep Gym"}),
+            ("mcp_go_to_exit", {"exit": "MOSSDEEP CITY GYM"}),
+            ("mcp_navigate_to", {"x": GYM_DOOR[0], "y": GYM_DOOR[1], "variance": "none"}),
+        ):
+            s.load(WEST_SHORE, wild_encounters=False)
+            _assert_gated(s.call(endpoint, {**payload, "reasoning": "test", "reason": "test"}))
+            snap = s.snapshot()
+            assert (snap.x, snap.y) == (16, 6) and s.srv._location_name() == "MOSSDEEP CITY", (endpoint, snap)
+
+
+def test_the_gym_level_gate_keeps_the_party_away_from_the_leader_inside():
+    """Inside already: talk_to the leader, or a walk up to them, is refused; the refusal
+    says walking out is allowed."""
+    s = server()
+    with _gym_gate(None):
+        _load(s)
+        _assert_gated(s.call("mcp_talk_to", {"x": LEADER[0], "y": LEADER[1], "reasoning": "test"}),
+                      "TATE AND LIZA", "walk out of the gym")
+        _assert_gated(s.call("mcp_navigate_to", {"x": BELOW_TATE[0], "y": BELOW_TATE[1], "variance": "none",
+                                                 "reason": "test"}), "TATE AND LIZA")
+        snap = s.snapshot()
+        assert (snap.x, snap.y) == (3, 20), snap
+
+
+def test_the_gym_level_gate_opens_when_lowered_or_off():
+    s = server()
+    with _gym_gate("off"):
+        assert s.srv._gym_min_levels() == {}
+    with _gym_gate("MOSSDEEP CITY GYM=5"):
+        s.load(WEST_SHORE, wild_encounters=False)
+        r = s.call("mcp_go_to", {"place": "Mossdeep Gym", "reasoning": "test"})
+        print("   ", r.get("summary") or r.get("error"))
+        assert r["success"] is True and s.srv._location_name() == "MOSSDEEP CITY GYM", (r, s.srv._location_name())
 
 
 def _run_all(only=""):

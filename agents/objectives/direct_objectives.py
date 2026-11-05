@@ -3641,6 +3641,7 @@ class DirectObjectiveManager:
             navigation_hint=obj_data.get("navigation_hint"),
             completion_condition=obj_data.get("completion_condition"),
             priority=obj_data.get("priority", 1),
+            requires_flag=obj_data.get("requires_flag"),
         )
         sequence.insert(index, new_obj)
         self.auto_save()
@@ -3738,6 +3739,7 @@ class DirectObjectiveManager:
                     optional=obj_data.get("optional", False),
                     recommended_battling_objectives=obj_data.get("recommended_battling_objectives", []),
                     prerequisite_story_objective=obj_data.get("prerequisite_story_objective"),
+                    requires_flag=obj_data.get("requires_flag"),
                 )
                 sequence[idx] = new_obj
                 edits_applied.append({"action": "modify", "index": idx, "id": new_obj.id})
@@ -3755,6 +3757,7 @@ class DirectObjectiveManager:
                     optional=obj_data.get("optional", False),
                     recommended_battling_objectives=obj_data.get("recommended_battling_objectives", []),
                     prerequisite_story_objective=obj_data.get("prerequisite_story_objective"),
+                    requires_flag=obj_data.get("requires_flag"),
                 )
                 sequence.append(new_obj)
                 edits_applied.append({"action": "create", "index": idx, "id": new_obj.id})

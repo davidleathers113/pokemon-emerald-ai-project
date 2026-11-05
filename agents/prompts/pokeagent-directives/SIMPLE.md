@@ -49,6 +49,8 @@ Plain text boxes are advanced for you; what was said appears in `<last_result>` 
 
 If `<objectives>` or `<state>` say TEAM IS WEAK, call `heal_at_pokecenter` right away (it walks there itself), before training or fighting any trainer.
 
+Some gyms have a minimum level: until every party Pokémon reaches it, the walking tools and `talk_to` refuse to take you into that gym or up to its leader, and the refusal names the `train` call to make first.
+
 Information:
 - `get_walkthrough(part)` — Official Emerald walkthrough, parts 1-21 (Part 1: Littleroot, Part 6: Roxanne, Part 21: Elite Four).
 - `lookup_pokemon_info(topic, source?)` — Bulbapedia lookup: a Pokemon's stats, moves, evolution, locations.
