@@ -22,6 +22,9 @@ Fixtures:
                                    player stepped in the grass again
   test_battle_wurmple.state        TRAINER battle (Bug Catcher Lyle), move menu open
   test_movement_route101.state     ROUTE 101, outdoors
+  test_league_lobby.state          EVER GRANDE CITY POKEMON LEAGUE 1F (16,4), across the
+                                   counter from the clerk, $73994; the live game's 19:22
+                                   checkpoint (2026-11-05)
 
 RAM writes (documented where used): party HP/status before healing, battle speeds to
 force a failed escape, the wild Pokémon's HP and sleep for a guaranteed catch, and a
@@ -44,6 +47,7 @@ WILD_INTRO = HERE / "test_wild_shroomish_intro.state"
 WILD = HERE / "test_wild_shroomish.state"
 WILD_TWO = HERE / "test_wild_two_party.state"
 TRAINER = HERE / "test_battle_wurmple.state"
+LEAGUE_LOBBY = HERE / "test_league_lobby.state"
 
 # pret pokeemerald symbols (US): gPlayerParty (100-byte mons; +0x50 status, +0x56 HP),
 # gPlayerPartyCount, gBattleMons (0x58 bytes; +6 speed, +0x28 HP, +0x48 personality,
@@ -575,6 +579,79 @@ def test_buy_refuses_outside_a_mart():
     r = s.call("mcp_buy_item", {"item": "Potion", "count": 1})
     print("   ", r)
     assert r["success"] is False and "no shop clerk here" in r["error"], r
+
+
+def _bag(s):
+    inventory = _read(s, lambda r: r.read_full_inventory())
+    totals = {}
+    for pocket in inventory.values():
+        for e in pocket:
+            totals[e["name"]] = totals.get(e["name"], 0) + e["quantity"]
+    return totals
+
+
+def _loaded(s, graphics_id):
+    from server import menu_state as ms
+
+    return _read(s, lambda r: ms.find_objects_by_graphics(r, graphics_id))
+
+
+def test_buy_from_a_clerk_out_of_view():
+    """Seen live in EVER GRANDE CITY POKEMON LEAGUE 1F, after healing: buy_item said
+    "There is no shop clerk here". From the nurse at (3,4) the clerk at (16,2) is past
+    pret's spawn window (TrySpawnObjectEvents: 10 tiles right of the player), so only
+    its template in SaveBlock1 knows it."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(LEAGUE_LOBBY)
+    walk = s.call("mcp_navigate_to", {"x": 3, "y": 4, "variance": "none", "reason": "test"})
+    snap = s.snapshot()
+    assert (snap.x, snap.y) == (3, 4), walk
+    assert _loaded(s, ms.OBJ_EVENT_GFX_MART_EMPLOYEE) == [], "the clerk should be out of view here"
+    money, bag = _money(s), _bag(s)
+    r = s.call("mcp_buy_item", {"item": "FULL RESTORE", "count": 1})
+    print("   ", r)
+    assert r["success"] is True and r["status"] == "BOUGHT", r
+    assert _money(s) == money - 3000, (money, _money(s))
+    after = _bag(s)
+    changed = {name: after.get(name, 0) - bag.get(name, 0) for name in set(bag) | set(after) if after.get(name, 0) != bag.get(name, 0)}
+    assert changed == {"Full Restore": 1}, changed
+    snap = s.snapshot()
+    assert (snap.x, snap.y, snap.facing) == (16, 4, "UP"), snap  # across the counter
+    assert s.srv._player_can_walk(), "the shop should be closed"
+
+
+def test_heal_from_a_nurse_out_of_view():
+    """The same spawn window for the nurse: from the League clerk at (16,4) the nurse at
+    (3,2) is not loaded, and heal_at_pokecenter went looking for another Pokémon Center.
+    RAM: the lead down to 1 HP."""
+    from server import menu_state as ms
+
+    s = server()
+    s.load(LEAGUE_LOBBY)
+    assert _loaded(s, ms.OBJ_EVENT_GFX_NURSE) == [], "the nurse should be out of view here"
+    _write(s, 16, PARTY + 0x56, 1)
+    r = s.call("mcp_heal_at_pokecenter", {})
+    print("   ", r.get("summary") or r)
+    assert r["success"] is True and r["status"] == "HEALED", r
+    lead = _party(s)[0]
+    assert lead.current_hp == lead.max_hp, lead
+    snap = s.snapshot()
+    assert (snap.x, snap.y, snap.facing) == (3, 4, "UP"), snap
+
+
+def test_shop_clerks_are_told_by_their_script():
+    """pret: the LILYCOVE DEPARTMENT STORE clerks are WOMAN_3 sprites, OLDALE TOWN's
+    MART_EMPLOYEE only gives a Potion; the clerk is whoever runs `pokemart`."""
+    from server import game_tools
+
+    lilycove = game_tools.shop_clerks("LilycoveCity_DepartmentStore_2F")
+    assert lilycove is not None and len(lilycove) == 2, lilycove
+    assert game_tools.shop_clerks("OldaleTown") == frozenset()
+    assert game_tools.shop_clerks("EverGrandeCity_PokemonLeague_1F") == frozenset({2})
+    assert len(game_tools.shop_clerks("RustboroCity_Mart")) == 1
+    assert game_tools.shop_clerks("NoSuchMap") is None
 
 
 def _give_hm06(s):

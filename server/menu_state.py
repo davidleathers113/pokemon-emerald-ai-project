@@ -20,7 +20,7 @@ Function pointers are Thumb (bit 0 set), so they are compared with `| 1`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from server.field_control import (
     G_MAIN_CALLBACK2,
@@ -28,6 +28,9 @@ from server.field_control import (
     MAP_OFFSET,
     OBJECT_EVENT_COUNT,
     OBJECT_EVENT_SIZE,
+    OBJECT_EVENT_TEMPLATE_SIZE,
+    OBJECT_EVENT_TEMPLATES_COUNT,
+    SAVE_BLOCK1_OBJECT_EVENT_TEMPLATES,
     decode_field_message,
     read_field_message,
 )
@@ -1007,8 +1010,8 @@ class CounterPerson:
 def find_objects_by_graphics(reader, graphics_id: int) -> List[Tuple[int, int, str]]:
     """(x, y, facing button) of every visible object event using this sprite.
 
-    gObjectEvents holds the people loaded on the current map; graphicsId (+5) names
-    the sprite, which is the same for every Pokémon Center nurse and Mart clerk.
+    gObjectEvents holds the people loaded on the current map, which is only those near
+    the camera (find_map_people reads the rest); graphicsId (+5) names the sprite.
     """
     found = []
     for i in range(OBJECT_EVENT_COUNT):
@@ -1026,6 +1029,65 @@ def find_objects_by_graphics(reader, graphics_id: int) -> List[Tuple[int, int, s
 
 
 OBJ_EVENT_ID_PLAYER = 0xFF  # struct ObjectEvent localId (+8) of the player's own object
+
+# pret include/global.h struct ObjectEventTemplate in SaveBlock1's objectEventTemplates
+# (field_control.SAVE_BLOCK1_OBJECT_EVENT_TEMPLATES): +0 localId, +1 graphicsId, +4 s16 x,
+# +6 s16 y, +9 movementType, +0x14 u16 flagId.
+TEMPLATE_GRAPHICS_ID = 1
+TEMPLATE_MOVEMENT_TYPE = 9
+TEMPLATE_FLAG_ID = 0x14
+# pret include/constants/event_object_movement.h MOVEMENT_TYPE_FACE_UP .. _FACE_RIGHT
+# (7..10): the way a person who only stands and faces is turned when spawned
+# (gInitialMovementTypeFacingDirections). Nurses and clerks are all of these.
+FACE_MOVEMENT_TYPES = {7: "UP", 8: "DOWN", 9: "LEFT", 10: "RIGHT"}
+
+
+def find_map_people(reader, wanted: Callable[[int, int], bool]) -> List[Tuple[int, int, str]]:
+    """(x, y, facing button) of every shown person of the current map for whom
+    wanted(local id, graphics id) is true, whether or not the game has loaded them.
+
+    gObjectEvents holds only the people near the camera: pret event_object_movement.c
+    TrySpawnObjectEvents spawns a template only from 9 tiles left to 10 right and 7 up to
+    9 down of the player, and RemoveObjectEventsOutsideView drops the ones left behind.
+    Seen live in EVER GRANDE CITY POKEMON LEAGUE 1F: from the nurse at (3,4) the clerk at
+    (16,2) was not loaded, and buy_item said "There is no shop clerk here".
+
+    A loaded person (struct ObjectEvent +0x05 graphicsId, +0x08 localId, +0x09 mapNum,
+    +0x0A mapGroup) is where it stands and faces; any other is read from its template:
+    hidden when its flagId is set (TrySpawnObjectEvents: !FlagGet(template->flagId)), and
+    facing as its movement type spawns it (DOWN for one that walks around; read it again
+    once it is loaded).
+    """
+    found = []
+    loaded_ids = set()
+    map_group, map_num = reader._read_current_map()
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        flags = reader._read_u32(base)
+        local_id = reader._read_u8(base + 0x08)
+        if not flags & 0x1 or local_id == OBJ_EVENT_ID_PLAYER:
+            continue
+        if (reader._read_u8(base + 0x0A), reader._read_u8(base + 0x09)) != (map_group, map_num):
+            continue  # a neighbouring map's object: its local id is that map's
+        loaded_ids.add(local_id)
+        if flags & (1 << 13) or not wanted(local_id, reader._read_u8(base + 5)):  # invisible
+            continue
+        x = reader._read_s16(base + 0x10) - MAP_OFFSET
+        y = reader._read_s16(base + 0x12) - MAP_OFFSET
+        found.append((x, y, FACING_BUTTON.get(reader._read_u16(base + 0x18) & 0xF, "DOWN")))
+    sb1 = reader._read_u32(reader.addresses.SAVE_BLOCK1_PTR)
+    for i in range(OBJECT_EVENT_TEMPLATES_COUNT):
+        base = sb1 + SAVE_BLOCK1_OBJECT_EVENT_TEMPLATES + i * OBJECT_EVENT_TEMPLATE_SIZE
+        local_id = reader._read_u8(base)
+        if not local_id or local_id in loaded_ids:
+            continue
+        if not wanted(local_id, reader._read_u8(base + TEMPLATE_GRAPHICS_ID)):
+            continue
+        if reader._is_event_flag_set(reader._read_u16(base + TEMPLATE_FLAG_ID)):
+            continue
+        facing = FACE_MOVEMENT_TYPES.get(reader._read_u8(base + TEMPLATE_MOVEMENT_TYPE), "DOWN")
+        found.append((reader._read_s16(base + 4), reader._read_s16(base + 6), facing))
+    return found
 
 
 def people_near(reader, x: int, y: int, radius: int) -> List[Tuple[int, int]]:

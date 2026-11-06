@@ -1181,6 +1181,26 @@ def map_file_tiles(map_dir: str) -> Dict[int, Tuple[int, int]]:
     }
 
 
+@lru_cache(maxsize=None)
+def shop_clerks(map_dir: str) -> Optional[frozenset]:
+    """Local ids (map_file_tiles) of a map's people whose script runs `pokemart`: the
+    ones buy_item can buy from. None when the map file can't be read.
+
+    Told by the script, not the sprite: in pret, the LILYCOVE CITY DEPARTMENT STORE
+    clerks are OBJ_EVENT_GFX_WOMAN_3 (LilycoveCity_DepartmentStore_2F_EventScript_ClerkLeft),
+    the LAVARIDGE TOWN HERB SHOP clerk WOMAN_2, SLATEPORT CITY's Energy Guru POKEFAN_M,
+    while OLDALE TOWN's and the Cycling Road gates' MART_EMPLOYEEs sell nothing.
+    `pokemartdecoration` (the decoration shops) opens another list and is left out.
+    """
+    objects = _raw_map_json(map_dir).get("object_events")
+    if objects is None:
+        return None
+    return frozenset(
+        local_id for local_id, obj in enumerate(objects, start=1)
+        if any(line.partition(" ")[0] == "pokemart" for line in _script_lines(map_dir, str(obj.get("script", ""))))
+    )
+
+
 def statue_at(reader, map_dir: str, x: int, y: int) -> bool:
     """Whether a statue (porymap_state.STATUE_GRAPHICS) stands on (x, y) now, by where
     each object stands (field_control.object_places)."""

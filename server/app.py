@@ -35,7 +35,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from urllib.parse import quote_plus
 
-from typing import Any, Dict, List, Optional, Tuple, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set, Union
 import hashlib
 
 # Add parent directory to path for local modules
@@ -9668,8 +9668,29 @@ def _counter_tile_between(x: int, y: int) -> Optional[bool]:
     return grid[row][col][1] == MetatileBehavior.COUNTER
 
 
-async def _walk_up_to(graphics_id: int, who: str, source: str) -> Tuple[Optional[Any], Optional[str]]:
-    """Walk to the tile facing the nearest person with this sprite and face them.
+def _is_nurse(_local_id: int, graphics_id: int) -> bool:
+    from server import menu_state as ms
+
+    return graphics_id == ms.OBJ_EVENT_GFX_NURSE
+
+
+def _shop_clerk_test() -> Callable[[int, int], bool]:
+    """wanted(local id, graphics id) for menu_state.find_map_people: this map's people
+    whose script runs `pokemart` (game_tools.shop_clerks), or by the Mart clerk's sprite
+    where the map file can't be read."""
+    from server import game_tools
+    from server import menu_state as ms
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    clerks = game_tools.shop_clerks(ROM_TO_PORYMAP_MAP.get(_location_name(), ""))
+    if clerks is None:
+        return lambda _local_id, graphics_id: graphics_id == ms.OBJ_EVENT_GFX_MART_EMPLOYEE
+    return lambda local_id, _graphics_id: local_id in clerks
+
+
+async def _walk_up_to(wanted: Callable[[int, int], bool], who: str, source: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Walk to the tile facing the nearest person for whom wanted(local id, graphics id)
+    (menu_state.find_map_people) and face them.
 
     Returns (CounterPerson, None) or (None, why not).
     """
@@ -9677,24 +9698,32 @@ async def _walk_up_to(graphics_id: int, who: str, source: str) -> Tuple[Optional
     from server.field_control import DIRECTION_DELTAS
 
     snap = _field_snapshot()
-    people = _mem(ms.find_objects_by_graphics, graphics_id)
-    if not people or snap is None:
-        return None, f"no {who} is on this map"
-    x, y, facing = min(people, key=lambda p: abs(p[0] - snap.x) + abs(p[1] - snap.y))
-    dx, dy = DIRECTION_DELTAS[facing]
-    counter = _counter_tile_between(x + dx, y + dy)
-    # Unreadable (None) is treated as a counter: nurses and clerks all stand behind one.
-    spot = ms.talk_spot(x, y, facing, counter is not False)
-    if (snap.x, snap.y) != spot.stand:
+    walk: Dict[str, Any] = {}
+    planned = None
+    # Planned again after the first walk: a person out of view is planned from their
+    # template (find_map_people) and the counter in front of them can't be read yet
+    # (_counter_tile_between: None), both known for sure once the player is near.
+    for _ in range(2):
+        people = _mem(ms.find_map_people, wanted)
+        if not people or snap is None:
+            return None, f"no {who} is on this map"
+        x, y, facing = min(people, key=lambda p: abs(p[0] - snap.x) + abs(p[1] - snap.y))
+        dx, dy = DIRECTION_DELTAS[facing]
+        counter = _counter_tile_between(x + dx, y + dy)
+        # Unreadable (None) is treated as a counter: nurses and clerks all stand behind one.
+        spot = ms.talk_spot(x, y, facing, counter is not False)
+        if (snap.x, snap.y) == spot.stand or spot == planned:
+            break
+        planned = spot
         walk = await mcp_navigate_to(
             {"x": spot.stand[0], "y": spot.stand[1], "variance": "none", "reason": f"{source}: talk to the {who}", "consider_npcs": True}
         )
         snap = _field_snapshot()
-        if snap is None or (snap.x, snap.y) != spot.stand:
-            return None, (
-                f"could not walk to ({spot.stand[0]},{spot.stand[1]}), the tile facing the {who} at ({x},{y}): "
-                f"{walk.get('summary') or walk.get('error')}"
-            )
+    if snap is None or (snap.x, snap.y) != spot.stand:
+        return None, (
+            f"could not walk to ({spot.stand[0]},{spot.stand[1]}), the tile facing the {who} at ({x},{y}): "
+            f"{walk.get('summary') or walk.get('error')}"
+        )
     if snap.facing != spot.face:
         # The counter (or the person) blocks that way, so this press only turns the player.
         await _macro_press([spot.face], source)
@@ -9933,7 +9962,7 @@ async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]
     # said "no nurse is on this map" instead of why the way out was not found.
     return await _walk_along(
         lambda location, position: game_tools.pokemon_center_route(location, position) or None,
-        lambda: bool(_mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE)),
+        lambda: bool(_mem(ms.find_map_people, _is_nurse)),
         "the nearest Pokémon Center",
         source,
         f"{source}() again",
@@ -10745,7 +10774,7 @@ async def mcp_heal_at_pokecenter(request: dict = None):
             return refused
         trip = []
         roped = ""
-        if not _mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_NURSE):
+        if not _mem(ms.find_map_people, _is_nurse):
             # In a cave or dungeon an Escape Rope is the quick way out (pret
             # ItemUseOutOfBattle_EscapeRope: allowEscaping maps only), then the walk. Seen
             # live in MAGMA HIDEOUT 1F: the walk alone found no way out.
@@ -10771,7 +10800,7 @@ async def mcp_heal_at_pokecenter(request: dict = None):
                 return _refusal(f"Did not heal: {roped}{why}.{walked}{on}")
 
         before = _party_lines()
-        spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_NURSE, "nurse", source)
+        spot, why = await _walk_up_to(_is_nurse, "nurse", source)
         if why:
             return _refusal(f"Did not heal: {why}.")
         await _macro_press(["A"], source)
@@ -12746,7 +12775,8 @@ async def mcp_buy_item(request: dict = None):
         if refused:
             return refused
         location = _location_name()
-        if not _mem(ms.find_objects_by_graphics, ms.OBJ_EVENT_GFX_MART_EMPLOYEE):
+        is_clerk = _shop_clerk_test()
+        if not _mem(ms.find_map_people, is_clerk):
             hint = _exit_hint("MART")
             where = f" This map has one: {hint}, then buy_item." if hint else " Go to a town with a POKEMON MART first."
             return _refusal(f"There is no shop clerk here ({location}).{where}")
@@ -12761,7 +12791,7 @@ async def mcp_buy_item(request: dict = None):
             return counts
 
         money_before = _mem(lambda r: r.read_money())
-        spot, why = await _walk_up_to(ms.OBJ_EVENT_GFX_MART_EMPLOYEE, "clerk", source)
+        spot, why = await _walk_up_to(is_clerk, "clerk", source)
         if why:
             return _refusal(f"Bought nothing: {why}.")
         await _macro_press(["A"], source)
