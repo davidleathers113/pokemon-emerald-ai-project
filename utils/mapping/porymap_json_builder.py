@@ -77,20 +77,48 @@ def override_walk_tiles(override_tiles, override_ascii: str, layout_tiles) -> Op
     return tiles
 
 
+def underwater_floor(metatiles) -> Optional[List[List[tuple]]]:
+    """An underwater map's tiles with their water behaviors read as plain floor (MB_NORMAL).
+
+    Underwater the player is no surfer: pret src/field_player_avatar.c sets
+    PLAYER_AVATAR_FLAG_UNDERWATER, not _SURFING (PlayerAvatarTransition_Underwater), and
+    MovePlayerNotOnBike walks them (PlayerWalkNormal) where GetCollisionAtCoords allows,
+    by collision bit and elevation only. UNDERWATER SEAFLOOR CAVERN's floor is
+    MB_DEEP_WATER at elevation 3, and the planner's Surf rules (pathfinding.water_step)
+    took it for water to Surf onto from its warp, so no walk crossed it. Which tile B
+    surfaces from (MB_NO_SURFACING) is read from the layout itself
+    (porymap_state.layout_tiles), never from these."""
+    from utils.mapping.pathfinding import SURF_WATER_BEHAVIORS, tile_behavior_name
+
+    if not metatiles:
+        return metatiles
+    return [
+        [
+            (tile[0], MetatileBehavior.NORMAL, *tile[2:])
+            if len(tile) > 1 and tile_behavior_name(tile) in SURF_WATER_BEHAVIORS else tile
+            for tile in row
+        ]
+        for row in metatiles
+    ]
+
+
 def build_json_map(map_name: str, pokeemerald_root: Path,
                    include_grid: bool = True,
                    include_ascii: bool = True,
-                   badge_count: int = 0) -> Optional[Dict[str, Any]]:
+                   badge_count: int = 0,
+                   layout: str = "") -> Optional[Dict[str, Any]]:
     """
     Build a complete JSON map structure from porymap data.
-    
+
     Args:
         map_name: Map name (e.g., "OldaleTown", "LittlerootTown")
         pokeemerald_root: Root directory of pokeemerald project
         include_grid: Include full grid data as JSON (True) or just metadata (False)
         include_ascii: Include ASCII representation for visualization
         badge_count: Number of badges player has (for game-state-aware map selection)
-        
+        layout: a LAYOUT_* id to draw the map from instead of the map file's: the one its
+            transition script swaps in (porymap_state.map_layout_now)
+
     Returns:
         Dictionary with complete map data in JSON-serializable format
         {
@@ -118,7 +146,7 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
     layout_parser = PokeemeraldLayoutParser(pokeemerald_root)
     
     # Get layout name
-    layout_name = map_loader.get_layout_name_from_map(map_name)
+    layout_name = layout or map_loader.get_layout_name_from_map(map_name)
 
     # Parse tile data if layout available
     grid = None
@@ -149,6 +177,8 @@ def build_json_map(map_name: str, pokeemerald_root: Path,
     if metatiles is None and layout_name:
         # Get metatiles with behavior
         metatiles = layout_parser.get_metatiles_with_behavior(layout_name)
+        if map_data.get("map_type") == "MAP_TYPE_UNDERWATER":
+            metatiles = underwater_floor(metatiles)
 
         if metatiles:
             height = len(metatiles)
@@ -390,6 +420,7 @@ def _build_json_map_for_llm_cached(
     map_name: str,
     pokeemerald_root_str: str,
     badge_count: int,
+    layout: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Cache static porymap builds to avoid repeated filesystem parsing."""
     return build_json_map(
@@ -398,6 +429,7 @@ def _build_json_map_for_llm_cached(
         include_grid=True,
         include_ascii=True,
         badge_count=badge_count,
+        layout=layout,
     )
 
 
@@ -419,10 +451,15 @@ def build_json_map_for_llm(map_name: str, pokeemerald_root: Path, badge_count: i
     Returns:
         JSON-serializable dictionary optimized for LLM
     """
+    from utils.mapping.porymap_state import map_layout_now
+
+    # The layout the map's transition script swaps in now (ROUTE 131 is always drawn from
+    # LAYOUT_ROUTE131_SKY_PILLAR), so a map read from the decomp matches the game's.
     cached_map = _build_json_map_for_llm_cached(
         map_name=map_name,
         pokeemerald_root_str=str(Path(pokeemerald_root).resolve()),
         badge_count=badge_count,
+        layout=map_layout_now(map_name),
     )
     if cached_map is None:
         return None

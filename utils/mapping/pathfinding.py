@@ -137,6 +137,29 @@ def is_shore(tile) -> bool:
     return bool(tile) and len(tile) > 3 and tile[3] == SHORE_ELEVATION and not tile[2] and not is_surf_water(tile)
 
 
+# Dive. Seen live (2026-11-05): with DIVE on AZUMARILL and the Mind Badge, the AI pressed A
+# on ROUTE 128's ordinary water at (25,0) four times; A dives only on the deep water the
+# player is on. pret src/field_control_avatar.c TrySetDiveWarp reads the behavior of the
+# player's own tile (PlayerGetDestCoords), not the one faced: on a map that is not
+# MAP_TYPE_UNDERWATER, MetatileBehavior_IsDiveable (pret src/metatile_behavior.c) is these.
+DIVEABLE_BEHAVIORS = frozenset({"INTERIOR_DEEP_WATER", "DEEP_WATER", "SOOTOPOLIS_DEEP_WATER"})
+# Underwater, B surfaces from any tile but these (pret MetatileBehavior_IsUnableToEmerge;
+# MB_WATER_DOOR joins them only under BUGFIX, so the cartridge lets the player surface on
+# a water door: the planner never picks one, a warp tile is no place to stop).
+NO_EMERGE_BEHAVIORS = frozenset({"NO_SURFACING", "SEAWEED_NO_SURFACING", "WATER_DOOR"})
+
+
+def is_diveable(tile) -> bool:
+    """A tile A dives from (DIVEABLE_BEHAVIORS), surfing on it."""
+    return tile_behavior_name(tile) in DIVEABLE_BEHAVIORS
+
+
+def can_emerge(tile) -> bool:
+    """An underwater tile B surfaces from (not NO_EMERGE_BEHAVIORS); False when unknown."""
+    name = tile_behavior_name(tile)
+    return bool(name) and name not in NO_EMERGE_BEHAVIORS
+
+
 def elevation_step(walker: Optional[int], there: Optional[int]) -> Optional[int]:
     """The walker's elevation after a step onto a tile at elevation `there`, or None when
     the game refuses the step for an elevation mismatch. None for walker or there means

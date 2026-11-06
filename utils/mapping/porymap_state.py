@@ -632,52 +632,60 @@ def _register_every_map() -> None:
             ROM_TO_PORYMAP_MAP.setdefault(location.name.replace("_", " "), map_dir)
 
 
-# map dir -> the LAYOUT_* a script drew the map from when the player was last on it, where
-# that is not its map file's (dynamic_map_overlay.swapped_layout, kept by
-# game_tools.note_live_layout). pret data/maps/SkyPillar_4F/scripts.inc OnTransition draws
-# LAYOUT_SKY_PILLAR_4F_CLEAN while VAR_SKY_PILLAR_STATE < 2. Seen live (2026-11-05): the
-# route areas came from the map file's layout, whose cracked floor is not the clean one's,
-# and go_to("SKY PILLAR 5F") from 4F (11,2) said it can't be reached.
-_live_layouts: Dict[str, str] = {}
+# {map dir: LAYOUT_* ("" for its map file's own)} for the map the player is on, as the
+# game drew it (dynamic_map_overlay.swapped_layout, kept by game_tools.note_live_layout):
+# ground truth for that map, over what its transition script is read to swap in
+# (game_tools.scripted_layout). pret data/maps/SkyPillar_4F/scripts.inc OnTransition
+# draws LAYOUT_SKY_PILLAR_4F_CLEAN while VAR_SKY_PILLAR_STATE < 2. Seen live (2026-11-05):
+# the route areas came from the map file's layout, whose cracked floor is not the clean
+# one's, and go_to("SKY PILLAR 5F") from 4F (11,2) said it can't be reached. One map only:
+# a map left behind is planned from its script again, which reads the story as it is now.
+_live_layout: Dict[str, str] = {}
 
 
-def note_layout(map_dir: str, layout: str) -> bool:
-    """Record the layout map_dir is drawn from now ("" for its map file's own); True when
-    that changed, so what was planned from the old one is stale."""
-    if not map_dir or _live_layouts.get(map_dir, "") == (layout or ""):
-        return False
-    if layout:
-        _live_layouts[map_dir] = layout
-    else:
-        _live_layouts.pop(map_dir, None)
-    return True
+def note_layout(map_dir: str, layout: str) -> None:
+    """Record the layout the player's map map_dir is drawn from now ("" for its map file's
+    own). What was planned from another layout is forgotten by game_tools.layout_now, the
+    one place every layout change goes through."""
+    if map_dir:
+        _live_layout.clear()
+        _live_layout[map_dir] = layout or ""
+
+
+def live_layout(map_dir: str) -> Optional[str]:
+    """note_layout's layout for map_dir while it is the player's map, else None."""
+    return _live_layout.get(map_dir)
+
+
+def map_layout_now(map_dir: str) -> str:
+    """The LAYOUT_* the map is drawn from now ("" for its map file's own): the game's own
+    for the player's map (note_layout), else the one its transition script swaps in
+    (server.game_tools.layout_now, which also clears what was planned from another). ""
+    where no server is running."""
+    if not map_dir:
+        return ""
+    try:
+        from server import game_tools
+    except ImportError:
+        return _live_layout.get(map_dir, "")
+    return game_tools.layout_now(map_dir)
 
 
 def _static_build(map_dir: str) -> tuple:
     """(grid, tiles) of a map from the decomp: the collision grid, one string per row, and
     the tiles walks are planned on, (tile id, behavior, collision, elevation) per cell by
     row (porymap_json_builder raw_tiles: the layout's, also under an ASCII override of the
-    same size). (None, ()) when it can't be built. A map a script was seen drawing from
-    another layout (note_layout) is built from that one."""
-    return _build_layout(map_dir, _live_layouts.get(map_dir, ""))
+    same size), from the layout the map is drawn from now (map_layout_now). (None, ())
+    when it can't be built."""
+    return _static_build_on(map_dir, map_layout_now(map_dir))
 
 
 @lru_cache(maxsize=64)
-def _build_layout(map_dir: str, layout: str) -> tuple:
-    """_static_build from `layout` ("" for the map file's own)."""
+def _static_build_on(map_dir: str, layout: str) -> tuple:
+    """_static_build from `layout` ("" for the map file's own): the builder draws the
+    swapped layout's tiles with the map's own warps and objects."""
     from utils.mapping.porymap_json_builder import build_json_map
 
-    if layout:
-        from utils.mapping.map_formatter import format_tile_to_symbol
-
-        tiles = layout_tiles(map_dir, layout)
-        if tiles:
-            # The symbols the live overlay draws the same tiles with (dynamic_map_overlay).
-            grid = tuple(
-                "".join(format_tile_to_symbol(tile, x=x, y=y) for x, tile in enumerate(row))
-                for y, row in enumerate(tiles)
-            )
-            return grid, tiles
     root = _get_pokeemerald_root()
     if not root:
         return None, ()
@@ -686,7 +694,7 @@ def _build_layout(map_dir: str, layout: str) -> tuple:
         # (ascii_map_loader CONDITIONAL_SELECTORS). With none, PetalburgCity_Gym came back
         # as the 9x8 lobby numbered from row 0, while its warps are in the 9x112 map's
         # coordinates, so no door of the gym joined anything.
-        built = build_json_map(map_dir, root, include_grid=True, include_ascii=False, badge_count=8)
+        built = build_json_map(map_dir, root, include_grid=True, include_ascii=False, badge_count=8, layout=layout)
     except Exception as e:  # a broken neighbour must not take the prompt down with it
         logger.warning(f"Porymap: could not build grid for {map_dir}: {e}")
         return None, ()
@@ -707,13 +715,19 @@ def _static_tiles(map_dir: str) -> Tuple[Tuple[tuple, ...], ...]:
     return _static_build(map_dir)[1]
 
 
-@lru_cache(maxsize=None)
 def layout_tiles(map_dir: str, layout: str = "") -> Tuple[Tuple[tuple, ...], ...]:
     """A map's tiles from the decomp's own layout, (tile id, behavior, collision,
     elevation) per cell by row; () when it can't be read. Never an ASCII override: an
     override draws only walls and floor (RustboroCity's draws its gym door as plain
     floor) and keeps no elevation. `layout` (a LAYOUT_* id) reads that layout instead of
-    the map file's: the one a script swapped in (dynamic_map_overlay.swapped_layout)."""
+    the map file's: the one a script swapped in (dynamic_map_overlay.swapped_layout);
+    without it, the one the map's transition script swaps in now (map_layout_now)."""
+    return _layout_tiles(map_dir, layout or map_layout_now(map_dir))
+
+
+@lru_cache(maxsize=None)
+def _layout_tiles(map_dir: str, layout: str) -> Tuple[Tuple[tuple, ...], ...]:
+    """layout_tiles from `layout` ("" for the map file's)."""
     from utils.mapping.pokeemerald_parser import PokeemeraldLayoutParser, PokeemeraldMapLoader
 
     root = _get_pokeemerald_root()
@@ -728,14 +742,21 @@ def layout_tiles(map_dir: str, layout: str = "") -> Tuple[Tuple[tuple, ...], ...
     return tuple(tuple(tuple(tile) for tile in row) for row in tiles or ())
 
 
-@lru_cache(maxsize=None)
 def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
     """For each of the map's warp_events, in order: (its layout tile (tile id, behavior,
     collision, elevation) or None, whether a bg_event with a script is on that tile).
 
     Tiles come from the decomp's own layout, never an ASCII override: an override draws
-    only walls and floor, and RustboroCity's draws its gym door as plain floor.
+    only walls and floor, and RustboroCity's draws its gym door as plain floor. The
+    layout is the one the map is drawn from now (map_layout_now): ROUTE 131's door to SKY
+    PILLAR ENTRANCE is open sea in the map file's layout.
     """
+    return _warp_tiles_on(map_dir, map_layout_now(map_dir))
+
+
+@lru_cache(maxsize=None)
+def _warp_tiles_on(map_dir: str, layout: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
+    """_warp_tiles from `layout` ("" for the map file's)."""
     root = _get_pokeemerald_root()
     map_file = Path(root) / "data" / "maps" / map_dir / "map.json" if root and map_dir else None
     if map_file is None or not map_file.is_file():
@@ -746,7 +767,7 @@ def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
     except (OSError, ValueError) as e:  # unreadable: every warp counts as an ordinary one, as before
         logger.warning(f"Porymap: could not read {map_file}: {e}")
         return ()
-    tiles = layout_tiles(map_dir)
+    tiles = layout_tiles(map_dir, layout)
     scripted = {
         (int(bg.get("x", -1)), int(bg.get("y", -1))) for bg in data.get("bg_events") or [] if bg.get("script")
     }
@@ -758,7 +779,6 @@ def _warp_tiles(map_dir: str) -> Tuple[Tuple[Optional[tuple], bool], ...]:
     return tuple(out)
 
 
-@lru_cache(maxsize=None)
 def arrival_only_warps(map_dir: str) -> frozenset:
     """Indexes in the map's warp_events of the warps that only mark where a warp arrives.
 
@@ -787,17 +807,20 @@ def lands_only(tile: Optional[tuple]) -> bool:
 # Behaviors a warp event fires on (pret src/metatile_behavior.c): IsWarpMetatileBehavior's
 # doors, ladders, escalators, holes, geysers and pads, and IsArrowWarpMetatileBehavior's
 # arrows (MetatileBehavior_IsNorthArrowWarp counts MB_STAIRS_OUTSIDE_ABANDONED_SHIP,
-# IsSouthArrowWarp MB_WATER_SOUTH_ARROW_WARP and MB_SHOAL_CAVE_ENTRANCE). The water ones
-# stay too (Route131's way into Sky Pillar reads as MB_DEEP_WATER here, UnionRoom's way
-# out as MB_BRIDGE_OVER_OCEAN): no walk stands on them, and dropping a real one would
-# hide it from EXITS.
+# IsSouthArrowWarp MB_WATER_SOUTH_ARROW_WARP and MB_SHOAL_CAVE_ENTRANCE). Water is none
+# of these, so a warp event on open water is where a warp lands (Route131 (36,6), out in
+# the sea, AQUA HIDEOUT 1F's pool, UnionRoom's MB_BRIDGE_OVER_OCEAN). They were kept as
+# exits while no walk stood on water; Surf and Dive walks do. Seen in a test: SEAFLOOR
+# CAVERN ENTRANCE's warp at (10,18), MB_DEEP_WATER in the game's own map buffer too,
+# was the shortest way to UNDERWATER ROUTE 128, and stepping onto it does nothing (the
+# way is Dive, then the cavern's south arrow warp).
 _WARP_BEHAVIORS = frozenset({
     "ANIMATED_DOOR", "NON_ANIMATED_DOOR", "WATER_DOOR", "DEEP_SOUTH_WARP", "LADDER",
     "UP_ESCALATOR", "DOWN_ESCALATOR", "LAVARIDGE_GYM_B1F_WARP", "LAVARIDGE_GYM_1F_WARP",
     "AQUA_HIDEOUT_WARP", "MT_PYRE_HOLE", "MOSSDEEP_GYM_WARP", "BATTLE_PYRAMID_WARP",
     "CRACKED_FLOOR_HOLE", "EAST_ARROW_WARP", "WEST_ARROW_WARP", "NORTH_ARROW_WARP",
     "SOUTH_ARROW_WARP", "WATER_SOUTH_ARROW_WARP", "STAIRS_OUTSIDE_ABANDONED_SHIP",
-    "SHOAL_CAVE_ENTRANCE", "DEEP_WATER", "OCEAN_WATER", "BRIDGE_OVER_OCEAN",
+    "SHOAL_CAVE_ENTRANCE",
 })
 
 
@@ -808,6 +831,72 @@ _ARROW_WARP_PRESS = {
     "SOUTH_ARROW_WARP": "DOWN", "WATER_SOUTH_ARROW_WARP": "DOWN", "SHOAL_CAVE_ENTRANCE": "DOWN",
     "WEST_ARROW_WARP": "LEFT", "EAST_ARROW_WARP": "RIGHT",
 }
+
+
+@dataclass(frozen=True)
+class DiveLink:
+    """A map's Dive down (button "A", from deep water) or up (button "B", underwater) to
+    dest (a data/maps dir). tile is where it lands, or None for the same coordinates."""
+    button: str
+    dest: str
+    name: str
+    tile: Optional[Tuple[int, int]]
+
+    @property
+    def label(self) -> str:
+        """The EXITS line's text, also what go_to_exit matches (server.field_control.match_exits)."""
+        how = "dive (A on deep water, needs DIVE)" if self.button == "A" else "surface (B underwater, needs DIVE)"
+        return f"{how} -> {self.name}"
+
+
+@lru_cache(maxsize=None)
+def dive_links(map_dir: str) -> Tuple[DiveLink, ...]:
+    """Where Dive goes from a map: down from a map that is not MAP_TYPE_UNDERWATER, up from
+    one that is; () for neither.
+
+    pret src/overworld.c SetDiveWarp: the map's connection in that direction (map.json
+    "dive" / "emerge") warps to the same x, y on its map; without one, the fixed dive warp
+    a map script set (RunOnDiveWarpMapScript, then sFixedDiveWarp: `setdivewarp MAP, x, y`,
+    run from MAP_SCRIPT_ON_RESUME on every map that has one, e.g. UNDERWATER SEAFLOOR
+    CAVERN's to SEAFLOOR CAVERN ENTRANCE (10,17)). A map whose scripts set more than one
+    (UNDERWATER SEALED CHAMBER picks by where the player is) is left out: which one holds
+    is the game's choice at the time.
+    """
+    root = _get_pokeemerald_root()
+    if not root or not map_dir:
+        return ()
+    folder = Path(root) / "data" / "maps" / map_dir
+    try:
+        with open(folder / "map.json", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ()
+    underwater = data.get("map_type") == "MAP_TYPE_UNDERWATER"
+    button, direction = ("B", "emerge") if underwater else ("A", "dive")
+    dirs = _map_dirs_by_const()
+    links = [
+        DiveLink(button, dirs[str(c.get("map"))], _readable_map_name(str(c.get("map"))), None)
+        for c in data.get("connections") or []
+        if c.get("direction") == direction and str(c.get("map")) in dirs
+    ]
+    if links:
+        return tuple(links)
+    try:
+        scripts = (folder / "scripts.inc").read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    fixed = set()
+    for line in scripts.splitlines():
+        command, _, args = line.split("@")[0].strip().partition(" ")
+        parts = [p.strip() for p in args.split(",")]
+        if command == "setdivewarp" and len(parts) == 3 and all(p.lstrip("-").isdigit() for p in parts[1:]):
+            fixed.add((parts[0], int(parts[1]), int(parts[2])))
+    if len(fixed) != 1:
+        return ()
+    const, x, y = fixed.pop()
+    if const not in dirs:
+        return ()
+    return (DiveLink(button, dirs[const], _readable_map_name(const), (x, y)),)
 
 
 def warp_entry(map_dir: str, index: int, x: int, y: int) -> Optional[Tuple[Tuple[int, int], str]]:
@@ -1310,6 +1399,8 @@ def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str], surf: bool =
     lines = []
     for conn in json_map.get("connections", []):
         direction = conn.get("direction", "?")
+        if direction in ("dive", "emerge"):
+            continue  # not an edge: listed with the Dive links below (dive_links)
         span = connection_open_span(conn, surf)
         where = _edge_openings(ascii_lines, direction, span, surf)
         on_foot = _edge_openings(ascii_lines, direction, connection_open_span(conn), False) if surf else where
@@ -1335,7 +1426,21 @@ def _format_exits(json_map: Dict[str, Any], ascii_lines: List[str], surf: bool =
         x, y = warp.get("x", "?"), warp.get("y", "?")
         how = warp_entry_text(warp_entry(map_dir, i, x, y), x, y) if isinstance(x, int) and isinstance(y, int) else ""
         lines.append(f"- door/warp at ({x}, {y}) -> {_readable_map_name(warp.get('dest_map', '?'))}{how}")
+    # Seen live: "dive edge of the map -> UNDERWATER ROUTE 128" was listed as an edge, and
+    # go_to_exit("UNDERWATER ROUTE 128") answered that no exit matched.
+    for link in dive_links(map_dir):
+        lines.append(f"- {link.label}{dive_note()}")
     return lines
+
+
+def dive_note() -> str:
+    """The EXITS note on a Dive link while the party can't Dive (server.game_tools.can_dive),
+    or "" when it can or no server is running."""
+    try:
+        from server import game_tools
+    except ImportError:
+        return ""
+    return "" if game_tools.can_dive() else " (needs a party Pokémon that knows DIVE and the Mind Badge)"
 
 
 def _format_porymap_info(

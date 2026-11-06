@@ -425,6 +425,41 @@ def test_walks_never_step_on_a_door_they_are_not_going_to():
     assert _location(s) == "ROUTE 117 POKEMON DAY CARE", _location(s)  # asked for: still works
 
 
+def test_a_walk_blocked_only_by_people_names_them():
+    """Seen live: a Magma grunt on (13,2) in front of SPACE CENTER 1F's stairs gave a bare
+    "No path found" (no fixture there: the grunts are gone once the scene is over). When a
+    way exists with people left out, the answer names each person on it and, for a
+    trainer not beaten yet, the talk_to that battles them.
+
+    test_aqua_hideout_b2f.state (31,17): Matt, not beaten, stands at (23,19) in the only
+    way west to (14,16). test_route117_blocked.state (47,5): the Day Care man at (47,4)
+    stands in the gap north."""
+    from server import game_tools
+
+    s = server()
+    s.load(HERE / "test_aqua_hideout_b2f.state", wild_encounters=False)
+    # The party's field moves are kept for a second: the way west crosses water, and the
+    # test before (another fixture's party) would otherwise still answer. Seen: run after
+    # test_a_rock_is_smashed_when_the_emulator_runs_slow, no way west was found at all.
+    game_tools._field_moves_cache[0] = 0.0
+    with s.srv.memory_lock:
+        r = game_tools.navigate_to_direct(s.srv.env, 14, 16, variance="none")
+    said = r.get("note") or r.get("error") or ""
+    print("   ", said)
+    assert "Only people block the way: MATT at (23,19), a trainer not beaten yet: talk_to(23, 19) battles them" in said, r
+    assert [(p["x"], p["y"], p["trainer"]) for p in r["people_in_the_way"]] == [(23, 19, True)], r
+
+    s.load(HERE / "test_route117_blocked.state", wild_encounters=False)
+    r = s.call("mcp_navigate_to", {"x": 45, "y": 0, "variance": "none", "reason": "test"})
+    print("   ", r.get("summary") or r.get("error"))
+    said = r.get("summary") or r.get("error") or ""
+    assert "Only people block the way: OLD MAN at (47,4)." in said and "talk_to" not in said, r
+    # A way that needs nobody to move says nothing about people.
+    with s.srv.memory_lock:
+        r = game_tools.navigate_to_direct(s.srv.env, 47, 5, variance="none")  # where the walk began
+    assert r["success"] and r["path_end"] == [47, 5] and "people_in_the_way" not in r, r
+
+
 def test_people_hidden_by_the_story_do_not_block_walks():
     """Seen live: five TEAM AQUA grunts and PROF BIRCH from a finished Route 110 scene
     (their hide flags set) stood in the pathfinder's object list across the only way

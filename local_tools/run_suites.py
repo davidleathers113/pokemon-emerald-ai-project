@@ -29,7 +29,7 @@ IMAGE = "emerald-harness:local"
 # Longest first (minutes, measured serially), so the pool doesn't end on one long suite.
 DOCKER_SUITES = [
     "train_macro", "macros", "strength", "warp_routes", "rotating_gates", "movement_exits", "objective_memory", "battle_flow",
-    "elevation", "mossdeep_gym", "scene_walls", "rematch", "fishing",
+    "elevation", "mossdeep_gym", "scene_walls", "rematch", "fishing", "dive",
     "battle_view",
     "battle_doubles", "use_item", "party_rule", "dialogue_agent", "dialogue_auto_advance", "phase4_agent",
     "movement_feedback", "surf", "prompt_cache", "play_endpoints", "phase4_backend", "phase23_health",

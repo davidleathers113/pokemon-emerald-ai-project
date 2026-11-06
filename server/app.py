@@ -5444,6 +5444,69 @@ async def _await_landing(was_surfing: bool) -> Optional[Tuple[int, int]]:
     return (snap.x, snap.y) if snap is not None else None
 
 
+# A presses after YES to Dive: "<MON> used DIVE.", with room for the YES/NO's own box.
+DIVE_PRESSES = 4
+# YES to Dive until the player walks the other map: the line, the field effect (pret
+# src/field_effect.c FldEff_UseDive: the Pokémon shown, then DoDiveWarp's fade) and the
+# map's fade-in, in game frames, with room to spare.
+DIVE_EFFECT_FRAMES = 1200
+
+
+async def _use_dive(plan: Dict[str, Any], before, source: str) -> Optional[str]:
+    """Standing on the plan's Dive spot (game_tools.plan_exit_route kind "dive"): the
+    plan's button, A on deep water or B underwater, YES to "The sea is deep here." /
+    "Light is filtering down from above. Would you like to use DIVE?", then "<MON> used
+    DIVE." until the map changes and the player can walk. None once that happened, else why
+    not (the YES/NO answered NO, so nothing is left on screen).
+
+    pret src/field_control_avatar.c ProcessPlayerFieldInput: B underwater runs
+    TrySetupDiveEmergeScript before anything else; A dives only after TryStartInteractionScript
+    found nothing to talk to or read in front (TrySetupDiveDownScript). Both read the
+    player's own tile. data/scripts/field_move_scripts.inc EventScript_UseDive /
+    EventScript_UseDiveUnderwater: MSGBOX_YESNO, Text_MonUsedDive, FLDEFF_USE_DIVE. Seen
+    live (2026-11-05): exactly these presses by hand on ROUTE 128 (38,27) and in
+    UNDERWATER SEAFLOOR CAVERN.
+    """
+    from server import menu_state as ms
+
+    if not await _await_game(_player_can_walk, MACRO_MENU_FRAMES):
+        return f"the player can't act at the Dive spot{_screen_note()}"
+    asked, texts = False, []
+    for _ in range(3):
+        await _macro_press([plan["press"]], source)
+        asked, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+        if asked or texts or not _player_can_walk():
+            break
+    if not asked:
+        await _close_dialogue(source)
+        return f"{plan['press']} at {tuple(plan['target'])} asked nothing ({_quote(texts) or 'nothing was said'})"
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor == 1 and cursor.cursor == 1:
+        await _macro_press(["UP"], source)
+        cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor != 1 or cursor.cursor != 0:
+        await _macro_press(["B"], source)  # B answers NO: never leave the question up
+        await _close_dialogue(source)
+        return f"the DIVE question's YES/NO cursor is not on YES (cursor {cursor.cursor})"
+    await _macro_press(["A"], source)  # YES
+
+    def moved() -> bool:
+        snap = _field_snapshot()
+        return snap is not None and snap.map_id != before.map_id
+
+    # "<MON> used DIVE." waits for A (as Surf's line does, _start_surf): A only once a box
+    # waits for it, and never after the map changed, where the next map would take it.
+    for _ in range(DIVE_PRESSES):
+        await _await_game(lambda: moved() or _box_waits_for_a(), MACRO_TEXT_FRAMES)
+        if moved():
+            break
+        if _box_waits_for_a():
+            await _macro_press(["A"], source)
+    if not await _await_game(lambda: moved() and _player_can_walk(), DIVE_EFFECT_FRAMES):
+        return f"answered YES to DIVE at {tuple(plan['target'])} but the map did not change{_screen_note()}"
+    return None
+
+
 # A presses after YES to Strength: "<MON> used STRENGTH!" and its second page, with room
 # for the YES/NO's own box (pret data/scripts/field_move_scripts.inc Text_MonUsedStrength).
 STRENGTH_PRESSES = 5
@@ -5580,6 +5643,8 @@ async def mcp_go_to_exit(request: dict):
         exit_query = str(request.get("exit") or request.get("destination") or "").strip()
         if not exit_query:
             return {"success": False, "error": "exit is required, e.g. 'north' or 'OLDALE TOWN'"}
+        # go_to's next step on the map entered (_walk_along): which Dive spot to take.
+        then = str(request.get("then") or "").strip()
         refused = _refuse_during_battle("go_to_exit")
         if refused:
             return refused
@@ -5611,7 +5676,7 @@ async def mcp_go_to_exit(request: dict):
 
             def _plan():
                 with memory_lock:
-                    return game_tools.plan_exit_route(env, exit_query, avoid=tuple(avoid))
+                    return game_tools.plan_exit_route(env, exit_query, avoid=tuple(avoid), then=then)
 
             plan = await run_in_threadpool(_plan)
             # On a rotating tile puzzle map (MOSSDEEP CITY GYM) a plain walk never steps on
@@ -5701,7 +5766,10 @@ async def mcp_go_to_exit(request: dict):
                     break
                 cleared.append(f"a scene played at {tuple(plan['scene'])}")
                 continue
-            snap = await _await_exit(plan, before, WARP_FRAMES if plan["kind"] == "warp" else EDGE_FRAMES)
+            if plan["kind"] == "dive":
+                snap = _field_snapshot()  # the walk to a Dive spot changes no map: nothing to wait for
+            else:
+                snap = await _await_exit(plan, before, WARP_FRAMES if plan["kind"] == "warp" else EDGE_FRAMES)
             # A rock or tree on the way that the party can clear: clear it, plan again.
             used = await _clear_obstacle((report or {}).get("blocked_tile"), "go_to_exit")
             if used:
@@ -5736,6 +5804,19 @@ async def mcp_go_to_exit(request: dict):
             door_trouble = await _open_sign_door(plan, "go_to_exit")
             if door_trouble is None:
                 snap = await _await_exit(plan, before, WARP_FRAMES)
+
+        # Dive is taken on the spot: A on deep water, B underwater, YES.
+        if (
+            plan["kind"] == "dive"
+            and snap is not None
+            and not _went_through(plan, before, snap)
+            and not walk_stopped
+            and (snap.x - ox, snap.y - oy) == tuple(plan["target"])
+        ):
+            door_trouble = await _use_dive(plan, before, "go_to_exit")
+            snap = _field_snapshot()
+            if door_trouble is None:
+                cleared.append(f"used DIVE at ({plan['target'][0] + ox},{plan['target'][1] + oy})")
 
         # Arrow warps (house mats, cave mouths) fire when the player walks off them.
         pushes_tried = []
@@ -5780,6 +5861,8 @@ async def mcp_go_to_exit(request: dict):
             reason = f"reached the warp tile but it did not fire (tried {', '.join(pushes_tried)})"
         elif plan.get("arrival_here"):
             reason = f"the walk ended without arriving at {tuple(plan['arrival_here'])}, where that warp leads"
+        elif plan["kind"] == "dive":
+            reason = f"the walk ended short of the tile to use DIVE from, ({plan['target'][0] + ox},{plan['target'][1] + oy})"
         else:
             reason = "the walk ended without leaving the map"
         # A warp within the map is not "leaving" it: say what did not happen.
@@ -6568,6 +6651,12 @@ def _route_flag_reader(flag: int) -> bool:
     return bool(_mem(lambda r: r._is_event_flag_set(flag)))
 
 
+def _route_var_reader(var_id: int) -> Optional[int]:
+    """Story vars for route planning (server.game_tools.var_reader): which layout a map's
+    transition script swaps in (game_tools.scripted_layout)."""
+    return _mem(lambda r: r.read_game_var(var_id))
+
+
 def _mem(fn, *args):
     """Call fn(memory_reader, *args) under the memory lock."""
     with memory_lock:
@@ -6638,6 +6727,7 @@ def _install_route_flag_reader() -> None:
     from server import game_tools
 
     game_tools.flag_reader = _route_flag_reader
+    game_tools.var_reader = _route_var_reader
     game_tools.field_moves_reader = _usable_field_moves
     game_tools.items_reader = _held_item_names
     game_tools.boulders_reader = _boulders_here
@@ -9807,7 +9897,12 @@ async def _walk_along(
         elif route[0][0].startswith(game_tools.FALL_STEP):
             step = await _fall_through(route[0][0], route[0][1], source)
         else:
-            step = await mcp_go_to_exit({"exit": route[0][0], "reasoning": f"{source}: walk to {route[-1][1]}"})
+            # The step after, on the map entered: where a Dive should land near (game_tools
+            # _dive_spot_order).
+            then = route[1][0] if len(route) > 1 else ""
+            step = await mcp_go_to_exit(
+                {"exit": route[0][0], "then": then, "reasoning": f"{source}: walk to {route[-1][1]}"}
+            )
         if on_the_way is not None and step.get("on_the_way"):
             on_the_way.append(f"on {location}: {'; '.join(step['on_the_way'])}")
         # A warp within the map (game_tools.tile_route) succeeds without a new map name.

@@ -595,6 +595,81 @@ def jump_presses(start: Tuple[int, int], buttons: List[str], tiles) -> List[str]
     return out
 
 
+# pret include/constants/flags.h: a trainer's "beaten" flag is TRAINER_FLAGS_START + id.
+TRAINER_FLAGS_START = 0x500
+
+
+def people_in_the_way(state: dict, start: Tuple[int, int], goal: Tuple[int, int], map_dir: str) -> List[dict]:
+    """When no walk reaches goal only because people stand in the way (a way exists with
+    people left out, pathfinder consider_npcs=False): each person on that way, in walking
+    order, as {"x", "y", "name", "trainer": True for a trainer not beaten yet}. [] when
+    there is no such way.
+
+    Seen live: in SPACE CENTER 1F a Magma grunt on (13,2), in front of the stairs, gave a
+    bare "No path found"; the grunt was a trainer to battle, talk_to(13, 2).
+    """
+    from server.field_control import DIRECTION_DELTAS
+    from utils.mapping.porymap_state import _map_trainers
+
+    porymap = state.get("map", {}).get("porymap", {})
+    # Its own planner: the shared one's last_pushes / last_scene belong to the caller's walk.
+    way = Pathfinder().find_path(start, goal, state, consider_npcs=False, allow_partial=False)
+    if not way:
+        return []
+    standing: Dict[Tuple[int, int], dict] = {}
+    for obj in porymap.get("objects") or []:
+        standing.setdefault((obj.get("x"), obj.get("y")), obj)
+    people = set(standing) | {
+        (o.get("current_x"), o.get("current_y")) for o in porymap.get("runtime_objects") or []
+    }
+    # Trainers by their object (local id, the place in object_events from 1), as they
+    # stand now (objects_where_they_stand moved each object to its live tile).
+    raw_objects = _raw_map_json(map_dir).get("object_events") or [] if map_dir else []
+    trainers = {(x, y): (name, trainer_id) for x, y, name, trainer_id in _map_trainers(map_dir)} if map_dir else {}
+    out, seen = [], set()
+    x, y = start
+    for button in way:
+        dx, dy = DIRECTION_DELTAS.get(button, (0, 0))
+        x, y = x + dx, y + dy
+        if (x, y) not in people or (x, y) in seen or (x, y) == tuple(goal):
+            continue
+        seen.add((x, y))
+        obj = standing.get((x, y)) or {}
+        event_id = obj.get("event_id")
+        home = raw_objects[event_id - 1] if isinstance(event_id, int) and 0 < event_id <= len(raw_objects) else {}
+        trainer = trainers.get((int(home.get("x", -1)), int(home.get("y", -1)))) if home else None
+        graphics = str(obj.get("graphics_id") or "")
+        name = graphics[len("OBJ_EVENT_GFX_"):].replace("_", " ") if graphics.startswith("OBJ_EVENT_GFX_") else "someone"
+        unbeaten = False
+        if trainer is not None:
+            name = trainer[0]
+            try:
+                unbeaten = flag_reader is not None and not flag_reader(TRAINER_FLAGS_START + trainer[1])
+            except Exception as e:  # unreadable: say nothing about a battle
+                logger.debug(f"trainer flag unreadable: {e}")
+        out.append({"x": x, "y": y, "name": name, "trainer": unbeaten})
+    return out
+
+
+def people_note(people: List[dict]) -> str:
+    """The sentences on people_in_the_way's people (the walking tools' coordinates), with
+    a leading space and no closing full stop: the callers' texts go on after it."""
+    if not people:
+        return ""
+    parts = []
+    for p in people:
+        if p["trainer"]:
+            parts.append(
+                f"{p['name']} at ({p['x']},{p['y']}), a trainer not beaten yet: talk_to({p['x']}, {p['y']}) battles them"
+            )
+        else:
+            parts.append(f"{p['name']} at ({p['x']},{p['y']})")
+    return (
+        " Only people block the way: " + "; ".join(parts)
+        + ". Without them a way exists; people may step aside later"
+    )
+
+
 def navigate_to_direct(
     env,
     x,
@@ -726,8 +801,13 @@ def navigate_to_direct(
                 error_msg += f" (distance: {manhattan_dist} tiles - may be too far)"
             if map_data.get("rotating_gates") is not None:
                 error_msg += " (planned through this map's rotating gates as they stand now)"
+            people = people_in_the_way(state, start, goal, _map_source.get("porymap_map_name") or "") if consider_npcs else []
+            error_msg += f".{people_note(people)}." if people else ""
 
-            return {"success": False, "error": error_msg, "target": f"({x}, {y})", "reason": "unreachable"}
+            failed = {"success": False, "error": error_msg, "target": f"({x}, {y})", "reason": "unreachable"}
+            if people:
+                failed["people_in_the_way"] = people
+            return failed
 
         nav_reason_text = f"Navigating from ({start_x}, {start_y}) to ({x}, {y})"
         if nav_reason:
@@ -780,6 +860,11 @@ def navigate_to_direct(
                         "; boulders ('R') may be in the way, and pushing them needs a party Pokémon that "
                         "knows STRENGTH and the Heat Badge"
                     )
+                elif consider_npcs:
+                    people = people_in_the_way(state, start, goal, _map_source.get("porymap_map_name") or "")
+                    result["note"] += "." + people_note(people) if people else ""
+                    if people:
+                        result["people_in_the_way"] = people
 
         return result
     except Exception as e:
@@ -811,6 +896,8 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, liv
         _readable_map_name,
         arrival_only_warps,
         connection_open_span,
+        dive_links,
+        dive_note,
         sign_door_warps,
         warp_entry,
         warp_entry_text,
@@ -863,6 +950,12 @@ def list_map_exits(json_map: dict, porymap_map_name: str, coord_offset=None, liv
             "arrival": warp_arrival(warp),
             # Read from the tile in front, not stepped on (porymap_state.sign_door_warps).
             "sign_door": i in sign_doors,
+        })
+    # Dive down or up (porymap_state.dive_links): planned from the map's Dive spots
+    # (plan_exit_route), taken with the button there (server _use_dive).
+    for link in dive_links(porymap_map_name or ""):
+        exits.append({
+            "kind": "dive", "name": link.name, "label": link.label, "how": dive_note(), "link": link,
         })
     return exits
 
@@ -1185,6 +1278,9 @@ _OBSTACLE_GRAPHICS = ("OBJ_EVENT_GFX_BREAKABLE_ROCK", "OBJ_EVENT_GFX_PUSHABLE_BO
 # are gone for good. Without it every obstacle counts as present: a missing route is
 # better than one through solid rock.
 flag_reader = None
+# var id -> value, installed by the server like flag_reader (scripted_layout reads story
+# vars with it). None: every var is unknown.
+var_reader = None
 
 
 @lru_cache(maxsize=1)
@@ -1462,9 +1558,14 @@ FLY = "FLY"
 # until the next map load clears the flag (src/event_data.c ClearTempFieldEventData).
 STRENGTH = "STRENGTH"
 PUSHABLE_BOULDER = "OBJ_EVENT_GFX_PUSHABLE_BOULDER"
+# Dive needs the Mind Badge both ways: pret src/field_control_avatar.c
+# TrySetupDiveDownScript (A) and TrySetupDiveEmergeScript (B) check FlagGet(FLAG_BADGE07_GET),
+# and their scripts (data/scripts/field_move_scripts.inc EventScript_UseDive,
+# EventScript_UseDiveUnderwater) checkpartymove MOVE_DIVE, which skips eggs.
+DIVE = "DIVE"
 # Every field move the walks use, by the badge number that allows it outside battle.
 FIELD_MOVE_BADGES = {
-    **{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5, FLY: 6, STRENGTH: 4,
+    **{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5, FLY: 6, STRENGTH: 4, DIVE: 7,
 }
 # () -> set of field moves usable now (known by a party Pokémon, badge set), installed by
 # the server. None: no obstacle is clearable and no water crossable.
@@ -1517,6 +1618,13 @@ def can_push_boulders() -> bool:
     """A party Pokémon (not an egg) knows STRENGTH and the Heat Badge is set: A at a
     boulder offers "Would you like to use STRENGTH?" and the walks push boulders."""
     return STRENGTH in _usable_field_moves()
+
+
+def can_dive() -> bool:
+    """A party Pokémon (not an egg) knows DIVE and the Mind Badge is set: A on deep water
+    asks "The sea is deep here. Would you like to use DIVE?", and B underwater "Light is
+    filtering down from above. Would you like to use DIVE?"."""
+    return DIVE in _usable_field_moves()
 
 
 # () -> (map dir the player is on, {local id: tile} of its boulders loaded now
@@ -1643,6 +1751,226 @@ def _script_lines(map_dir: str, label: str) -> List[str]:
     return lines
 
 
+# Script-time constants a condition compares with (pret include/constants/global.h, the
+# YES/NO menu's results).
+_SCRIPT_CONSTANTS = {"TRUE": 1, "FALSE": 0, "YES": 1, "NO": 0}
+# Branches one layout evaluation may follow, and commands per branch, before it gives up
+# (the map file's layout stays): far more than any of pret's transition scripts needs.
+_LAYOUT_MAX_PATHS = 256
+_LAYOUT_MAX_STEPS = 400
+_LAYOUT_TTL_S = 1.0
+_layout_cache: Dict[str, tuple] = {}
+
+
+def scripted_layout(map_dir: str) -> str:
+    """The LAYOUT_* a map is drawn from when the player enters it now, if its
+    MAP_SCRIPT_ON_TRANSITION script swaps one in (`setmaplayoutindex`); "" for the map
+    file's own, or when which one can't be told.
+
+    pret src/overworld.c LoadMapFromWarp runs RunOnTransitionMapScript before InitMap
+    loads gMapHeader.mapLayout, so a layout set there is the one the map is built from;
+    MAP_SCRIPT_ON_LOAD runs inside InitMap, after the layout is loaded. Seen (2026-11-05,
+    from the coordinator): Route131_OnTransition always calls `setmaplayoutindex
+    LAYOUT_ROUTE131_SKY_PILLAR`, where the warp to SKY PILLAR ENTRANCE at (36,6) is a door
+    (MB_NON_ANIMATED_DOOR); in the map file's LAYOUT_ROUTE131 that tile is open sea.
+
+    Every path through the script is followed (call, goto and the call_if_* / goto_if_*
+    branches, falling through labels as the game does), with flags and vars read live
+    (flag_reader, var_reader) and the script's own setflag / setvar applied on the way. A
+    condition that can't be read follows both branches; the answer is the layout every
+    path ends with, else "" (Route130's Mirage Island, a coin flip per day, keeps the map
+    file's). Kept for a second, as the field moves are: route searches ask per map.
+    """
+    import time
+
+    now = time.monotonic()
+    cached = _layout_cache.get(map_dir)
+    if cached is not None and now - cached[0] < _LAYOUT_TTL_S:
+        return cached[1]
+    try:
+        layout = _scripted_layout(map_dir)
+    except Exception as e:  # a script this can't follow: the map file's layout, as before
+        logger.debug(f"layout script of {map_dir} not followed: {e}")
+        layout = ""
+    _layout_cache[map_dir] = (now, layout)
+    return layout
+
+
+def _transition_label(map_dir: str) -> Optional[str]:
+    """The label `map_script MAP_SCRIPT_ON_TRANSITION, <label>` names, or None."""
+    labels, _ = _script_labels(map_dir)
+    for line in labels.get(f"{map_dir}_MapScripts", []):
+        command, _, args = line.partition(" ")
+        parts = [p.strip() for p in args.split(",")]
+        if command == "map_script" and len(parts) == 2 and parts[0] == "MAP_SCRIPT_ON_TRANSITION":
+            return parts[1]
+    return None
+
+
+def _scripted_layout(map_dir: str) -> str:
+    """scripted_layout without the cache."""
+    labels, order = _script_labels(map_dir)
+    start = _transition_label(map_dir)
+    if start is None or not any(
+        line.startswith("setmaplayoutindex") for body in labels.values() for line in body
+    ):
+        return ""
+    ends: set = set()
+    paths = [0]  # one counter, shared: the number of paths started
+
+    def value_of(name: str, known: dict) -> Optional[int]:
+        """A var or constant: what the script set, else live, else None."""
+        name = name.strip()
+        if name in known:
+            return known[name]
+        if name in _SCRIPT_CONSTANTS:
+            return _SCRIPT_CONSTANTS[name]
+        try:
+            return int(name, 0)
+        except ValueError:
+            pass
+        if name.startswith("VAR_TEMP_"):
+            return 0  # pret ClearTempFieldEventData clears them before the transition script
+        var_id = _var_ids().get(name)
+        if var_id is None or var_reader is None or name == "VAR_RESULT":
+            return None
+        try:
+            return var_reader(var_id)
+        except Exception:
+            return None
+
+    def flag_of(name: str, known: dict) -> Optional[bool]:
+        if name in known:
+            return known[name]
+        number = flag_id(name)
+        if number is None or flag_reader is None:
+            return None
+        try:
+            return bool(flag_reader(number))
+        except Exception:
+            return None
+
+    def condition(command: str, args: List[str], known: dict) -> Optional[bool]:
+        """call_if_* / goto_if_*: True, False, or None when it can't be told."""
+        test = command.split("_if_", 1)[1]
+        if test in ("set", "unset"):
+            got = flag_of(args[0], known)
+            return None if got is None else got == (test == "set")
+        if test in ("defeated", "not_defeated"):
+            from utils.mapping.porymap_state import _trainer_ids
+
+            trainer = _trainer_ids().get(args[0])
+            if trainer is None or flag_reader is None:
+                return None
+            try:
+                beaten = bool(flag_reader(TRAINER_FLAGS_START + trainer))
+            except Exception:
+                return None
+            return beaten == (test == "defeated")
+        left, right = value_of(args[0], known), value_of(args[1], known) if len(args) > 1 else None
+        if left is None or right is None:
+            return None
+        return {
+            "eq": left == right, "ne": left != right, "lt": left < right,
+            "le": left <= right, "gt": left > right, "ge": left >= right,
+        }.get(test)
+
+    def run(label: str, index: int, known: dict, layout: str, returns: tuple, steps: int) -> None:
+        while True:
+            if steps > _LAYOUT_MAX_STEPS:
+                ends.add(None)  # can't be told
+                return
+            if label not in labels:
+                # A shared script (data/scripts/*.inc, not read here: Common_EventScript_
+                # SetAbnormalWeather, GabbyAndTy_EventScript_UpdateLocation …) sets no
+                # layout; it may write VAR_RESULT. A call returns, a goto ends there.
+                known = {**known, "VAR_RESULT": None}
+                if not returns:
+                    ends.add(layout)
+                    return
+                (label, index), returns = returns[-1], returns[:-1]
+                continue
+            body = labels[label]
+            if index >= len(body):  # falls through into the next label
+                at = order.index(label) + 1
+                if at >= len(order):
+                    ends.add(layout)
+                    return
+                label, index = order[at], 0
+                continue
+            steps += 1
+            command, _, rest = body[index].partition(" ")
+            args = [a.strip() for a in rest.split(",")] if rest else []
+            index += 1
+            if command == "end" or (command == "return" and not returns):
+                ends.add(layout)
+                return
+            if command == "return":
+                (label, index), returns = returns[-1], returns[:-1]
+                continue
+            if command == "setmaplayoutindex" and args:
+                layout = args[0]
+            elif command in ("setflag", "clearflag") and args:
+                known = {**known, args[0]: command == "setflag"}
+            elif command == "setvar" and len(args) == 2:
+                known = {**known, args[0]: value_of(args[1], known)}
+            elif command == "special" and args and args[0] in _LAYOUT_SPECIALS:
+                known = {**known, **_LAYOUT_SPECIALS[args[0]](lambda n: value_of(n, known), lambda n: flag_of(n, known))}
+            elif command in ("goto", "call") and args:
+                if command == "call":
+                    returns = returns + ((label, index),)
+                label, index = args[-1], 0
+            elif "_if_" in command and command.startswith(("goto_if_", "call_if_")) and args:
+                taken = condition(command, args[:-1], known)
+                branches = [taken] if taken is not None else [True, False]
+                for branch in branches[1:]:
+                    paths[0] += 1
+                    if paths[0] > _LAYOUT_MAX_PATHS:
+                        ends.add(None)
+                        return
+                    if branch:
+                        more = returns + ((label, index),) if command.startswith("call") else returns
+                        run(args[-1], 0, known, layout, more, steps)
+                    else:
+                        run(label, index, known, layout, returns, steps)
+                if branches[0]:
+                    if command.startswith("call"):
+                        returns = returns + ((label, index),)
+                    label, index = args[-1], 0
+            else:
+                # Any other command may write the vars it names (getplayerxy, copyvar,
+                # specialvar …) and VAR_RESULT (checkitem, frontier_checkvisittrainer …).
+                known = {**known, "VAR_RESULT": None, **{a: None for a in args if a.startswith("VAR_")}}
+
+    run(start, 0, {}, "", (), 0)
+    own = str(_raw_map_json(map_dir).get("layout") or "")
+    ends = {"" if end == own else end for end in ends}  # Route130 sets its own layout back
+    if len(ends) != 1 or None in ends:
+        return ""
+    return ends.pop()
+
+
+def _mirage_tower_visibility(var, flag) -> dict:
+    """pret src/mirage_tower.c SetMirageTowerVisibility: hidden for good once
+    VAR_MIRAGE_TOWER_STATE is set, shown when FLAG_FORCE_MIRAGE_TOWER_VISIBLE is, else
+    Random() & 1 (unknown)."""
+    state = var("VAR_MIRAGE_TOWER_STATE")
+    if state:
+        return {"FLAG_MIRAGE_TOWER_VISIBLE": False}
+    if state == 0 and flag("FLAG_FORCE_MIRAGE_TOWER_VISIBLE"):
+        return {"FLAG_MIRAGE_TOWER_VISIBLE": True}
+    return {"FLAG_MIRAGE_TOWER_VISIBLE": None}
+
+
+# Specials a layout script calls that set what its conditions read. UpdateShoalTideFlag
+# (pret src/time_events.c) sets FLAG_SYS_SHOAL_TIDE from the real-time clock's hour as
+# the player enters, so the flag read now may be from another hour: unknown.
+_LAYOUT_SPECIALS = {
+    "SetMirageTowerVisibility": _mirage_tower_visibility,
+    "UpdateShoalTideFlag": lambda var, flag: {"FLAG_SYS_SHOAL_TIDE": None},
+}
+
+
 _PLAYER_IDS = ("LOCALID_PLAYER", "OBJ_EVENT_ID_PLAYER")
 
 
@@ -1723,7 +2051,9 @@ def _walk_areas(map_dir: str) -> dict:
     surfing, cutting, smashing or crossing a wall. Ledges count as two-way here, which
     keeps a route's halves whole for arrived_at; routes use _route_areas.
     """
-    return _walk_areas_without(map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset())
+    return _walk_areas_without(
+        map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), layout=layout_now(map_dir)
+    )
 
 
 # Ledge tiles in the static grid, with the way they can be jumped (pokeemerald
@@ -1741,12 +2071,15 @@ def _route_areas(map_dir: str) -> dict:
     When the party can Surf (can_surf), water is part of the areas too: it joins the
     shores it can be surfed from and landed on (pathfinding.water_step).
     """
-    return _walk_areas_without(map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True, can_surf())
+    return _walk_areas_without(
+        map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True, can_surf(), layout_now(map_dir)
+    )
 
 
 @lru_cache(maxsize=None)
 def _walk_areas_without(
-    map_dir: str, obstacles: frozenset, ledges_are_walls: bool = False, surf: bool = False
+    map_dir: str, obstacles: frozenset, ledges_are_walls: bool = False, surf: bool = False,
+    layout: Optional[str] = None,
 ) -> dict:
     """The areas are flooded with the tile planner's own steps (pathfinding.walk_steps):
     collision bits, and the walker's elevation carried from tile to tile (pret
@@ -1759,24 +2092,30 @@ def _walk_areas_without(
     shore onto water Surf can start on and back, water to water, and under a bridge
     (elevation 15, which keeps the surfer's elevation). A bridge tile is labelled with the
     land it carries when a walker reaches it; a surfer passes under it in the water's area.
+
+    layout: the LAYOUT_* the map is drawn from ("" the map file's; None, the one it is
+    drawn from now, layout_now). Part of the cache's key: a story
+    step can change it (SKY PILLAR's floors are swapped for their _CLEAN layouts only
+    while VAR_SKY_PILLAR_STATE is below 2).
     """
     from utils.mapping.pathfinding import (
         BRIDGE_ELEVATION, PASSABLE_WITH_COLLISION, WATER_ELEVATION, is_surf_water, walk_steps,
     )
-    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid, _static_tiles, fall_tiles
+    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_build_on, fall_tiles
 
-    grid = _static_grid(map_dir) if map_dir else None
+    built = _static_build_on(map_dir, layout_now(map_dir) if layout is None else layout) if map_dir else (None, ())
+    grid = built[0]
     if not grid:
         return {}
     # A tile that drops the walker to the floor below is no floor to walk across; the
     # drop is a way of its own (_fall_exits).
-    obstacles = obstacles | fall_tiles(map_dir, _static_tiles(map_dir))
+    obstacles = obstacles | fall_tiles(map_dir, built[1])
     grid = [
         "".join("#" if (x, y) in obstacles else cell for x, cell in enumerate(row))
         for y, row in enumerate(grid)
     ] if obstacles else grid
     walls = set(_EDGE_BLOCKED) | (set(_LEDGE_STEPS) if ledges_are_walls else set())
-    tiles = _static_tiles(map_dir)
+    tiles = built[1]
     if len(tiles) != len(grid) or any(len(a) != len(b) for a, b in zip(tiles, grid)):
         tiles = ()  # no tiles to check: walls by symbol only, no elevation
 
@@ -2040,6 +2379,152 @@ def _fall_exits_with(map_dir: str, surf: bool) -> tuple:
     return tuple(sorted(out))
 
 
+def dive_spots(map_dir: str) -> tuple:
+    """((DiveLink, tile Dive is taken from, tile it lands on), ...) for the map's Dive links
+    (porymap_state.dive_links), from every tile the walks reach (_route_areas)."""
+    return _dive_spots_with(map_dir, can_surf())
+
+
+@lru_cache(maxsize=None)
+def _dive_spots_with(map_dir: str, surf: bool) -> tuple:
+    """dive_spots, kept per Surf ability: the areas it reads (_route_areas) change with it.
+
+    Down: a tile A dives from (pathfinding.is_diveable, by the decomp's own layout: the
+    walks' tiles are the same there) that a surfer reaches. Up: a walkable underwater tile
+    B surfaces from (pathfinding.can_emerge, by the layout: the walks' underwater tiles
+    are plain floor, porymap_json_builder.underwater_floor). Never a warp tile, which is no
+    place to stop. Landing on the same coordinates (a connection), the landing must be a
+    tile the walks know there: underwater floor; going up, water the game dives from
+    again. pret checks neither (SetDiveWarp warps to x, y), but the underwater maps mark
+    every tile without deep water above as MB_NO_SURFACING, and a landing the planner
+    could not walk on is never chosen."""
+    from utils.mapping.pathfinding import can_emerge, is_diveable
+    from utils.mapping.porymap_state import dive_links, layout_tiles
+
+    links = dive_links(map_dir)
+    if not links:
+        return ()
+    tiles, areas = layout_tiles(map_dir), _route_areas(map_dir)
+    warps = {(int(w.get("x", -1)), int(w.get("y", -1))) for w in _raw_map_json(map_dir).get("warp_events") or []}
+    out = []
+    for link in links:
+        dest_tiles, dest_areas = layout_tiles(link.dest), _route_areas(link.dest)
+        for (x, y) in areas:
+            if (x, y) in warps or not (0 <= y < len(tiles) and 0 <= x < len(tiles[y])):
+                continue
+            if not (is_diveable(tiles[y][x]) if link.button == "A" else can_emerge(tiles[y][x])):
+                continue
+            landing = link.tile or (x, y)
+            if link.tile is None:
+                if landing not in dest_areas:
+                    continue
+                if link.button == "B" and not (
+                    0 <= y < len(dest_tiles) and 0 <= x < len(dest_tiles[y]) and is_diveable(dest_tiles[y][x])
+                ):
+                    continue
+            out.append((link, (x, y), landing))
+    return tuple(out)
+
+
+def _dive_exits(map_dir: str) -> tuple:
+    """_walk_exits' shape for the map's Dive links while the party can Dive (can_dive):
+    the exit argument is the map dived to, as the EXITS line names it."""
+    if not can_dive():
+        return ()
+    return _dive_exits_with(map_dir, can_surf())
+
+
+@lru_cache(maxsize=None)
+def _dive_exits_with(map_dir: str, surf: bool) -> tuple:
+    """_dive_exits, kept per Surf ability (dive_spots)."""
+    here = _route_areas(map_dir)
+    out = set()
+    for link, tile, landing in _dive_spots_with(map_dir, surf):
+        for area in _areas_at(link.dest, landing[0], landing[1], _route_areas(link.dest)):
+            out.add((here[tile], link.name, link.dest, area, link.name))
+    return tuple(sorted(out))
+
+
+def _step_distances(map_dir: str, sources, surf: bool) -> Dict[Tuple[int, int], int]:
+    """Steps from the nearest of `sources` to every tile of the map a walk reaches
+    (pathfinding.walk_steps, the floods' rules; ledges as walls, so it never counts a jump
+    the wrong way). Measures which Dive spot is nearest the way on; not a walk plan."""
+    from collections import deque
+
+    from utils.mapping.pathfinding import walk_steps
+    from utils.mapping.porymap_state import _EDGE_BLOCKED, _static_grid, _static_tiles
+
+    grid, tiles = _static_grid(map_dir), _static_tiles(map_dir)
+    if not grid or not tiles:
+        return {}
+    walls = set(_EDGE_BLOCKED) | set(_LEDGE_STEPS)
+    # Breadth-first over (tile, the walker's elevation there): one tile can be reached at
+    # two elevations (a bridge), and only one of them may lead on.
+    steps: Dict[tuple, int] = {}
+    queue = deque()
+    for x, y in sources:
+        if 0 <= y < len(grid) and 0 <= x < len(grid[y]) and (x, y, None) not in steps:
+            steps[(x, y, None)] = 0
+            queue.append((x, y, None))
+    while queue:
+        state = queue.popleft()
+        for there in walk_steps(tiles, grid, *state, surf, walls):
+            if there not in steps:
+                steps[there] = steps[state] + 1
+                queue.append(there)
+    dist: Dict[Tuple[int, int], int] = {}
+    for (x, y, _), n in steps.items():
+        dist[(x, y)] = min(n, dist.get((x, y), n))
+    return dist
+
+
+def _dive_spot_order(
+    map_dir: str, link, start: Tuple[int, int], then: str = ""
+) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """[(spot, landing), ...] of a Dive link (dive_spots) the player at start (map
+    coordinates) can reach, best first: the fewest steps to the spot plus, when `then`
+    names the next exit on the map dived to, from the landing to that exit (_step_distances
+    both, so a landing walled off from it comes last).
+
+    Seen live: by hand, the way from ROUTE 128 to SEAFLOOR CAVERN ENTRANCE dived at
+    (38,27), the deep water nearest UNDERWATER ROUTE 128's warp at (38,26); the AI had
+    pressed A at (25,0), far from it (and on water no Dive starts from).
+    """
+    spots = [(tile, landing) for each, tile, landing in dive_spots(map_dir) if each == link]
+    if not spots:
+        return []
+    here = _step_distances(map_dir, [start], can_surf())
+    goal = exit_tiles(link.dest, then) if then else []
+    there = _step_distances(link.dest, goal, can_surf()) if goal else {}
+    far = len(here) + len(there) + 1  # more steps than any way has: the landing can't reach it
+    ranked = sorted(
+        (here[tile] + (there.get(landing, far) if goal else 0), tile, landing)
+        for tile, landing in spots if tile in here
+    )
+    return [(tile, landing) for _, tile, landing in ranked]
+
+
+def exit_tiles(map_dir: str, exit_arg: str) -> List[Tuple[int, int]]:
+    """The tiles a go_to_exit(exit_arg) on map_dir is taken from (map coordinates): a
+    warp's tile, an edge's standable tiles, a Dive link's spots; [] when none matches."""
+    from server.field_control import edge_candidates, match_exits
+    from utils.mapping.porymap_state import _static_grid
+
+    raw = _raw_map_json(map_dir)
+    if not raw:
+        return []
+    grid = _static_grid(map_dir) or []
+    out: List[Tuple[int, int]] = []
+    for exit_entry in match_exits(list_map_exits(raw, map_dir), exit_arg):
+        if exit_entry["kind"] == "warp":
+            out.append((exit_entry["x"], exit_entry["y"]))
+        elif exit_entry["kind"] == "edge":
+            out.extend(edge_candidates(grid, exit_entry["direction"], surf=can_surf()))
+        elif exit_entry["kind"] == "dive":
+            out.extend(tile for link, tile, _ in dive_spots(map_dir) if link.label == exit_entry["label"])
+    return out
+
+
 def _downhill(map_dir: str, area: int) -> set:
     """The areas of a map reachable on foot from `area`: itself and every area below a
     ledge from it (one-way jumps; _ledge_jumps)."""
@@ -2217,9 +2702,16 @@ def arrived_at(location_name: str, position: Optional[Tuple[int, int]], target: 
         return False
     if not here.endswith(wanted) and not _names_same_place(location_name, " ".join(words[:-1] if half else words)):
         return False
+    map_dir = ROM_TO_PORYMAP_MAP.get(location_name, "")
+    # Every MAP_TYPE_UNDERWATER map is named UNDERWATER … (ABANDONED SHIP UNDERWATER1 too),
+    # and a target that doesn't say so is the map above. Seen in a test: go_to("ROUTE
+    # 128") from UNDERWATER ROUTE 128 answered "You are already on UNDERWATER ROUTE 128".
+    if _raw_map_json(map_dir).get("map_type") == "MAP_TYPE_UNDERWATER" and not any(
+        "UNDERWATER" in word for word in _place_words(target)
+    ):
+        return False
     if half is None:
         return True
-    map_dir = ROM_TO_PORYMAP_MAP.get(location_name, "")
     areas = _walk_areas(map_dir)
     mine = _areas_at(map_dir, *position) if position is not None else set()
     if len(mine) != 1 or not areas:
@@ -2333,9 +2825,11 @@ def _walk_paths(
             break  # the goal's nearest areas: no way through more exits is wanted
         nxt = []
         for node in frontier:
-            for from_area, exit_arg, dest, dest_area, name in (
-                _walk_exits(node[0]) + (_ride_exits(node[0]) if rides else ()) + (_fall_exits(node[0]) if falls else ())
-            ):
+            ways = (
+                _walk_exits(node[0]) + _dive_exits(node[0]) + (_ride_exits(node[0]) if rides else ())
+                + (_fall_exits(node[0]) if falls else ())
+            )
+            for from_area, exit_arg, dest, dest_area, name in ways:
                 target = (dest, dest_area)
                 if from_area != node[1] or target in parent:
                     continue
@@ -2438,6 +2932,8 @@ def _exit_distance(map_dir: str, position: Tuple[int, int], exit_arg: str) -> in
         name = _readable_map_name(warp.get("dest_map", ""))
         if exit_arg in (name, f"{name} ({wx}, {wy})"):
             spots.append(abs(wx - x) + abs(wy - y))
+    # A Dive link (_dive_exits) is taken from its nearest spot.
+    spots.extend(abs(tx - x) + abs(ty - y) for link, (tx, ty), _ in dive_spots(map_dir) if link.name == exit_arg)
     return min(spots, default=0)
 
 
@@ -3220,17 +3716,44 @@ def fly_plan(
 
 def note_live_layout(reader) -> None:
     """Tell the route planner which layout the player's map is drawn from now
-    (porymap_state.note_layout; dynamic_map_overlay.swapped_layout reads it from the save),
-    and forget the areas planned from another one. Caller holds the emulator lock."""
+    (porymap_state.note_layout; dynamic_map_overlay.swapped_layout reads it from the save):
+    ground truth for that map, over its script (scripted_layout). layout_now then forgets
+    what was planned from another layout. Caller holds the emulator lock."""
     from utils.mapping.dynamic_map_overlay import swapped_layout
     from utils.mapping.porymap_state import decomp_map_at, note_layout
 
     found = decomp_map_at(*reader._read_current_map())
     if found is None:
         return
-    if note_layout(found[0], (swapped_layout(reader) or {}).get("id", "")):
-        for cached in (_walk_areas_without, _edge_dead_ends_with, _ride_exits_with, _fall_exits_with, _puzzle_plan):
+    note_layout(found[0], (swapped_layout(reader) or {}).get("id", ""))
+    layout_now(found[0])
+
+
+# {map dir: the layout it was last planned from} (layout_now).
+_planned_layouts: Dict[str, str] = {}
+
+
+def layout_now(map_dir: str) -> str:
+    """The LAYOUT_* a map is planned from now ("" for its map file's own): the game's own
+    for the player's map (porymap_state.live_layout, noted by note_live_layout), else the
+    one its transition script swaps in (scripted_layout). Every map built from the decomp
+    asks here (porymap_state.map_layout_now), so when a map's layout changes this is the
+    one place the plans made from the old one are forgotten: the caches below are keyed by
+    map and Surf, not by layout."""
+    from utils.mapping.porymap_state import live_layout
+
+    if not map_dir:
+        return ""
+    live = live_layout(map_dir)
+    layout = live if live is not None else scripted_layout(map_dir)
+    if _planned_layouts.get(map_dir, "") != layout:
+        for cached in (
+            _walk_areas_without, _edge_dead_ends_with, _ride_exits_with, _fall_exits_with, _puzzle_plan,
+            _dive_spots_with, _dive_exits_with,
+        ):
             cached.cache_clear()
+    _planned_layouts[map_dir] = layout
+    return layout
 
 
 def _live_tile_reader(env):
@@ -3253,7 +3776,7 @@ def _live_tile_reader(env):
     return tile
 
 
-def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: Tuple = ()) -> dict:
+def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: Tuple = (), then: str = "") -> dict:
     """Resolve an EXITS entry to a walkable route (caller holds the emulator lock).
 
     Edge exits: the reachable standable tile on that edge nearest the player, then one
@@ -3266,6 +3789,11 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
 
     avoid: map tiles (raw map coordinates) to treat as blocked, e.g. where a person
     stopped the last walk.
+
+    Dive links (kind "dive"): a Dive spot (dive_spots) to stand on, and "press", the button
+    that dives there (A down, B up). then: the go_to_exit argument the way takes next, on
+    the map dived to (go_to's next step); the spot is the one whose landing is nearest
+    it, counting the steps to the spot as well (_dive_spot_order).
     """
     from server.field_control import (
         DIRECTION_DELTAS,
@@ -3325,6 +3853,36 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
     # go_to_exit walks through the floor switches to them (server/app.py _cross_to).
     targets: list = []
     for exit_entry in matches:
+        if exit_entry["kind"] == "dive":
+            link = exit_entry["link"]
+            if not can_dive():
+                tried.append(
+                    f"{exit_entry['label']}: no party Pokémon can use DIVE now (it needs a Pokémon that knows "
+                    "DIVE, taught with HM08, and the Mind Badge)"
+                )
+                continue
+            map_dir = source.get("porymap_map_name") or ""
+            raw_start = (start[0] + ox, start[1] + oy)
+            order = _dive_spot_order(map_dir, link, raw_start, then)
+            if not order:
+                tried.append(f"{exit_entry['label']}: no tile here to use DIVE from can be reached")
+                continue
+            for raw_tile, landing in order[:max_edge_candidates]:
+                tile = (raw_tile[0] - ox, raw_tile[1] - oy)
+                targets.append(tile)
+                buttons = route_to(tile)
+                if buttons is None:
+                    continue
+                if best is None or len(buttons) < len(best["buttons"]):
+                    best = {
+                        "kind": "dive", "label": exit_entry["label"], "to": exit_entry["name"],
+                        "target": tile, "buttons": buttons, "final_button": None,
+                        "press": link.button, "landing": landing,
+                    }
+                break
+            else:
+                tried.append(f"{exit_entry['label']}: no walkable path to a tile to use DIVE from, from {start}")
+            continue
         if exit_entry["kind"] == "edge":
             candidates = edge_candidates(grid, exit_entry["direction"], surf=surf)
             span = exit_entry.get("open_span")
@@ -3400,8 +3958,10 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
             "error": (
                 f"Cannot reach '{exit_query}' from ({pos.get('x')}, {pos.get('y')}) on {location}: "
                 + "; ".join(tried)
-                # With Surf the plan crosses water already: water is no reason then.
-                + (". A ledge (one-way) or a person may be in the way." if surf
+                # Dive alone, without the move or badge: nothing on the way is to blame.
+                + ("." if not can_dive() and all(e["kind"] == "dive" for e in matches)
+                   # With Surf the plan crosses water already: water is no reason then.
+                   else ". A ledge (one-way) or a person may be in the way." if surf
                    else ". A ledge (one-way), water (needs Surf) or a person may be in the way.")
                 + (" This map's floor switches move its statues, and no way through them was found either."
                    if puzzle else "")

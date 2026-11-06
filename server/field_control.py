@@ -551,6 +551,12 @@ def _integers_in(text: str) -> List[int]:
     return numbers
 
 
+_DIVE_WORDS = {
+    "DIVE": "A", "DIVEDOWN": "A", "USEDIVE": "A",
+    "SURFACE": "B", "EMERGE": "B", "DIVEUP": "B",
+}
+
+
 def match_exits(exits: List[Dict], query: str) -> List[Dict]:
     """Exits that ``query`` names, best matches first.
 
@@ -589,6 +595,9 @@ def match_exits(exits: List[Dict], query: str) -> List[Dict]:
     if stripped in _DIRECTION_WORDS:
         wanted_dir = _DIRECTION_WORDS[stripped]
         return [e for e in exits if e["kind"] == "edge" and e["direction"] == wanted_dir]
+    # The move by name: "dive" (down, A) or "surface" (up, B), as the EXITS line says it.
+    if stripped in _DIVE_WORDS:
+        return [e for e in exits if e["kind"] == "dive" and e["link"].button == _DIVE_WORDS[stripped]]
 
     exact = [e for e in exits if normalize_name(e["name"]) == wanted]
     if exact:
