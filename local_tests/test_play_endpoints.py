@@ -136,6 +136,119 @@ def test_the_page_and_its_renderers_are_served():
     assert js.media_type == "application/javascript" and b"renderFeed" in js.body
 
 
+# The macro hold is at the HTTP edge (server/app.py MacroHoldMiddleware), so these tests
+# talk to the app over ASGI as /play and curl do, on one event loop as under uvicorn.
+ROUTE101 = HERE / "test_movement_route101.state"
+WALK = {"place": "Oldale Town Pokemon Center", "reasoning": "test"}
+
+
+def _client(s):
+    import httpx
+
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=s.srv.app), base_url="http://play", timeout=300)
+
+
+async def _until_macro_presses(s, timeout=20.0):
+    """Wait for the macro's first press of its own, read from the sequence reports (not
+    /macro_status), so a server without the hold still gets the outside press mid-macro."""
+    first = max(s.srv.sequence_reports, default=0)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if max(s.srv.sequence_reports, default=0) > first:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the macro never pressed a button")
+
+
+def _manual_sequences(s):
+    return [r for r in s.srv.sequence_reports.values() if r.get("source") == "manual"]
+
+
+def test_a_press_from_play_is_refused_while_a_macro_runs():
+    """Seen live (2026-11-05, Elite Four): use_item("REVIVE", "MANECTRIC") failed with
+    "Could not put the START menu cursor on BAG": a fast A from the /play page landed
+    mid-macro. go_to from ROUTE 101 to OLDALE TOWN's Pokémon Center is a long macro
+    with helper macros inside it (navigate_to, go_to_exit): while it runs, /play's press
+    (/action, source "manual") and an operator's press_buttons are refused with a message
+    naming go_to, nothing of theirs is queued, pause and status still answer, and the
+    walk arrives as it does alone (test_macros test_go_to_walks_map_after_map). After it,
+    /action presses again, and the feed has the macro's start and end."""
+    s = server()
+    s.load(ROUTE101, wild_encounters=False)
+
+    async def scenario():
+        async with _client(s) as client:
+            walk = asyncio.create_task(client.post("/mcp/go_to", json=WALK))
+            try:
+                await _until_macro_presses(s)
+                before = len(_manual_sequences(s))
+                press = await client.post("/action", json={"buttons": ["A"], "speed": "fast", "source": "manual"})
+                operator = await client.post("/mcp/press_buttons", json={"buttons": ["B"], "source": "implementor"})
+                queued = len(_manual_sequences(s)) - before
+                status = await client.get("/macro_status")
+                health = (await client.get("/health")).json()
+                pause = await client.post("/agent_pause", json={"paused": False, "source": "test"})
+                feed = await client.get("/ai_feed")
+            finally:
+                walked = (await walk).json()
+            after = await client.post("/action", json={"buttons": ["B"], "speed": "fast", "source": "manual"})
+            idle = (await client.get("/macro_status")).json()
+            events = (await client.get("/ai_feed")).json()["events"]
+            return press, operator, queued, status, health, pause, feed, walked, after, idle, events
+
+    press, operator, queued, status, health, pause, feed, walked, after, idle, events = asyncio.run(scenario())
+    print("   ", press.status_code, press.text[:200])
+    print("   ", walked.get("summary") or walked)
+    assert press.status_code == 409, (press.status_code, press.text)
+    assert queued == 0, f"{queued} refused press(es) reached the button queue"
+    assert press.json()["error"].startswith("a macro (go_to) is running; try again when it ends."), press.json()
+    assert press.json()["macro"]["tool"] == "go_to", press.json()
+    assert operator.status_code == 409 and "go_to" in operator.json()["error"], (operator.status_code, operator.text)
+    assert status.status_code == 200, (status.status_code, status.text)
+    status = status.json()
+    assert status["running"] and status["tool"] == "go_to" and status["since"] and status["refused"] == 2, status
+    assert health["macro"]["running"] and health["macro"]["tool"] == "go_to", health
+    assert pause.status_code == 200 and feed.status_code == 200, (pause.status_code, feed.status_code)
+    assert walked["success"] is True and walked["status"] == "ARRIVED", walked
+    assert s.srv._location_name() == "OLDALE TOWN POKEMON CENTER 1F", s.srv._location_name()
+    assert after.status_code == 200 and after.json()["status"] == "success", (after.status_code, after.text)
+    assert idle == {"running": False, "tool": None, "since": None, "elapsed_s": None, "refused": 0, "forced": 0}, idle
+    start = next(e for e in events if e["kind"] == "macro_start")
+    end = next(e for e in events if e["kind"] == "macro_end")
+    assert events.index(end) < events.index(start), events  # newest first
+    assert start["source"] == end["source"] == "go_to", (start, end)
+    assert "2 press request(s) from other clients refused" in end["text"], end
+
+
+def test_force_presses_through_a_macro_hold():
+    """An operator's emergency: "force": true on /action goes through while go_to holds
+    the buttons, and is counted in /macro_status."""
+    s = server()
+    s.load(ROUTE101, wild_encounters=False)
+
+    async def scenario():
+        async with _client(s) as client:
+            walk = asyncio.create_task(client.post("/mcp/go_to", json=WALK))
+            try:
+                await _until_macro_presses(s)
+                before = len(_manual_sequences(s))
+                # B does nothing on its own in the overworld, so the walk can go on.
+                forced = await client.post("/action", json={"buttons": ["B"], "speed": "fast", "source": "manual", "force": True})
+                queued = len(_manual_sequences(s)) - before
+                status = await client.get("/macro_status")
+            finally:
+                await walk
+            return forced, queued, status
+
+    forced, queued, status = asyncio.run(scenario())
+    print("   ", forced.status_code, status.text)
+    assert forced.status_code == 200 and forced.json()["status"] == "success", (forced.status_code, forced.text)
+    assert queued == 1, queued
+    assert status.status_code == 200, (status.status_code, status.text)
+    status = status.json()
+    assert status["running"] and status["tool"] == "go_to" and status["forced"] == 1, status
+
+
 def _run_all():
     import test_movement_feedback as harness
 

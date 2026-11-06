@@ -581,6 +581,171 @@ app = FastAPI(
     version="3.0.0-preview",
 )
 
+
+### MACRO HOLD (local addition) ###
+# Seen live (2026-11-05, Elite Four): use_item("REVIVE", "MANECTRIC") failed with "Could
+# not put the START menu cursor on BAG": a fast A from the /play page landed mid-macro.
+# Every client shares one button queue (the agent's tools, /play through /action, an
+# operator's curl), and a macro reads the screen between its own presses, so one press
+# from elsewhere sends the rest of its sequence to the wrong menu.
+#
+# While a pressing tool runs, presses that arrive over HTTP from anyone else are refused
+# with 409 and a message naming the tool. Refused, not queued: a press queued until the
+# macro ends would land on whatever screen the macro left, seconds after the person
+# pressed it, which is the same surprise one step later. A refused press is visible at
+# once and can be pressed again.
+#
+# The hold lives at the HTTP edge, so a macro can never meet its own hold: its presses
+# and the helper macros it calls (go_to -> navigate_to -> go_to_exit, train ->
+# heal_at_pokecenter, use_move) are Python calls to take_action and the mcp_* functions,
+# never requests, whatever task or thread they press from (auto_advance_dialogue presses
+# from a worker thread). "force": true in a request's JSON body goes through anyway, for
+# emergencies.
+
+# The agent's macros (agents/PokeAgent.py MACRO_TOOLS). They also mark their start and
+# end in the /play feed; the per-step pressing tools below hold too, but each step is
+# already a feed row of its own, and two more rows for every step would bury the rest.
+MACRO_FEED_TOOLS = (
+    "heal_at_pokecenter", "run_from_battle", "throw_ball", "switch_pokemon", "buy_item", "train", "talk_to", "go_to",
+    "teach_move", "set_lead", "give_item", "use_item", "deposit_pokemon", "withdraw_pokemon", "fly_to",
+    "rematch_loop",
+)
+# Every route that presses a sequence and answers once it ran: path -> tool name.
+MACRO_HOLD_PATHS = {
+    **{f"/mcp/{name}": name for name in MACRO_FEED_TOOLS},
+    **{f"/mcp/{name}": name for name in ("press_buttons", "navigate_to", "go_to_exit", "use_move", "auto_advance_dialogue")},
+    "/harness_step": "harness_step",
+    "/maintain_party": "maintain_party",
+}
+# Presses that are refused during a hold but never take one: /action queues and answers
+# at once, so there is no sequence of its own to protect.
+OUTSIDE_PRESS_PATHS = ("/action",)
+MACRO_EVENTS_KEPT = 10
+
+_macro_hold: Dict[str, Any] = {"tool": None, "since": None, "started": None, "refused": 0, "forced": 0}
+# Macro start/end rows for /ai_feed, kept apart from _pause_events so a run of macros
+# never pushes a pause or a model switch out of the feed.
+_macro_events: List[Dict[str, Any]] = []
+
+
+def macro_status() -> Dict[str, Any]:
+    """The hold, for /macro_status, /health and the 409 body."""
+    tool = _macro_hold["tool"]
+    return {
+        "running": tool is not None,
+        "tool": tool,
+        "since": _macro_hold["since"],
+        "elapsed_s": round(time.monotonic() - _macro_hold["started"], 1) if tool is not None else None,
+        "refused": _macro_hold["refused"],
+        "forced": _macro_hold["forced"],
+    }
+
+
+def _macro_event(kind: str, tool: str, text: str) -> None:
+    _macro_events.append({"time": datetime.datetime.utcnow().isoformat(), "kind": kind, "source": tool, "text": text})
+    del _macro_events[:-MACRO_EVENTS_KEPT]
+
+
+def _start_macro_hold(tool: str) -> None:
+    _macro_hold.update(tool=tool, since=datetime.datetime.utcnow().isoformat(), started=time.monotonic(), refused=0, forced=0)
+    if tool in MACRO_FEED_TOOLS:
+        _macro_event("macro_start", tool, f"{tool} is running: presses from other clients are refused until it ends.")
+
+
+def _end_macro_hold() -> None:
+    tool = _macro_hold["tool"]
+    if tool in MACRO_FEED_TOOLS:
+        text = f"{tool} ended after {time.monotonic() - _macro_hold['started']:.1f}s."
+        if _macro_hold["refused"]:
+            text += f" {_macro_hold['refused']} press request(s) from other clients refused."
+        if _macro_hold["forced"]:
+            text += f" {_macro_hold['forced']} forced through."
+        _macro_event("macro_end", tool, text)
+    _macro_hold.update(tool=None, since=None, started=None, refused=0, forced=0)
+
+
+async def _buffered_body(receive):
+    """The request body, and a receive() that replays it to the app; None if the client
+    went away first."""
+    chunks = []
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":
+            return None, receive
+        chunks.append(message.get("body", b""))
+        if not message.get("more_body"):
+            break
+    body = b"".join(chunks)
+    replayed = False
+
+    async def replay():
+        nonlocal replayed
+        if replayed:
+            return await receive()
+        replayed = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return body, replay
+
+
+def _request_fields(body: bytes) -> Dict[str, Any]:
+    try:
+        fields = json.loads(body or b"null")
+    except ValueError:
+        return {}
+    return fields if isinstance(fields, dict) else {}
+
+
+class MacroHoldMiddleware:
+    """Plain ASGI, not BaseHTTPMiddleware: every other route, the frame stream and the
+    websockets pass straight through untouched."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path") if scope["type"] == "http" and scope.get("method") == "POST" else None
+        tool = MACRO_HOLD_PATHS.get(path)
+        if tool is None and path not in OUTSIDE_PRESS_PATHS:
+            await self.app(scope, receive, send)
+            return
+        if _macro_hold["tool"] is None:
+            if tool is None:
+                await self.app(scope, receive, send)
+                return
+            # No await between the check above and taking the hold: on the one event
+            # loop, two macros arriving together can't both take it.
+            _start_macro_hold(tool)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _end_macro_hold()
+            return
+        body, receive = await _buffered_body(receive)
+        if body is None:
+            return
+        fields = _request_fields(body)
+        holder = _macro_hold["tool"]
+        if fields.get("force") is True:
+            _macro_hold["forced"] += 1
+            logger.warning(f"macro hold: {path} from {fields.get('source') or 'unknown'} forced through while {holder} runs")
+            await self.app(scope, receive, send)
+            return
+        _macro_hold["refused"] += 1
+        message = (
+            f"a macro ({holder}) is running; try again when it ends. A press now would land in "
+            f"the middle of its own presses. Send \"force\": true to press anyway (emergencies only)."
+        )
+        logger.info(f"macro hold: refused {path} from {fields.get('source') or 'unknown'} while {holder} runs")
+        response = JSONResponse(
+            status_code=409, content={"success": False, "error": message, "summary": message, "macro": macro_status()}
+        )
+        await response(scope, receive, send)
+
+
+# Added before CORS so CORS stays outermost and a 409 still carries its headers.
+app.add_middleware(MacroHoldMiddleware)
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -603,6 +768,9 @@ class ActionRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     # Judge each direction press and stop the call's sequence when one is blocked.
     check_movement: bool = False
+    # Press even while a macro holds the buttons (MacroHoldMiddleware reads it from the
+    # request body; declared so /docs shows it). Emergencies only.
+    force: bool = False
 
 
 class GameStateResponse(BaseModel):
@@ -1541,7 +1709,17 @@ async def get_health():
                 "timestamp": now,
             },
         )
-    return {"status": "healthy", "last_frame_age_s": round(frame_age, 3), "timestamp": now, "server_id": SERVER_ID}
+    return {
+        "status": "healthy", "last_frame_age_s": round(frame_age, 3), "timestamp": now, "server_id": SERVER_ID,
+        "macro": macro_status(),  # the /play page polls /health already
+    }
+
+
+@app.get("/macro_status")
+async def get_macro_status():
+    """Whether a macro holds the buttons (MacroHoldMiddleware): {running, tool, since,
+    elapsed_s, refused, forced}."""
+    return macro_status()
 
 
 # Local addition: lets a human pause the autonomous agent (agents/PokeAgent.py waits
@@ -1654,7 +1832,7 @@ def _step_result(prompt: str) -> Tuple[Optional[str], Optional[bool]]:
 async def get_ai_feed():
     """Read-only: the agent's last steps for the controller page (reasoning, the call,
     its result, how long the step took), the step being thought about now, and
-    pause/resume events.
+    pause/resume, backend and macro start/end events.
 
     David (2026-11-04): "it would be cool to be able to see what the LLM is doing".
     Read from the trajectory file's end; nothing here touches the emulator.
@@ -1710,7 +1888,9 @@ async def get_ai_feed():
         "paused": paused,
         "in_flight": in_flight,
         "steps": list(reversed(steps[-AI_FEED_STEPS:])),
-        "events": list(reversed(_pause_events)),
+        # Newest first; each list is reversed first so rows logged in the same instant
+        # keep newest-first order (the sort is stable).
+        "events": sorted([*reversed(_pause_events), *reversed(_macro_events)], key=lambda e: e["time"], reverse=True),
     }
 
 
