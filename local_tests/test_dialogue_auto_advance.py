@@ -64,7 +64,11 @@ def test_reads_a_multi_box_dialogue_to_the_end():
     said = " ".join(r["texts"])
     assert "take your" in said and "restored your" in said and "see you again" in said, r
     assert r["final_status"] == "none", r
-    assert r["presses"] >= 3 and not r["capped"], r
+    # Two As: the arrow after "…to full health." and the one on "We hope to see you
+    # again!" ("Okay, I'll take…" goes on to the healing by itself). This said >= 3 when
+    # As on printing text were counted too; those took 13-15 presses and under load hit
+    # the cap of 15.
+    assert 2 <= r["presses"] <= 4 and not r["capped"], r
 
 
 def test_single_box_dialogue_is_read_and_closed():
@@ -222,6 +226,39 @@ def test_cap_limits_presses():
         max_presses=7,
     )
     assert result.presses == 7 and len(presses) == 7 and result.capped
+
+
+def test_a_is_pressed_only_once_the_box_waits_for_it():
+    """A box prints for a while, then shows its arrow; a second box then closes. The only
+    As are the two on an arrow: while text prints an A only hurries it, and under load
+    those presses used up the nurse's cap (test_reads_a_multi_box_dialogue_to_the_end)."""
+    from server.field_control import DIALOGUE_NONE, DIALOGUE_PLAIN, auto_advance_dialogue
+
+    clock = {"settles": 0, "boxes": 2, "printed_at": 5}
+    presses = []
+
+    def status():
+        return DIALOGUE_PLAIN if clock["boxes"] else DIALOGUE_NONE
+
+    def settle():
+        clock["settles"] += 1
+
+    def press_a():
+        presses.append(clock["settles"])
+        clock["boxes"] -= 1
+        clock["printed_at"] = clock["settles"] + 5
+
+    result = auto_advance_dialogue(
+        status=status,
+        read_text=lambda: f"box {clock['boxes']}",
+        press_a=press_a,
+        settle=settle,
+        max_presses=3,
+        waits_for_a=lambda: clock["settles"] >= clock["printed_at"],
+    )
+    assert result.presses == 2 and result.final_status == DIALOGUE_NONE and not result.capped, result
+    assert presses == [5, 10], presses
+    assert result.texts == ["box 2", "box 1"], result
 
 
 def _run_all():

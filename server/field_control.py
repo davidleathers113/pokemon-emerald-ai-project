@@ -531,6 +531,8 @@ def auto_advance_dialogue(
     settle: Callable[[], None],
     max_presses: int = 15,
     max_busy_waits: int = 30,
+    waits_for_a: Callable[[], bool] | None = None,
+    max_print_waits: int = 75,
 ) -> DialogueAdvanceResult:
     """Press A through a plain text box, never into a YES/NO or menu.
 
@@ -541,10 +543,18 @@ def auto_advance_dialogue(
     box up (BUSY: the nurse's healing jingle after YES, or between two boxes) it waits
     up to ``max_busy_waits`` settles for the next box instead of handing back to the
     model mid-event.
+
+    With ``waits_for_a`` A is pressed only once the box waits for it (the arrow, or
+    the script's waitbuttonpress), for up to ``max_print_waits`` settles a box; PLAIN
+    also covers a box still printing, where an A only hurries the text. Seen in
+    test_dialogue_auto_advance under load: the nurse's lines after YES took 13-15 of
+    the 15 presses (over her two reads ~20 of ~25 As landed on printing text, 4 on an
+    arrow), and some reads stopped at the cap with "the text box is still open". 75 settles of 12
+    frames is MACRO_TEXT_FRAMES, a message printing at slow text speed.
     """
     texts: List[str] = []
     presses = 0
-    busy_waits = 0
+    busy_waits = print_waits = 0
     looks = 0
 
     def note_text():
@@ -552,7 +562,7 @@ def auto_advance_dialogue(
         if text and text not in texts:
             texts.append(text)
 
-    while presses < max_presses and looks < (max_presses + 1) * (3 + max_busy_waits):
+    while presses < max_presses and looks < (max_presses + 1) * (3 + max_busy_waits + max_print_waits):
         looks += 1
         current = status()
         if current == DIALOGUE_BUSY and busy_waits < max_busy_waits:
@@ -564,10 +574,18 @@ def auto_advance_dialogue(
         settle()
         if status() != DIALOGUE_PLAIN:
             continue  # re-classify: a YES/NO may have just appeared
+        # Noted while it shows, not only before an A: a box the script moves on from by
+        # itself (the nurse's "Okay, I'll take your POKéMON…", then the healing) gets none.
         note_text()
+        if waits_for_a is not None and not waits_for_a() and print_waits < max_print_waits:
+            # Still printing: let it finish. A box that never shows its arrow (the
+            # script goes on by itself) leaves PLAIN, and one that does neither is
+            # pressed once the wait runs out, as before.
+            print_waits += 1
+            continue
         press_a()
         presses += 1
-        busy_waits = 0  # the wait budget is per gap between two boxes
+        busy_waits = print_waits = 0  # the wait budgets are per box and per gap between two
     final = status()
     if final in (DIALOGUE_PLAIN, DIALOGUE_CHOICE):
         note_text()  # the question in front of a YES/NO, or the box we stopped on

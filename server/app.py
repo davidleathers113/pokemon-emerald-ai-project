@@ -6278,8 +6278,9 @@ async def _advance_dialogue(request: Optional[dict]) -> Dict[str, Any]:
         # which is fewer frames than that whenever the emulator runs behind.
         _wait_frames_blocking(12)
 
+    # An A counts only once the box waits for it (field_control.auto_advance_dialogue).
     result = await run_in_threadpool(
-        auto_advance_dialogue, status, read_text, press_a, settle, max_presses
+        auto_advance_dialogue, status, read_text, press_a, settle, max_presses, waits_for_a=_box_waits_for_a
     )
     if result.final_status == DIALOGUE_CHOICE:
         # Hand a YES/NO back only once it takes input (menu_state.yes_no_ready). Seen in
