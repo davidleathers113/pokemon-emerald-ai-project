@@ -3859,7 +3859,8 @@ def _switch_train_line(guidance: Dict[str, Any]) -> str:
         p for p in party
         if str(p.species_name).upper() != trainee and p.max_hp and p.current_hp * 2 > p.max_hp
     ]
-    if not partners:
+    if not partners or view.get("trap"):
+        # Trapped, nobody can come in: the battle section's TRAPPED line says fight.
         return ""
     partner = max(partners, key=lambda p: p.level)
     name = str(partner.species_name).upper()
@@ -3892,9 +3893,14 @@ def _catch_target_line(guidance: Dict[str, Any]) -> str:
             continue
         if foe.get("level", 0) < wanted[name]:
             # "Catch a level 10+ Sableye" (David, 2026-11-03): a lower one isn't it.
+            trap = view.get("trap")
+            leave = (
+                f"Trapped by {trap['why']}: you can't run, so knock it out (use_move)"
+                if trap and not trap["can_run"] else "Call run_from_battle"
+            )
             return (
                 f"NOT THIS ONE: this wild {name} is Lv{foe.get('level')}, below the Lv{wanted[name]} "
-                f"your objective wants. Call run_from_battle and look for another."
+                f"your objective wants. {leave} and look for another."
             )
         return f"CATCH THIS ONE: the wild {name} Lv{foe.get('level')} in front of you is the Pokémon your objective wants. " + _catch_plan(view, foe)
     return ""
@@ -6420,9 +6426,14 @@ async def mcp_use_move(request: dict):
         with memory_lock:
             useless = env.memory_reader.status_move_failure(move["id"], aim)
         if useless:
+            from utils.state_formatter import battle_trap_text
+
             hint = view.get("switch_hint")
+            trapped = battle_trap_text(view)
             instead = (
                 f'Use a damaging move, or switch_pokemon("{hint["name"]}").' if hint
+                # Trapped (MEAN LOOK, FIRE SPIN...): no switch, and no run (_trapped_refusal).
+                else f"Use a damaging move or an item: {trapped}." if trapped
                 else "Use a damaging move, switch Pokémon, or run."
             )
             message = f"Not using {move['name']}: {useless}. {instead} Your moves: {listing}."
@@ -6567,6 +6578,27 @@ def _refusal(message: str, **extra) -> Dict[str, Any]:
     result = {"success": False, "error": message, "summary": message}
     result.update(extra)
     return result
+
+
+def _trapped_refusal(view: Optional[Dict[str, Any]], action: str) -> Optional[Dict[str, Any]]:
+    """The refusal for `action` ("run" or "switch") while the battle view's trap
+    (menu_state.battler_trap) makes it impossible, or None.
+
+    Seen live (2026-11-05, VICTORY ROAD): wild GOLBAT's MEAN LOOK; run_from_battle chose RUN
+    turn after turn, the game said "Can't escape!" each time, and GOLBAT hit back: three
+    faints. pret: IsRunningFromBattleImpossible (RUN AWAY and a SMOKE BALL still run) and
+    HandleTurnActionSelectionState's B_ACTION_SWITCH (nothing lets a trapped one switch).
+    """
+    from utils.state_formatter import trapped_fight_text
+
+    trap = (view or {}).get("trap")
+    if not trap or (action == "run" and trap["can_run"]):
+        return None
+    return _refusal(
+        f"Trapped by {trap['why']}: you can't {action}. {trapped_fight_text(view)} "
+        "Nothing was chosen: the turn is still yours.",
+        status="TRAPPED",
+    )
 
 
 def _usable_field_moves() -> set:
@@ -6899,11 +6931,19 @@ def _battle_report(played: Dict[str, Any]) -> str:
     if played.get("notes"):
         happened += f"Answered for you: {'; '.join(played['notes'])}. "
     if end == "action":
-        hp = _battle_hp_text(_read_battle_view())
-        return (
-            f"{happened}{hp} Your turn: FIGHT/BAG/POKEMON/RUN is open "
-            "(use_move, switch_pokemon, run_from_battle or throw_ball)."
-        ).strip()
+        from utils.state_formatter import battle_trap_text
+
+        view = _read_battle_view()
+        hp = _battle_hp_text(view)
+        trapped = battle_trap_text(view)
+        if trapped:
+            # Seen live (VICTORY ROAD, 2026-11-05): after MEAN LOOK this still offered
+            # switch_pokemon and run_from_battle, and the model ran into "Can't escape!".
+            run = ", run_from_battle" if view["trap"]["can_run"] and not view["is_trainer"] else ""
+            tools = f"{trapped}: use_move, use_item{run} or throw_ball"
+        else:
+            tools = "use_move, switch_pokemon, run_from_battle or throw_ball"
+        return f"{happened}{hp} Your turn: FIGHT/BAG/POKEMON/RUN is open ({tools}).".strip()
     if end == "over":
         result = ms.outcome_name(flow.outcome)
         if flow.outcome in (ms.B_OUTCOME_WON, ms.B_OUTCOME_LOST, ms.B_OUTCOME_DREW):
@@ -7001,15 +7041,25 @@ async def mcp_run_from_battle(request: dict = None):
         source = "run_from_battle"
         view = _read_battle_view()
         if view is not None and view["is_trainer"]:
+            # A trapped battler can't switch either (_trapped_refusal).
+            switch = "" if view.get("trap") else " or switch with switch_pokemon"
             return _refusal(
                 "You can't run from a trainer battle: the game won't allow it. Fight with use_move "
-                "(the battle section names the best move) or switch with switch_pokemon."
+                f"(the battle section names the best move){switch}."
             )
         if view is not None and _battle_type_flags() & BATTLE_TYPE_FIRST_BATTLE:
             return _refusal("You can't run from this battle (the first battle, with Prof. Birch's Pokémon): use use_move.")
+        # At the menu the trap is read before any press; during text gBattleMons may still
+        # hold the last battle's Pokémon, so it is read again once the menu is open.
+        trapped = _trapped_refusal(view, "run") if view is not None and view["menu"] != "busy" else None
+        if trapped:
+            return trapped
         view, refusal = await _ready_for_battle_action("run_from_battle", source)
         if refusal:
             return refusal
+        trapped = _trapped_refusal(view, "run")
+        if trapped:
+            return trapped
         opponent = view["target"]["name"].upper() if view.get("target") else "the wild Pokémon"
         error = await _choose_battle_action(ms.ACTION_RUN, source)
         if error:
@@ -7464,12 +7514,20 @@ async def mcp_switch_pokemon(request: dict = None):
         # switch_pokemon said "pick one with press_buttons" for 30 minutes. There the
         # POKEMON step is already done: pick the Pokémon and SEND OUT.
         forced = _forced_party_menu()
+        # A fainted Pokémon's replacement is never blocked; any other switch is while
+        # trapped. Read before any press at the menu, and again once text has played out.
+        trapped = _trapped_refusal(view, "switch") if not forced and view["menu"] != "busy" else None
+        if trapped:
+            return trapped
         if not forced:
             chosen_for = _battle_key()
             view, refusal = await _ready_for_battle_action("switch_pokemon", source)
             if refusal and not _forced_party_menu():
                 return refusal
             forced = refusal is not None
+            trapped = _trapped_refusal(view, "switch") if not forced else None
+            if trapped:
+                return trapped
             if not forced and _matchup_changed(chosen_for, _battle_key()):
                 # The text played out first changed who is out: the switch was for the
                 # match-up before (seen live: chosen vs MIGHTYENA, played vs ZUBAT).

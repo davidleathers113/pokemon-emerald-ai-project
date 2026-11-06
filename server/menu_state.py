@@ -438,6 +438,9 @@ def active_battler_personality(reader) -> int:
 # BattlePokemon: +0x20 ability, +0x21/+0x22 types, +0x2E item, +0x50 status2).
 G_BATTLERS_COUNT = 0x0202406C
 G_STATUSES3 = 0x020242AC          # u32[4]
+# gDisableStructs[4] (struct DisableStruct, 0x1C bytes): +0x14 battlerPreventingEscape,
+# the battler whose MEAN LOOK, BLOCK or SPIDER WEB set STATUS2_ESCAPE_PREVENTION.
+G_DISABLE_STRUCTS, DISABLE_STRUCT_SIZE, DISABLE_PREVENTING_ESCAPE = 0x020242BC, 0x1C, 0x14
 G_BATTLE_STRUCT = 0x0202449C      # struct BattleStruct *; +0x04 wrappedMove[battler * 2] (u16, two bytes)
 G_LAST_LANDED_MOVES = 0x02024250  # u16[4]: the move that last hit each battler
 G_LAST_HIT_BY = 0x02024270        # u8[4]: the battler that last hit each one
@@ -451,6 +454,8 @@ TYPE_FLYING, TYPE_STEEL = 2, 8
 ITEM_SMOKE_BALL = 194  # HOLD_EFFECT_CAN_ALWAYS_RUN
 # Moves that set STATUS2_WRAPPED (pret EFFECT_TRAP): BIND, WRAP, FIRE SPIN, CLAMP, WHIRLPOOL, SAND TOMB.
 TRAPPING_MOVES = (20, 35, 83, 128, 250, 328)
+# Moves that set STATUS2_ESCAPE_PREVENTION (pret EFFECT_MEAN_LOOK): SPIDER WEB, MEAN LOOK, BLOCK.
+ESCAPE_PREVENTION_MOVES = (169, 212, 335)
 
 
 @dataclass(frozen=True)
@@ -511,7 +516,20 @@ def battler_trap(reader, battler: int = 0) -> Optional[Trap]:
             move = known[0] if len(set(known)) == 1 else 0
         return Trap(_move_text(move) if move else "a trapping move", can_run)
     if status2 & STATUS2_ESCAPE_PREVENTION:
-        return Trap("MEAN LOOK, BLOCK or SPIDER WEB", can_run)
+        # Seen live (2026-11-05, VICTORY ROAD): wild GOLBAT's MEAN LOOK, and "Can't escape!"
+        # turn after turn. The trapper's own moves name it (pret SetMoveEffect's
+        # MOVE_EFFECT_PREVENT_ESCAPE stores it in battlerPreventingEscape); any foe's when
+        # that index isn't a foe.
+        trapper = reader._read_u8(G_DISABLE_STRUCTS + battler * DISABLE_STRUCT_SIZE + DISABLE_PREVENTING_ESCAPE)
+        holders = [trapper] if trapper < count and trapper % 2 != battler % 2 else [
+            foe for foe in range(count) if foe % 2 != battler % 2
+        ]
+        known = {
+            m for foe in holders
+            for m in (reader._read_u16(G_BATTLE_MONS + foe * BATTLE_MON_SIZE + 0x0C + 2 * i) for i in range(4))
+            if m in ESCAPE_PREVENTION_MOVES
+        }
+        return Trap(_move_text(known.pop()) if len(known) == 1 else "MEAN LOOK, BLOCK or SPIDER WEB", can_run)
     if reader._read_u32(G_STATUSES3 + 4 * battler) & STATUS3_ROOTED:
         return Trap("its own INGRAIN", can_run)
     return None

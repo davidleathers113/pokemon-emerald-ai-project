@@ -2568,6 +2568,14 @@ class PokemonEmeraldReader:
         if danger:
             better_switch = None  # the danger line names the switch that wins the exchange
         item_hint = self._battle_item_hint(ours, opponents) if menu == "action" else None
+        trap = self._battle_trap(chooser) if player else None
+        if trap is not None:
+            # Seen live (2026-11-05, VICTORY ROAD): wild GOLBAT's MEAN LOOK; the model was
+            # told to run or switch, and the game said "Can't escape!" until three fainted. No
+            # switch can work (pret HandleTurnActionSelectionState, B_ACTION_SWITCH).
+            switch_hint = better_switch = None
+            if danger:
+                danger = {**danger, "switch": None}
 
         action_cursor = self._read_u8(self.addresses.ACTION_SELECTION_CURSOR + chooser) & 3
         return {
@@ -2590,7 +2598,17 @@ class PokemonEmeraldReader:
             "danger": danger,
             "confusion": self.confusion_danger(player),
             "item_hint": item_hint,
+            "trap": trap,
         }
+
+    def _battle_trap(self, battler: int) -> Optional[Dict[str, Any]]:
+        """{"why": "MEAN LOOK", "can_run": False} when `battler` can't switch out, else None:
+        server.menu_state.battler_trap, the one pret rule train and the harness's battle
+        rules already follow (imported here so the view can't disagree with them)."""
+        from server.menu_state import battler_trap
+
+        trap = battler_trap(self, battler)
+        return {"why": trap.why, "can_run": trap.can_run} if trap is not None else None
 
     def read_team_condition(self, lead_index: Optional[int] = None) -> Dict[str, Any]:
         """assess_team_condition on the party, with move power and base PP from ROM.

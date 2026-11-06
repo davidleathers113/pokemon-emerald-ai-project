@@ -649,6 +649,78 @@ def test_confusion_is_shown_for_both_sides():
     assert not any("is confused" in line for line in lines), lines
 
 
+def test_a_trapped_battler_is_shown_and_told_to_fight():
+    """Seen live (VICTORY ROAD, 2026-11-05): wild GOLBAT's MEAN LOOK; nothing in the battle
+    section said so, and the model kept choosing run_from_battle ("Can't escape!") while
+    GOLBAT hit back: three faints. Isaac's battle with SABLEYE in danger (as in
+    test_a_foe_that_wins_the_exchange_is_a_danger), then RAM: MEAN LOOK on SABLEYE
+    (test_battle_rules._mean_look: STATUS2_ESCAPE_PREVENTION, battlerPreventingEscape 1,
+    MEAN LOOK in WHISMUR's moves). The DANGER line names the best move, not a switch. Then
+    test_wild_two_party.state's TORCHIC at 8/33 HP, trapped: the low-HP line doesn't say run
+    or switch either."""
+    import asyncio
+
+    from test_battle_rules import _mean_look
+
+    from utils.state_formatter import format_battle_view
+
+    s = server()
+    s.load(ISAAC)
+    _poke(s, 16, 0x02024084 + 0x28, 1)
+    _poke(s, 16, FOE + 0x28, 200)
+    _poke(s, 16, FOE + 0x2C, 200)
+    assert _view(s)["danger"]["switch"], "untrapped, the DANGER line names a switch"
+    _mean_look(s)
+    view = _view(s)
+    lines = format_battle_view(view)
+    print("    " + "\n    ".join(lines))
+    assert lines[1].startswith("You: SABLEYE ") and lines[1].endswith(", TRAPPED by MEAN LOOK (can't run or switch)"), lines[1]
+    danger = next((line for line in lines if line.startswith("DANGER: WHISMUR's")), "")
+    best = view["best_move"]["name"]
+    # SABLEYE at 1 HP: the item hint's POTION is offered too.
+    assert danger.endswith(
+        f"TRAPPED by MEAN LOOK (can't run or switch): Fight: use_move(\"{best}\"), "
+        "or heal: use_item(\"POTION\", \"SABLEYE\")."
+    ), danger
+    assert not any(
+        "switch_pokemon(" in line or "run_from_battle(" in line or "Better matchup" in line for line in lines
+    ), lines
+    assert view.get("trap") == {"why": "MEAN LOOK", "can_run": False}, view.get("trap")
+    # What the model's prompt carries (get_game_state's state text).
+    text = asyncio.run(s.srv.mcp_get_game_state())["state_text"]
+    assert "TRAPPED by MEAN LOOK (can't run or switch)" in text and "switch_pokemon(" not in text, text
+
+    s.load(WILD_TWO)
+    _poke(s, 16, 0x02024084 + 0x28, 8)
+    assert any("run_from_battle() or switch_pokemon() is safer" in line for line in format_battle_view(_view(s)))
+    _mean_look(s)
+    lines = format_battle_view(_view(s))
+    print("    " + "\n    ".join(lines))
+    low = next(line for line in lines if "is low on HP" in line)
+    assert low.startswith("TORCHIC is low on HP (8/33): TRAPPED by MEAN LOOK (can't run or switch): Fight: use_move("), low
+    assert not any("switch_pokemon(" in line or "run_from_battle(" in line for line in lines), lines
+
+
+def test_a_trapped_battlers_turn_report_offers_no_switch_or_run():
+    """The report after a turn ends on the tools to use next; live, after MEAN LOOK, it
+    still offered switch_pokemon and run_from_battle. Isaac's battle, RAM: WHISMUR at
+    200/200 HP (so the battle goes on after SCRATCH) and MEAN LOOK on SABLEYE."""
+    from test_battle_rules import _mean_look
+
+    s = server()
+    s.load(ISAAC)
+    _poke(s, 16, FOE + 0x28, 200)
+    _poke(s, 16, FOE + 0x2C, 200)
+    _mean_look(s)
+    r = s.call("mcp_use_move", {"move": "SCRATCH", "reasoning": "test"})
+    print("   ", r.get("summary"))
+    assert r["success"] and _view(s)["menu"] == "action", r
+    assert r["summary"].endswith(
+        "Your turn: FIGHT/BAG/POKEMON/RUN is open (TRAPPED by MEAN LOOK (can't run or switch): "
+        "use_move, use_item or throw_ball)."
+    ), r["summary"]
+
+
 def _run_all():
     import test_movement_feedback as harness
 

@@ -271,6 +271,121 @@ def test_hm_carriers_that_dont_fight_are_sent_in_only_when_nobody_else_wins():
         hm_carriers.HM_CARRIER_FIGHTS.update(saved)
 
 
+# -- trapped: no run, no switch (2026-11-05) ---------------------------------------
+# Seen live (VICTORY ROAD, ef1a194): a wild GOLBAT used MEAN LOOK; run_from_battle chose
+# RUN turn after turn, the game said "Can't escape!" each time and GOLBAT hit back: three
+# faints. pret include/battle.h: gBattleMons[].status2 (+0x50) STATUS2_ESCAPE_PREVENTION,
+# STATUS2_WRAPPED's turn count (bits 13-15); gDisableStructs[] (0x1C bytes) +0x14
+# battlerPreventingEscape; gBattleStruct (a pointer) +0x04 wrappedMove[battler * 2];
+# struct BattlePokemon +0x0C moves[4], +0x20 ability; gBattleResults +0x13
+# battleTurnCounter (pokeemerald.sym).
+STATUS2, ESCAPE_PREVENTION, WRAPPED_3_TURNS = 0x50, 0x04000000, 0x6000
+DISABLE_STRUCTS, G_BATTLE_STRUCT = 0x020242BC, 0x0202449C
+TURN_COUNTER = 0x03005D10 + 0x13
+MEAN_LOOK, FIRE_SPIN, ABILITY_RUN_AWAY = 212, 83, 50
+WILD_TWO = HERE / "test_wild_two_party.state"  # wild SILCOON; TORCHIC out, SHROOMISH benched
+
+
+def _mean_look(s):
+    """RAM, what wild GOLBAT did live: our battler 0 under STATUS2_ESCAPE_PREVENTION, set
+    by battler 1 (gDisableStructs[0].battlerPreventingEscape), whose 4th move is MEAN LOOK."""
+    status2 = _read(s, lambda r: r._read_u32(BATTLE_MONS + STATUS2))
+    _write(s, 32, BATTLE_MONS + STATUS2, status2 | ESCAPE_PREVENTION)
+    _write(s, 8, DISABLE_STRUCTS + 0x14, 1)
+    _write(s, 16, FOE + 0x0C + 6, MEAN_LOOK)
+
+
+def _fire_spin(s):
+    """RAM, as test_train_macro's: our battler 0 wrapped for 3 turns by FIRE SPIN
+    (gBattleStruct->wrappedMove[0]), what wild TORKOAL did live in MAGMA HIDEOUT."""
+    status2 = _read(s, lambda r: r._read_u32(BATTLE_MONS + STATUS2))
+    _write(s, 32, BATTLE_MONS + STATUS2, status2 | WRAPPED_3_TURNS)
+    _write(s, 16, _read(s, lambda r: r._read_u32(G_BATTLE_STRUCT)) + 4, FIRE_SPIN)
+
+
+def _record_presses(s):
+    """Every button the server's macros press from now on (server _macro_press)."""
+    presses = []
+    real = s.srv._macro_press
+
+    async def record(buttons, source):
+        presses.append(list(buttons))
+        await real(buttons, source)
+
+    s.srv._macro_press = record
+    return presses, real
+
+
+def test_run_from_battle_refuses_while_trapped():
+    """test_wild_shroomish.state at FIGHT/BAG/POKEMON/RUN; RAM: _mean_look. run_from_battle
+    refuses up front with the trap and the best move named: no press, no turn spent (each
+    "Can't escape!" was a free hit for the foe). With RUN AWAY (pret
+    IsRunningFromBattleImpossible) the same trap still lets it run."""
+    s = _fresh(WILD, mode="fight")
+    _mean_look(s)
+    view = _read(s, lambda r: r.read_battle_view())
+    assert view["menu"] == "action", view["menu"]
+    turns = _read(s, lambda r: r._read_u8(TURN_COUNTER))
+    presses, real = _record_presses(s)
+    try:
+        r = s.call("mcp_run_from_battle", {"reasoning": "test"})
+    finally:
+        s.srv._macro_press = real
+    print("   ", r.get("error"))
+    best = view["best_move"]["name"]
+    assert r["success"] is False and r.get("status") == "TRAPPED", r
+    assert r["error"].startswith(f"Trapped by MEAN LOOK: you can't run. Fight: use_move(\"{best}\")"), r
+    assert presses == [], presses
+    assert _in_battle(s) and _read(s, lambda r: r.read_battle_view())["menu"] == "action"
+    assert _read(s, lambda r: r._read_u8(TURN_COUNTER)) == turns
+    assert view.get("trap") == {"why": "MEAN LOOK", "can_run": False}, view.get("trap")
+
+    s = _fresh(WILD, mode="fight")
+    _mean_look(s)
+    _write(s, 8, BATTLE_MONS + 0x20, ABILITY_RUN_AWAY)
+    r = s.call("mcp_run_from_battle", {"reasoning": "test"})
+    assert r["status"] == "ESCAPED" and not _in_battle(s), r
+
+
+def test_switch_pokemon_refuses_while_trapped():
+    """test_wild_two_party.state (TORCHIC out, SHROOMISH benched). pret
+    HandleTurnActionSelectionState, B_ACTION_SWITCH: STATUS2_ESCAPE_PREVENTION and
+    STATUS2_WRAPPED both block a switch (Gen 3 has no Shed Shell), and RUN AWAY doesn't
+    help. Each is refused up front: no press, no turn spent, TORCHIC still out."""
+    for trap, why, run_away in ((_mean_look, "MEAN LOOK", False), (_fire_spin, "FIRE SPIN", False), (_mean_look, "MEAN LOOK", True)):
+        s = _fresh(WILD_TWO, mode="fight")
+        trap(s)
+        if run_away:
+            _write(s, 8, BATTLE_MONS + 0x20, ABILITY_RUN_AWAY)
+        assert _read(s, lambda r: r.read_battle_view())["menu"] == "action"
+        turns = _read(s, lambda r: r._read_u8(TURN_COUNTER))
+        presses, real = _record_presses(s)
+        try:
+            r = s.call("mcp_switch_pokemon", {"pokemon": "SHROOMISH", "reasoning": "test"})
+        finally:
+            s.srv._macro_press = real
+        print("   ", r.get("error"))
+        assert r["success"] is False and r.get("status") == "TRAPPED", r
+        assert r["error"].startswith(f"Trapped by {why}: you can't switch. Fight: use_move(\""), r
+        assert presses == [] and _out_name(s) == "TORCHIC", presses
+        assert _read(s, lambda r: r._read_u8(TURN_COUNTER)) == turns
+
+
+def test_no_danger_switch_while_trapped():
+    """The harness_step DANGER switch (_danger_switch_rule) never tries a switch the game
+    refuses: Isaac's battle in danger (_isaac_danger), then MEAN LOOK or FIRE SPIN in RAM.
+    Seen live (2026-11-05, MAGMA HIDEOUT): SHIFT under FIRE SPIN left the party menu open
+    ("SABLEYE can't be switched out!")."""
+    for trap, why in ((_mean_look, "MEAN LOOK"), (_fire_spin, "FIRE SPIN")):
+        s = _fresh(ISAAC)
+        assert _isaac_danger(s)["danger"]["switch"], "a teammate wins: the switch would happen untrapped"
+        trap(s)
+        r = _step(s)
+        assert r["changed"] is False and r.get("rule") is None, r
+        assert f"trapped by {why}, fighting" in r["why"].split("; "), r
+        assert _out_name(s) == "SABLEYE"
+
+
 # -- HM carriers never lead outside training ---------------------------------------
 
 

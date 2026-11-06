@@ -367,6 +367,35 @@ def _effectiveness_label(move):
 WILD_LEAD_LOW_HP_SHARE = 0.25
 
 
+def battle_trap_text(view):
+    """'TRAPPED by MEAN LOOK (can't run or switch)' for the battle view's trap, or "".
+
+    Seen live (2026-11-05, VICTORY ROAD): wild GOLBAT's MEAN LOOK; nothing said so, and
+    run_from_battle answered "Can't escape!" turn after turn while three Pokémon fainted.
+    RUN AWAY and a SMOKE BALL still run from a wild battle (pret battle_main.c
+    IsRunningFromBattleImpossible), never switch."""
+    trap = (view or {}).get('trap')
+    if not trap:
+        return ""
+    if trap['can_run'] and not view.get('is_trainer'):
+        return f"TRAPPED by {trap['why']} (can't switch; RUN AWAY or its SMOKE BALL still lets it run)"
+    return f"TRAPPED by {trap['why']} (can't run or switch)"
+
+
+def trapped_fight_text(view):
+    """What a trapped battler can still do: its best move, and the medicine the view's
+    item hint names for it (its ITEMS line says why). 'Fight: use_move("SHADOW BALL")'."""
+    best = (view or {}).get('best_move')
+    me = str(((view or {}).get('player') or {}).get('name', '')).upper()
+    uses = [u for u in ((view or {}).get('item_hint') or {}).get('uses') or [] if u['pokemon'] == me]
+    heal = " or ".join(f"use_item(\"{u['item']}\", \"{u['pokemon']}\")" for u in uses)
+    if best:
+        return f"Fight: use_move(\"{best['name']}\")" + (f", or heal: {heal}" if heal else "") + "."
+    if heal:
+        return f"No damaging move has PP left: heal with {heal}, or use a status move."
+    return "No damaging move has PP left: use an item (use_item) or a status move."
+
+
 def format_battle_view(view):
     """Compact battle section from memory_reader.read_battle_view() (None -> []).
 
@@ -382,7 +411,10 @@ def format_battle_view(view):
         kind += " double"
     foes = "; ".join(_battle_mon_line(mon) for mon in view['opponents']) or "not sent out yet"
     lines.append(f"{kind} battle vs {foes}")
-    lines.append(f"You: {_battle_mon_line(view['player'])}")
+    trapped = battle_trap_text(view)
+    lines.append(f"You: {_battle_mon_line(view['player'])}" + (f", {trapped}" if trapped else ""))
+    # Neither running nor switching works: every hint below says fight instead.
+    stuck = bool(trapped) and (view['is_trainer'] or not view['trap']['can_run'])
 
     moves = view['moves']
     menu = view['menu']
@@ -442,7 +474,12 @@ def format_battle_view(view):
                 f"first; {me['name'].upper()} {our}."
             )
             safe = danger.get('switch')
-            if safe:
+            if trapped:
+                # The view drops the switch while trapped; the way out is the fight (or
+                # medicine), and running only with RUN AWAY or a SMOKE BALL.
+                run = "" if stuck else " run_from_battle() still works, or:"
+                line += f" {trapped}:{run} {trapped_fight_text(view)}"
+            elif safe:
                 line += (
                     f" Switch: call switch_pokemon(\"{safe['name']}\") ({safe['move']} {safe['effectiveness']:g}x, "
                     f"~{round(safe['damage'])} HP a hit; it takes ~{round(safe['taken'])} of its {safe['hp']} HP "
@@ -458,24 +495,29 @@ def format_battle_view(view):
             f"No damaging move with PP left: call switch_pokemon(\"{hint['name']}\") "
             f"(slot {hint['slot']}, the best of the rest here). Status moves won't win this battle."
         )
+    elif moves and trapped:
+        lines.append(trapped_fight_text(view) + ("" if stuck else " Or run_from_battle()."))
     elif moves:
         lines.append("No damaging move with PP left: switch Pokémon, use an item, or run.")
     player = view['player']
+    # The ways out the two hints below may name: none at all while trapped.
+    ways = [] if trapped else ["switch_pokemon()"]
+    if not view['is_trainer'] and not stuck:
+        ways.append("run_from_battle()")
+    way = " or ".join(ways)
     confusion = view.get('confusion')
     if confusion and (confusion['low'] or confusion['knocks_out']):
         # Seen live (ROUTE 120): SABLEYE at 27/111 HP, confused by SWAGGER (+2 Attack),
         # attacked and "hurt itself in its confusion" until it fainted.
         knocks = ", a knock-out" if confusion['knocks_out'] else ""
-        way = "switch_pokemon() is" if view['is_trainer'] else "switch_pokemon() or run_from_battle() is"
+        advice = f"{way} is safer than attacking." if way else f"{trapped}: {trapped_fight_text(view)}"
         lines.append(
             f"{player['name'].upper()} is confused: one move in two it hits itself for ~{confusion['self_hit']} "
-            f"of its {player['hp']} HP{knocks}. {way} safer than attacking."
+            f"of its {player['hp']} HP{knocks}. {advice}"
         )
     if not view['is_trainer'] and player['max_hp'] and player['hp'] < player['max_hp'] * WILD_LEAD_LOW_HP_SHARE:
-        lines.append(
-            f"{player['name'].upper()} is low on HP ({player['hp']}/{player['max_hp']}): "
-            "run_from_battle() or switch_pokemon() is safer than attacking."
-        )
+        advice = f"{' or '.join(reversed(ways))} is safer than attacking." if way else f"{trapped}: {trapped_fight_text(view)}"
+        lines.append(f"{player['name'].upper()} is low on HP ({player['hp']}/{player['max_hp']}): {advice}")
     items = view.get('item_hint')
     if items:
         # Seen live (TATE & LIZA): 3 REVIVEs and 5 SUPER POTIONs stayed in the bag while
