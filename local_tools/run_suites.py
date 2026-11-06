@@ -33,7 +33,7 @@ DOCKER_SUITES = [
     "battle_view",
     "battle_doubles", "use_item", "party_rule", "dialogue_agent", "dialogue_auto_advance", "phase4_agent",
     "movement_feedback", "surf", "prompt_cache", "play_endpoints", "phase4_backend", "phase23_health",
-    "phase23_save_persistence", "gemini_fallback", "map_enum", "pc_storage", "fly", "battle_rules", "fall_through",
+    "phase23_save_persistence", "gemini_fallback", "map_enum", "pc_storage", "fly", "battle_rules", "fall_through", "boulder_rocks",
 ]
 HOST_PYTHON_SUITES = ["stall_watch", "speed_report"]  # plain Python, no emulator
 NODE_SUITES = ["play_panels"]

@@ -384,13 +384,22 @@ def load_pathfinding_state(env) -> tuple:
                         state["map"]["porymap"]["puzzle_switches"] = [
                             (sx - ox, sy - oy) for sx, sy in puzzle_switches(porymap_map_name)
                         ]
-                        # Rocks and trees the party can clear: walkable for the planner
-                        # (at a cost), cleared by the walk when it bumps into one.
-                        state["map"]["porymap"]["clearable"] = list(clearable_obstacles(porymap_map_name))
+                        # Rocks and trees the party can clear and still standing: walkable
+                        # for the planner (at a cost), cleared by the walk when it bumps
+                        # into one; among boulders, steps of the plan (pathfinding _astar).
+                        standing = standing_obstacles(porymap_map_name)
+                        gone = set(clearable_obstacles(porymap_map_name)) - set(standing)
+                        state["map"]["porymap"]["clearable"] = list(standing)
+                        state["map"]["porymap"]["objects"] = [
+                            o for o in state["map"]["porymap"]["objects"]
+                            if (o.get("x"), o.get("y")) not in gone
+                        ]
                         # Water the party can Surf joins the walk (pathfinding._water_step);
                         # the walk starts Surf when it bumps into the water (server
                         # _start_surf).
                         state["map"]["porymap"]["surf"] = can_surf()
+                        # Up waterfalls too (pathfinding.waterfall_steps; server _climb_waterfall).
+                        state["map"]["porymap"]["waterfall"] = can_climb_waterfalls()
                         state["map"]["porymap"]["raw_tiles"] = raw_tiles
                         # The player's tile and elevation now: a walk from there starts at
                         # it (pathfinding _astar). On a bridge (elevation 15) the tile can't
@@ -530,6 +539,42 @@ def planned_end(start: Tuple[int, int], buttons: List[str], pushes: List[dict]) 
     return end_of_path(start, [b for i, b in enumerate(buttons) if i not in skip])
 
 
+def boulder_reset_note(state: dict, start: Tuple[int, int], goals) -> str:
+    """For a walk that found no way: " ..." saying the boulders and rocks as they stand now
+    leave none but their map-file places would, so leaving the map and coming back is the
+    way (pret ClearTempFieldEventData clears the FLAG_TEMP_* flags on a map load, and a
+    boulder's new tile was never written to its template: both come back). "" otherwise.
+
+    Seen live (2026-11-05, SEAFLOOR CAVERN ROOM1): a boulder pushed up to (12,7) filled the
+    only corridor, and every walk to the exit failed until the player left and came back."""
+    from utils.mapping.pathfinding import Pathfinder
+    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+    porymap = (state.get("map") or {}).get("porymap") or {}
+    map_dir = ROM_TO_PORYMAP_MAP.get((state.get("player") or {}).get("location", ""), "")
+    spawns = set(boulder_spawns(map_dir).values()) if map_dir else set()
+    standing = {(o.get("x"), o.get("y")) for o in porymap.get("objects") or []}
+    smashed = [tile for tile in clearable_obstacles(map_dir) if tile not in standing] if map_dir else []
+    if not smashed and {tuple(b) for b in porymap.get("boulders") or []} == spawns:
+        return ""  # everything stands where a map load would put it
+    fresh = {
+        **porymap,
+        "boulders": sorted(spawns),
+        "objects": list(porymap.get("objects") or []) + [
+            {"x": x, "y": y, "graphics_id": "OBJ_EVENT_GFX_BREAKABLE_ROCK", "movement_type": "MOVEMENT_TYPE_NONE"}
+            for x, y in smashed
+        ],
+    }
+    again = {**state, "map": {**(state.get("map") or {}), "porymap": fresh}}
+    for goal in goals:
+        if Pathfinder().find_path(tuple(start), tuple(goal), again, consider_npcs=True, allow_partial=False):
+            return (
+                " The boulders and rocks here no longer leave a way, but they would where they"
+                " start: leave this map and come back in (a map load puts them back), then try again."
+            )
+    return ""
+
+
 def push_plan(start: Tuple[int, int], buttons: List[str], pushes: List[dict]) -> dict:
     """For a plan with boulder pushes (pathfinder.last_pushes): "buttons" cut short at the
     first push, "push" (the boulder's tile, where it goes, the press and the tile the
@@ -549,8 +594,10 @@ def push_plan(start: Tuple[int, int], buttons: List[str], pushes: List[dict]) ->
         "buttons": walk,
         "push": {
             "boulder": tuple(first["boulder"]),
-            "to": tuple(first["to"]),
+            # A rock or tree to clear (pathfinding: "clear") stays put: no tile it goes to.
+            "to": tuple(first["to"]) if first.get("to") is not None else None,
             "button": first["button"],
+            "kind": first.get("kind", "push"),
             "stand": end_of_path(start, walk),
         },
         "pushes": len(pushes),
@@ -575,7 +622,10 @@ def jump_presses(start: Tuple[int, int], buttons: List[str], tiles) -> List[str]
     past the path, and every press after that was one tile off, until "BLOCKED moving DOWN
     at (49,13): (49,14) is not walkable"."""
     from server.field_control import DIRECTION_DELTAS
-    from utils.mapping.pathfinding import tile_behavior_name
+    from utils.mapping.pathfinding import is_waterfall, tile_behavior_name, waterfall_run
+
+    def tile_at(x: int, y: int):
+        return tiles[y][x] if tiles and 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
 
     x, y = start
     out: List[str] = []
@@ -590,7 +640,11 @@ def jump_presses(start: Tuple[int, int], buttons: List[str], tiles) -> List[str]
             landing = None
             continue
         out.append(button)
-        tile = tiles[y][x] if tiles and 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
+        if button != "UP" and is_waterfall(tile_at(x, y)):
+            # The press rides down the waterfall to the water below it (pathfinding
+            # waterfall_run): several tiles for one press, as the plan has it.
+            x, y = waterfall_run(tiles, x, y, 1) or (x, y)
+        tile = tile_at(x, y)
         landing = step if LEDGE_JUMP_STEPS.get(tile_behavior_name(tile)) == step else None
     return out
 
@@ -803,6 +857,7 @@ def navigate_to_direct(
                 error_msg += " (planned through this map's rotating gates as they stand now)"
             people = people_in_the_way(state, start, goal, _map_source.get("porymap_map_name") or "") if consider_npcs else []
             error_msg += f".{people_note(people)}." if people else ""
+            error_msg += boulder_reset_note(state, start, [goal]) if map_data.get("boulders") else ""
 
             failed = {"success": False, "error": error_msg, "target": f"({x}, {y})", "reason": "unreachable"}
             if people:
@@ -818,7 +873,7 @@ def navigate_to_direct(
         logger.info(f"🗺️ {nav_reason_text} - Buttons calculated: {len(buttons)}")
 
         # Same coordinate frame as the requested target (map-local on override maps).
-        local_end = planned_end(start, buttons, pushes)
+        local_end = tuple(pathfinder.last_path_end or planned_end(start, buttons, pushes))
         path_end = local_end
 
         result = {
@@ -1329,9 +1384,16 @@ def _flag_ids_resolved() -> dict:
 
     for line in path.read_text(encoding="utf-8").splitlines():
         parts = line.split(None, 2)
-        if len(parts) < 3 or parts[0] != "#define" or not parts[1].startswith("FLAG_"):
+        if len(parts) < 3 or parts[0] != "#define":
             continue
         value = parts[2].split("//")[0].strip()
+        if not parts[1].startswith("FLAG_"):
+            # A base the flags count from (TEMP_FLAGS_START 0x0: FLAG_TEMP_1C is
+            # (TEMP_FLAGS_START + 0x1C), a Victory Road rock's).
+            base = number(value)
+            if base is not None and parts[1].endswith("_START"):
+                ids[parts[1]] = base
+            continue
         if value.startswith("(") and value.count("+") == 1 and "-" not in value:
             base, _, offset = value.strip("()").partition("+")
             left, right = number(base), number(offset)
@@ -1563,9 +1625,15 @@ PUSHABLE_BOULDER = "OBJ_EVENT_GFX_PUSHABLE_BOULDER"
 # and their scripts (data/scripts/field_move_scripts.inc EventScript_UseDive,
 # EventScript_UseDiveUnderwater) checkpartymove MOVE_DIVE, which skips eggs.
 DIVE = "DIVE"
+# Waterfall (up one, outside battle) needs the Rain Badge: pret field_control_avatar.c
+# GetInteractedWaterScript runs EventScript_UseWaterfall when FlagGet(FLAG_BADGE08_GET) and
+# IsPlayerSurfingNorth(); the script checks checkpartymove MOVE_WATERFALL. Going down one
+# needs nothing (the current pushes the surfer south, pathfinding waterfall_run).
+WATERFALL = "WATERFALL"
 # Every field move the walks use, by the badge number that allows it outside battle.
 FIELD_MOVE_BADGES = {
     **{move: badge for move, badge in FIELD_MOVE_OBSTACLES.values()}, SURF: 5, FLY: 6, STRENGTH: 4, DIVE: 7,
+    WATERFALL: 8,
 }
 # () -> set of field moves usable now (known by a party Pokémon, badge set), installed by
 # the server. None: no obstacle is clearable and no water crossable.
@@ -1588,8 +1656,18 @@ def _usable_field_moves() -> set:
     except Exception as e:  # unreadable party: treat obstacles as walls
         logger.debug(f"field moves unreadable: {e}")
         moves = set()
+    if moves != _field_moves_cache[1]:
+        # The route areas and what is built on them are kept per Surf ability only; a
+        # move learned (WATERFALL) or a badge won changes them too.
+        for cached in (_walk_areas_without, _edge_dead_ends_with, _ride_exits_with, _fall_exits_with):
+            cached.cache_clear()
     _field_moves_cache[:] = [time.monotonic(), moves]
     return moves
+
+
+def can_climb_waterfalls() -> bool:
+    """A party Pokémon (not an egg) knows WATERFALL and the Rain Badge is set."""
+    return WATERFALL in _usable_field_moves()
 
 
 def clearable_obstacles(map_dir: str) -> dict:
@@ -1605,6 +1683,26 @@ def clearable_obstacles(map_dir: str) -> dict:
         move = FIELD_MOVE_OBSTACLES.get(obj.get("graphics_id"), (None, 0))[0]
         if move in usable:
             out[(int(obj.get("x", -1)), int(obj.get("y", -1)))] = move
+    return out
+
+
+def standing_obstacles(map_dir: str) -> dict:
+    """clearable_obstacles less those gone now: pret EventScript_SmashRock's removeobject
+    sets the rock's flag (a FLAG_TEMP_* in VICTORY ROAD, cleared again by a map load,
+    ClearTempFieldEventData). Seen in a test: VICTORY ROAD B1F's rock at (20,25), smashed,
+    was planned and "smashed" again twelve times."""
+    out = clearable_obstacles(map_dir)
+    if flag_reader is None or not out:
+        return out
+    for obj in _raw_map_json(map_dir).get("object_events") or []:
+        tile = (int(obj.get("x", -1)), int(obj.get("y", -1)))
+        flag = flag_id(str(obj.get("flag", "")))
+        if tile in out and flag is not None:
+            try:
+                if flag_reader(flag):
+                    out.pop(tile)
+            except Exception as e:  # unreadable: the rock counts as standing
+                logger.debug(f"flag {flag} unreadable: {e}")
     return out
 
 
@@ -2072,16 +2170,18 @@ def _route_areas(map_dir: str) -> dict:
     shores it can be surfed from and landed on (pathfinding.water_step).
     """
     return _walk_areas_without(
-        map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True, can_surf(), layout_now(map_dir)
+        map_dir, _obstacle_tiles(map_dir) if map_dir else frozenset(), True, can_surf(), layout_now(map_dir),
+        can_climb_waterfalls(),
     )
 
 
 @lru_cache(maxsize=None)
 def _walk_areas_without(
     map_dir: str, obstacles: frozenset, ledges_are_walls: bool = False, surf: bool = False,
-    layout: Optional[str] = None,
+    layout: Optional[str] = None, waterfall: bool = False,
 ) -> dict:
-    """The areas are flooded with the tile planner's own steps (pathfinding.walk_steps):
+    """The areas are flooded with the tile planner's own steps (pathfinding.walk_steps;
+    waterfall: a surfer goes up and down waterfalls, pathfinding.waterfall_run):
     collision bits, and the walker's elevation carried from tile to tile (pret
     IsElevationMismatchAt, ObjectEventUpdateElevation), so floors at different elevations
     are different areas unless a tile at elevation 0 (stairs, a ramp) or a bridge joins
@@ -2151,7 +2251,7 @@ def _walk_areas_without(
         stack = [(x0, y0, walker)]
         while stack:
             x, y, here = stack.pop()
-            for nx, ny, there in walk_steps(tiles, grid, x, y, here, surf, walls):
+            for nx, ny, there in walk_steps(tiles, grid, x, y, here, surf, walls, waterfall=surf and waterfall):
                 if (nx, ny, there) in states:
                     continue
                 states[(nx, ny, there)] = number
@@ -3840,7 +3940,7 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
             start, tile, state, consider_npcs=True, allow_partial=False, blocked_coords=blocked
         )
         pushes = list(pathfinder.last_pushes)
-        if buttons and planned_end(start, buttons, pushes) == tile:
+        if buttons and tuple(pathfinder.last_path_end or planned_end(start, buttons, pushes)) == tile:
             pushes_to[tile] = pushes
             scenes_to[tile] = pathfinder.last_scene
             return buttons
@@ -3965,6 +4065,8 @@ def plan_exit_route(env, exit_query: str, max_edge_candidates: int = 16, avoid: 
                    else ". A ledge (one-way), water (needs Surf) or a person may be in the way.")
                 + (" This map's floor switches move its statues, and no way through them was found either."
                    if puzzle else "")
+                + (boulder_reset_note(state, start, list(dict.fromkeys(targets))[:max_edge_candidates])
+                   if state["map"]["porymap"].get("boulders") else "")
             ),
         }
         # A floor that drops the walker to the one below (hole_warp): the exit may be

@@ -90,11 +90,18 @@ SURF_START_COST = CLEARABLE_TILE_COST
 # Planner cost of one push: a stop, the push animation (with the field controls locked)
 # and, the first time, Strength's question; open ground of a few steps is preferred.
 BOULDER_PUSH_COST = 4.0
-# Pushes one planned walk may make, and nodes a search with boulders may open: each push
-# makes the same tile another search state, so the search is kept bounded. The live puzzle
-# needs 2 pushes and a few hundred nodes.
-BOULDER_MAX_PUSHES = 8
-BOULDER_SEARCH_MAX_NODES = 60000
+# Pushes (and rock clears) one planned walk may make, and nodes a search with boulders may
+# open: each push makes the same tile another search state, so the search is kept bounded.
+# Measured (2026-11-05) from the map-file tiles, warp to warp, every map with boulders:
+# SEAFLOOR CAVERN ROOM8 (5,12)->(5,2) 9 pushes (~100k nodes, 2.8 s), ROOM2 9, TRICK HOUSE 4
+# 9, SHOAL CAVE 7, VICTORY ROAD B1F 6 (4 pushes, 2 rock smashes), SEAFLOOR ROOM1 3. A
+# search that finds nothing stops at the node cap (VICTORY ROAD B1F between its separate
+# parts: ~3 s).
+BOULDER_MAX_PUSHES = 12
+BOULDER_SEARCH_MAX_NODES = 150000
+# States (tile, boulders, rocks) the check that a walk with pushes leaves the map's exits
+# reachable may visit (Pathfinder._reachable_exits); past it the check answers "unknown".
+BOULDER_REACH_MAX_NODES = 20000
 # Grid symbols a boulder may be pushed onto: floor and tall grass. pret TryPushBoulder wants
 # GetCollisionAtCoords == COLLISION_NONE and no MetatileBehavior_IsNonAnimDoor; doors,
 # stairs and other warps ('D'/'S'), ledges, water and walls are refused here, the doors and
@@ -205,7 +212,52 @@ def elevation_allows(here, there, from_symbol: str, dest_symbol: str, walker: Op
     return elevation_step(walker, there[3]) is not None
 
 
-def walk_steps(tiles, grid, x: int, y: int, walker: Optional[int], surf: bool, walls):
+def is_waterfall(tile) -> bool:
+    return tile_behavior_name(tile) == "WATERFALL"
+
+
+def waterfall_run(tiles, x: int, y: int, dy: int) -> Optional[Tuple[int, int]]:
+    """Where a surfer on the waterfall tile (x, y) comes out going dy (1: down, -1: up): the
+    first tile that way that is no waterfall, when it is surf water; else None.
+
+    pret: MB_WATERFALL is surfable (metatile_behavior.c TILE_FLAG_SURFABLE), and standing on
+    one is forced movement south (field_player_avatar.c sForcedMovementTestFuncs pairs
+    MetatileBehavior_IsWaterfall with ForcedMovement_PushedSouthByCurrent) until the tile is
+    no waterfall: a surfer goes down one without any move. Up is the Waterfall field move
+    (field_effect.c WaterfallFieldEffect_RideUp, again while
+    MetatileBehavior_IsWaterfall(currentMetatileBehavior)), which game_tools.WATERFALL
+    needs."""
+    while 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) and is_waterfall(tiles[y][x]):
+        y += dy
+    if not (0 <= y < len(tiles) and 0 <= x < len(tiles[y])):
+        return None
+    return (x, y) if is_surf_water(tiles[y][x]) else None
+
+
+def waterfall_steps(tiles, x: int, y: int, climb: bool):
+    """(landing tile, button, climbed) for each waterfall beside a surfer on (x, y):
+    down it (pressed into it from the north, east or west: the current takes the surfer
+    down to the first water below) and, with climb, up it (from the water below, facing
+    north: the Waterfall field move)."""
+    here = tiles[y][x] if 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
+    if here is None or not is_surf_water(here):
+        return
+    for dx, dy, button in ((1, 0, "RIGHT"), (-1, 0, "LEFT"), (0, 1, "DOWN"), (0, -1, "UP")):
+        nx, ny = x + dx, y + dy
+        if not (0 <= ny < len(tiles) and 0 <= nx < len(tiles[ny])) or not is_waterfall(tiles[ny][nx]):
+            continue
+        if dy == -1:
+            if climb:
+                land = waterfall_run(tiles, nx, ny, -1)
+                if land is not None:
+                    yield land, button, True
+            continue
+        land = waterfall_run(tiles, nx, ny, 1)
+        if land is not None:
+            yield land, button, False
+
+
+def walk_steps(tiles, grid, x: int, y: int, walker: Optional[int], surf: bool, walls, waterfall: bool = False):
     """(nx, ny, the walker's elevation there) for each tile a walker at elevation `walker`
     on (x, y) can step onto: the tile planner's rules (_can_move_to with the blocked set's
     collision rule) for the floods that don't plan a walk, the route areas
@@ -214,10 +266,17 @@ def walk_steps(tiles, grid, x: int, y: int, walker: Optional[int], surf: bool, w
     tiles are the layout tuples, grid the symbols by row; walls are symbols never entered
     (water among them is still entered where water_step allows it). Ledge directions are
     the caller's: a ledge tile is entered from any side here.
+
+    waterfall: a surfer who can climb waterfalls goes up and down them (waterfall_steps).
+    Without the climb the way down is one-way, which these floods (they join both ends)
+    can't hold; the tile planner takes it (Pathfinder._astar).
     """
     here = tiles[y][x] if 0 <= y < len(tiles) and 0 <= x < len(tiles[y]) else None
     if walker is None and here is not None and len(here) > 3 and here[3] != BRIDGE_ELEVATION:
         walker = here[3]
+    if waterfall:
+        for (lx, ly), _, _ in waterfall_steps(tiles, x, y, True):
+            yield lx, ly, WATER_ELEVATION
     from_symbol = grid[y][x]
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         nx, ny = x + dx, y + dy
@@ -301,7 +360,10 @@ class Node:
     gates: tuple | None = None  # rotating gates' orientations here (rotating_gates.py)
     boulders: tuple | None = None  # Strength boulders' tiles here, sorted (None: not modelled)
     push: tuple | None = None  # (button, boulder tile, tile it went to) when this step pushed one
-    pushes: int = 0  # pushes made on the way here
+    pushes: int = 0  # pushes and clears made on the way here
+    rocks: tuple | None = None  # clearable rocks/trees still standing, sorted (None: not modelled)
+    clear: tuple | None = None  # (button, tile) when this step cleared a rock or tree there
+    climb: tuple | None = None  # (foot tile, waterfall tile) when this step climbed a waterfall
 
     def __post_init__(self):
         self.f_cost = self.g_cost + self.h_cost
@@ -399,6 +461,7 @@ class Pathfinder:
         self.last_pushes = []
         self.last_path_buttons = []
         self.last_scene = None
+        self.last_path_end = None
 
         # CRITICAL: Require porymap data - no fallback allowed
         if not map_data:
@@ -518,6 +581,10 @@ class Pathfinder:
         # search state instead.
         if boulders and not map_data.get("strength"):
             blocked |= boulders - {start}
+        # A walk to a tile that is no exit may push boulders and clear rocks only so that
+        # every exit the player could reach before stays reachable after (_astar).
+        if boulders and map_data.get("strength") and not goal_is_warp:
+            map_data["keep_exits"] = [tuple(p) for p in map_data.get("raw_warps") or []]
 
         # Ensure start is never blocked
         blocked.discard(start)
@@ -650,14 +717,24 @@ class Pathfinder:
                 if len(partial_path) > 25:
                     partial_path = partial_path[:15]
                     logger.info(f"Limiting partial path to first 25 steps")
+                # Up to the first waterfall: a ride down or up is no plain press per tile.
+                for i in range(1, len(partial_path)):
+                    (ax, ay), (bx, by) = partial_path[i - 1], partial_path[i]
+                    if abs(ax - bx) + abs(ay - by) > 1:
+                        partial_path = partial_path[:i]
+                        break
 
                 logger.info(f"Partial path: {len(partial_path)} steps toward goal")
+                self.last_path_end = partial_path[-1]
                 return self._path_to_buttons(partial_path)
             else:
                 logger.warning(f"No progress possible toward {goal}")
                 return None
         else:
             path = result
+            # Where the walk ends: a ride down a waterfall is one press for several tiles,
+            # so counting presses (field_control.end_of_path) can't tell.
+            self.last_path_end = path[-1] if path else start
 
         # A push repeats the player's tile in the path, so its press comes from the nodes.
         base_buttons = list(self.last_path_buttons) if self.last_pushes else self._path_to_buttons(path)
@@ -718,6 +795,8 @@ class Pathfinder:
                     "clearable": porymap.get("clearable", []),
                     # The party can Surf now (game_tools.can_surf): water joins the walk.
                     "surf": bool(porymap.get("surf")),
+                    # The party can climb waterfalls (game_tools.can_climb_waterfalls).
+                    "waterfall": bool(porymap.get("waterfall")),
                     # The map's rotating gate puzzle and the gates' live orientations
                     # (game_tools.load_pathfinding_state): steps push and turn them.
                     "rotating_gates": porymap.get("rotating_gates"),
@@ -1718,11 +1797,26 @@ class Pathfinder:
         start_boulders = None
         if map_data.get("strength") and map_data.get("boulders"):
             start_boulders = tuple(sorted({tuple(b) for b in map_data["boulders"]} - {start}))
+        clearable = {tuple(t) for t in map_data.get("clearable") or []}
+        # Among boulders, the rocks and trees the party can clear are search state too: one
+        # stops a push (pret TryPushBoulder: an object on the tile behind), and clearing it
+        # (from a tile beside it, Rock Smash or Cut) is a step of the plan. Seen live
+        # (2026-11-05, SEAFLOOR CAVERN ROOM1): the walk planned a push from the rock's tile
+        # (5,10) as if the rock were floor, stopped beside it at (4,10), and reported "the
+        # boulder at (5,11) was not pushed". The way: smash (5,10), push (5,11) DOWN, push
+        # (12,11) RIGHT. Elsewhere a walk still bumps into a rock and clears it (cost).
+        start_rocks = None
+        if start_boulders is not None and clearable:
+            standing = {(o.get("x"), o.get("y")) for o in map_data.get("objects") or []}
+            start_rocks = tuple(sorted(clearable & standing))
+        # Exits a walk with pushes must leave reachable (keep_exits_reachable); found on
+        # the first goal reached by a walk that moved something.
+        exits_before = None
 
-        def key(pos, carried, gates=None, boulders=None):
+        def key(pos, carried, gates=None, boulders=None, rocks=None):
             # On a bridge, the same tile walked on from different floors leads on
             # differently, so it is a different search state.
-            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None, gates, boulders)
+            return (pos, carried if elevation(pos) == BRIDGE_ELEVATION else None, gates, boulders, rocks)
 
         # The player's own elevation where the walk starts from their tile (pret
         # gObjectEvents[player].currentElevation, game_tools.load_pathfinding_state): on a
@@ -1731,17 +1825,16 @@ class Pathfinder:
         start_carried = carried_after(live if start == map_data.get("start_position") else None, start)
         start_node = Node(
             start[0], start[1], 0, self._heuristic(start, goal), carried=start_carried, gates=start_gates,
-            boulders=start_boulders,
+            boulders=start_boulders, rocks=start_rocks,
         )
         goal_node = Node(goal[0], goal[1])
-        clearable = {tuple(t) for t in map_data.get("clearable") or []}
         self.last_pushes = []
         self.last_path_buttons = []
 
         open_list = []
         heapq.heappush(open_list, start_node)
         closed_set = set()
-        node_map = {key(start, start_carried, start_gates, start_boulders): start_node}
+        node_map = {key(start, start_carried, start_gates, start_boulders, start_rocks): start_node}
 
         # Track the best node (closest to goal) in case we can't reach it
         best_node = start_node
@@ -1752,10 +1845,20 @@ class Pathfinder:
 
             # Check if we reached the goal
             if (current.x, current.y) == goal:
+                # A walk that moved boulders or cleared rocks may not cut the player off from
+                # an exit they could reach before (keep_exits_reachable); the search goes on
+                # to the next way there instead.
+                if current.pushes and map_data.get("keep_exits"):
+                    if exits_before is None:
+                        exits_before = self._reachable_exits(start, start_boulders, start_rocks, blocked, map_data)
+                    after = self._reachable_exits(goal, current.boulders, current.rocks, blocked, map_data)
+                    if exits_before is not None and after is not None and not exits_before <= after:
+                        logger.info(f"Pathfinding: a walk to {goal} would cut off {sorted(exits_before - after)}")
+                        continue
                 # How the walk leaves the gates, for the caller to check after walking.
                 self.last_gate_orientations = current.gates
-                if start_boulders is not None:
-                    self.last_path_buttons, self.last_pushes = self._node_buttons(current)
+                # Pushes, clears and waterfall climbs: steps the walk stops for (push_plan).
+                self.last_path_buttons, self.last_pushes = self._node_buttons(current)
                 return self._reconstruct_path(current)
 
             if start_boulders is not None:
@@ -1771,7 +1874,7 @@ class Pathfinder:
             if current.g_cost > max_distance * max(1.0, self.grass_cost):
                 continue
 
-            closed_set.add(key((current.x, current.y), current.carried, current.gates, current.boulders))
+            closed_set.add(key((current.x, current.y), current.carried, current.gates, current.boulders, current.rocks))
 
             # Update best node if this one is closer to goal
             if current.h_cost < best_node.h_cost:
@@ -1784,7 +1887,24 @@ class Pathfinder:
             # This helps find optimal paths faster
             neighbors_with_cost = []
             here = (current.x, current.y)
+            rocks = current.rocks
             for neighbor_pos in neighbors:
+                if rocks is not None and neighbor_pos in rocks:
+                    # A rock or tree beside the player: clear it from here (the field move
+                    # is used facing it); the player stays where they are.
+                    if current.pushes >= BOULDER_MAX_PUSHES or not self._can_move_to(
+                        here, neighbor_pos, map_data, current.carried
+                    ):
+                        continue
+                    left = tuple(t for t in rocks if t != neighbor_pos)
+                    if key(here, current.carried, current.gates, current.boulders, left) in closed_set:
+                        continue
+                    button = self._path_to_buttons([here, neighbor_pos])[0]
+                    neighbors_with_cost.append(
+                        (here, current.g_cost + CLEARABLE_TILE_COST, current.h_cost, current.carried, current.gates,
+                         current.boulders, None, left, (button, neighbor_pos))
+                    )
+                    continue
                 if current.boulders is not None and neighbor_pos in current.boulders:
                     # A step into a boulder pushes it (pret TryPushBoulder) when the walk to
                     # it would be a legal step; the player stays where they are.
@@ -1793,16 +1913,17 @@ class Pathfinder:
                         here, neighbor_pos, map_data, current.carried
                     ):
                         continue
-                    to = self._push_target(neighbor_pos, delta, current.boulders, blocked, map_data)
+                    gone = frozenset(start_rocks or ()) - frozenset(rocks or ())
+                    to = self._push_target(neighbor_pos, delta, current.boulders, blocked, map_data, rocks, gone)
                     if to is None:
                         continue
                     moved = tuple(sorted((set(current.boulders) - {neighbor_pos}) | {to}))
-                    if key(here, current.carried, current.gates, moved) in closed_set:
+                    if key(here, current.carried, current.gates, moved, rocks) in closed_set:
                         continue
                     button = self._path_to_buttons([here, neighbor_pos])[0]
                     neighbors_with_cost.append(
                         (here, current.g_cost + BOULDER_PUSH_COST, current.h_cost, current.carried, current.gates,
-                         moved, (button, neighbor_pos, to))
+                         moved, (button, neighbor_pos, to), rocks, None)
                     )
                     continue
                 carried = carried_after(current.carried, neighbor_pos)
@@ -1814,7 +1935,7 @@ class Pathfinder:
                 gates = gates_after(current.gates, (current.x, current.y), neighbor_pos)
                 if puzzle is not None and gates is None:
                     continue  # a gate's arm is in the way and can't turn
-                if key(neighbor_pos, carried, gates, current.boulders) in closed_set:
+                if key(neighbor_pos, carried, gates, current.boulders, rocks) in closed_set:
                     continue
 
                 # Calculate movement cost - add penalty for grass tiles to avoid wild encounters
@@ -1830,26 +1951,49 @@ class Pathfinder:
                             cell = row[nx]
                             if cell == "~":  # Grass tile
                                 move_cost = self.grass_cost
-                if neighbor_pos in clearable:
+                if neighbor_pos in clearable and rocks is None:
                     move_cost = CLEARABLE_TILE_COST
                 elif surf and is_surf_water(raw_tile(neighbor_pos)) and not is_surf_water(raw_tile((current.x, current.y))):
                     move_cost = SURF_START_COST
 
                 g_cost = current.g_cost + move_cost
                 h_cost = self._heuristic(neighbor_pos, goal)
-                neighbors_with_cost.append((neighbor_pos, g_cost, h_cost, carried, gates, current.boulders, None))
+                neighbors_with_cost.append(
+                    (neighbor_pos, g_cost, h_cost, carried, gates, current.boulders, None, rocks, None)
+                )
+
+            # Waterfalls beside a surfer: down with the current, up with the Waterfall field
+            # move (waterfall_steps). Seen live (2026-11-05, VICTORY ROAD B2F): the ways from
+            # where the stairs come in to the stairs at (19,12) and (5,26) go down a waterfall
+            # (and from (30,25) up one first); every waterfall was a wall to the planner, and
+            # navigate_to said "No complete path".
+            climbs = []
+            if surf and raw_tiles:
+                for land, button, climbed in waterfall_steps(raw_tiles, current.x, current.y, bool(map_data.get("waterfall"))):
+                    if land in blocked or key(land, WATER_ELEVATION, current.gates, current.boulders, rocks) in closed_set:
+                        continue
+                    run = abs(land[1] - current.y) + abs(land[0] - current.x)
+                    cost = run + (CLEARABLE_TILE_COST if climbed else 0)
+                    climb = (here, (current.x, current.y - 1)) if climbed else None
+                    climbs.append(climb)
+                    neighbors_with_cost.append(
+                        (land, current.g_cost + cost, self._heuristic(land, goal), carried_after(current.carried, land),
+                         current.gates, current.boulders, None, rocks, None)
+                    )
+            climb_of = {entry[0]: c for entry, c in zip(neighbors_with_cost[len(neighbors_with_cost) - len(climbs):], climbs)}
 
             # Sort by h_cost (distance to goal) so we explore promising directions first
             # This helps find optimal paths when multiple neighbors have same f_cost
             neighbors_with_cost.sort(key=lambda x: x[2])  # Sort by h_cost
 
-            for neighbor_pos, g_cost, h_cost, carried, gates, boulders, push in neighbors_with_cost:
-                state = key(neighbor_pos, carried, gates, boulders)
-                pushes = current.pushes + (1 if push else 0)
+            for neighbor_pos, g_cost, h_cost, carried, gates, boulders, push, left, clear in neighbors_with_cost:
+                state = key(neighbor_pos, carried, gates, boulders, left)
+                pushes = current.pushes + (1 if push or clear else 0)
+                climb = climb_of.get(neighbor_pos)
                 if state not in node_map:
                     neighbor = Node(
                         neighbor_pos[0], neighbor_pos[1], g_cost, h_cost, carried=carried, gates=gates,
-                        boulders=boulders, push=push, pushes=pushes,
+                        boulders=boulders, push=push, pushes=pushes, rocks=left, clear=clear, climb=climb,
                     )
                     neighbor.parent = current
                     node_map[state] = neighbor
@@ -1860,7 +2004,7 @@ class Pathfinder:
                         neighbor.g_cost = g_cost
                         neighbor.f_cost = g_cost + neighbor.h_cost
                         neighbor.parent = current
-                        neighbor.push, neighbor.pushes = push, pushes
+                        neighbor.push, neighbor.pushes, neighbor.clear, neighbor.climb = push, pushes, clear, climb
 
         # No path found - return the best node we explored (for partial paths)
         return (None, best_node)
@@ -1965,11 +2109,63 @@ class Pathfinder:
         for before, after in zip(chain, chain[1:]):
             if after.push is not None:
                 button, boulder, to = after.push
-                pushes.append({"index": len(buttons), "button": button, "boulder": boulder, "to": to})
+                pushes.append({"index": len(buttons), "button": button, "boulder": boulder, "to": to, "kind": "push"})
+                buttons.append(button)
+            elif after.climb is not None:
+                # Up a waterfall: the server uses WATERFALL facing it from the foot (UP turns
+                # the surfer north), and the ride ends on the water above.
+                foot, fall = after.climb
+                pushes.append({"index": len(buttons), "button": "UP", "boulder": fall, "to": (after.x, after.y), "kind": "waterfall"})
+                buttons.append("UP")
+            elif after.clear is not None:
+                # The press faces the rock (it is an object: the step only turns the player).
+                button, tile = after.clear
+                pushes.append({"index": len(buttons), "button": button, "boulder": tile, "to": None, "kind": "clear"})
                 buttons.append(button)
             else:
                 buttons.extend(self._path_to_buttons([(before.x, before.y), (after.x, after.y)]))
         return buttons, pushes
+
+    def _reachable_exits(self, start, boulders, rocks, blocked, map_data) -> Optional[frozenset]:
+        """The map_data["keep_exits"] tiles a walker on `start` can still get to, pushing
+        boulders and clearing rocks as the search does (a breadth-first walk over the same
+        states); None when that takes more than BOULDER_REACH_MAX_NODES states (unknown).
+
+        Seen live (2026-11-05, SEAFLOOR CAVERN ROOM1): a walk pushed the boulder from
+        (12,11) up column 12 to (12,7), where it fills the only corridor ((12,6) is a wall);
+        the room could not be crossed again until the player left and came back."""
+        exits = {tuple(t) for t in map_data.get("keep_exits") or []}
+        if not exits:
+            return frozenset()
+        start_rocks = frozenset(rocks or ())
+        first = (tuple(start), boulders, rocks)
+        seen, queue, found = {first}, [first], set()
+        while queue:
+            if len(seen) > BOULDER_REACH_MAX_NODES:
+                return None
+            pos, stones, standing = queue.pop()
+            node = Node(pos[0], pos[1])
+            for nxt in self._get_neighbors(node, blocked - exits):
+                if not self._can_move_to(pos, nxt, map_data, None):
+                    continue
+                if nxt in exits:
+                    found.add(nxt)
+                    continue
+                state = None
+                if standing is not None and nxt in standing:
+                    state = (pos, stones, tuple(t for t in standing if t != nxt))
+                elif stones is not None and nxt in stones:
+                    delta = (nxt[0] - pos[0], nxt[1] - pos[1])
+                    gone = start_rocks - frozenset(standing or ())
+                    to = self._push_target(nxt, delta, stones, blocked, map_data, standing, gone)
+                    if to is not None:
+                        state = (pos, tuple(sorted((set(stones) - {nxt}) | {to})), standing)
+                else:
+                    state = (nxt, stones, standing)
+                if state is not None and state not in seen:
+                    seen.add(state)
+                    queue.append(state)
+        return frozenset(found)
 
     def _push_target(
         self,
@@ -1978,9 +2174,13 @@ class Pathfinder:
         boulders,
         blocked: Set[Tuple[int, int]],
         map_data: Dict,
+        rocks=None,
+        gone=frozenset(),
     ) -> Optional[Tuple[int, int]]:
         """Where a push in direction delta moves the boulder on `boulder`, or None when the
-        game would not move it (or this planner won't).
+        game would not move it (or this planner won't). rocks: the rocks and trees still
+        standing where the search models them; gone: the ones it has cleared, whose
+        map-file tiles hold no object any more.
 
         pret src/field_player_avatar.c TryPushBoulder: the tile behind must give
         GetCollisionAtCoords(boulder, ...) == COLLISION_NONE (src/event_object_movement.c:
@@ -1997,8 +2197,8 @@ class Pathfinder:
             return None
         if target in {tuple(p) for p in map_data.get("raw_warps") or []}:
             return None
-        if target in self._object_tiles(map_data):
-            return None  # pret DoesObjectCollideWithObjectAt: a person stands there
+        if target in (self._object_tiles(map_data) - set(gone)) or target in (rocks or ()):
+            return None  # pret DoesObjectCollideWithObjectAt: a person (or a rock) stands there
         raw_tiles = map_data.get("raw_tiles") or []
 
         def tile(pos):

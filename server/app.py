@@ -5309,18 +5309,52 @@ async def _clear_obstacle(tile, source: str) -> Optional[str]:
     move = game_tools.clearable_obstacles(ROM_TO_PORYMAP_MAP.get(_location_name(), "")).get(tuple(tile))
     if move is None:
         return None
+    from server import menu_state as ms
+
+    def in_battle() -> bool:
+        return bool(_mem(lambda r: r.is_in_battle()))
+
     await _macro_press(["A"], source)
     for _ in range(CLEAR_OBSTACLE_PRESSES):
-        await _await_game(lambda: _box_waits_for_a() or _player_can_walk(), MACRO_TEXT_FRAMES)
-        if _player_can_walk():
+        await _await_game(lambda: _box_waits_for_a() or _player_can_walk() or in_battle(), MACRO_TEXT_FRAMES)
+        if _player_can_walk() or in_battle():
             break
-        if _box_waits_for_a():
-            await _macro_press(["A"], source)  # the text, and YES at "Would you like to use …?"
+        if _mem(ms.task_running, ms.TASK_FIELD_YES_NO):
+            # "Would you like to use ROCK SMASH?": YES by the cursor, never by a blind A.
+            # Seen live (2026-11-05): a stray DOWN after A had put the cursor on NO.
+            await _await_game(lambda: _mem(ms.yes_no_ready), 30)
+            if await _answer_yes(source) is not None:
+                await _close_dialogue(source)
+                return None
+        elif _box_waits_for_a():
+            await _macro_press(["A"], source)  # the rock's text, and "<MON> used ROCK SMASH!"
+    # pret data/scripts/field_move_scripts.inc EventScript_SmashRock: special
+    # RockSmashWildEncounter may start a wild battle right after the smash; the rock is
+    # gone then (removeobject came first), so the move counts as used.
+    if in_battle():
+        return move.replace("_", " ")
     # The object vanishes after the animation; give it a moment.
     await _await_game(lambda: not _mem(lambda r: npc_at(r, tile[0], tile[1])), MACRO_MENU_FRAMES)
     if _mem(lambda r: npc_at(r, tile[0], tile[1])) or not _player_can_walk():
         return None
     return move.replace("_", " ")
+
+
+async def _answer_yes(source: str) -> Optional[str]:
+    """Answer the YES/NO on screen with YES, read by its cursor (menu_state.read_menu_cursor:
+    UP when it is on NO, then A). None when YES was pressed, else why not (B answers NO:
+    the question is never left up)."""
+    from server import menu_state as ms
+
+    cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor == 1 and cursor.cursor == 1:
+        await _macro_press(["UP"], source)
+        cursor = _mem(ms.read_menu_cursor)
+    if cursor.max_cursor != 1 or cursor.cursor != 0:
+        await _macro_press(["B"], source)
+        return f"the YES/NO cursor is not on YES (cursor {cursor.cursor})"
+    await _macro_press(["A"], source)  # YES
+    return None
 
 
 # The Surf field effect: the player's pose, the Pokémon shown, the jump onto its back
@@ -5517,8 +5551,9 @@ STRENGTH_EFFECT_FRAMES = 600
 BOULDER_PUSH_FRAMES = 180
 # Presses toward a boulder before a push is called a failure: one may only turn the player.
 BOULDER_PUSH_TRIES = 3
-# Pushes one navigate_to or go_to_exit may make before it stops and reports.
-STRENGTH_MAX_PUSHES = 8
+# Pushes, rock clears and waterfall climbs one navigate_to or go_to_exit may make before it
+# stops and reports: as many as one plan may hold (pathfinding.BOULDER_MAX_PUSHES).
+STRENGTH_MAX_PUSHES = 12
 FLAG_SYS_USE_STRENGTH = 0x889  # pret include/constants/flags.h (SYSTEM_FLAGS + 0x29)
 
 
@@ -5557,15 +5592,10 @@ async def _use_strength(boulder, button: str, source: str) -> Tuple[Optional[str
     if not asked:
         await _close_dialogue(source)
         return None, f"A at the boulder {tuple(boulder)} asked nothing ({_quote(texts) or 'nothing was said'})"
-    cursor = _mem(ms.read_menu_cursor)
-    if cursor.max_cursor == 1 and cursor.cursor == 1:
-        await _macro_press(["UP"], source)
-        cursor = _mem(ms.read_menu_cursor)
-    if cursor.max_cursor != 1 or cursor.cursor != 0:
-        await _macro_press(["B"], source)  # B answers NO: never leave the question up
+    why = await _answer_yes(source)
+    if why:
         await _close_dialogue(source)
-        return None, f"the STRENGTH question's YES/NO cursor is not on YES (cursor {cursor.cursor})"
-    await _macro_press(["A"], source)  # YES
+        return None, f"the STRENGTH question: {why}"
 
     def ready() -> bool:
         return _strength_on() and _player_can_walk()
@@ -5626,6 +5656,90 @@ async def _push_boulder(boulder, button: str, source: str) -> Tuple[bool, str]:
     if not pushed():
         return False, f"{first}the boulder at {tuple(boulder)} did not move (pushed {button} toward {to})"
     return True, f"{first}pushed the boulder at {tuple(boulder)} {button} to {to}"
+
+
+# A press that only turns a surfer who stands still (pret PlayerNotOnBikeTurningInPlace):
+# let go before the turn ends, or the held button moves them on, here into the waterfall.
+TURN_ONLY_HOLD_FRAMES = 2
+# The Waterfall ride after YES: the Pokémon shown, then a ride up each tile (pret
+# field_effect.c WaterfallFieldEffect_*), in game frames, with room to spare.
+WATERFALL_RIDE_FRAMES = 1800
+
+
+async def _climb_waterfall(fall, source: str) -> Tuple[bool, str]:
+    """Up the waterfall on `fall` (map tile north of the surfing player): face it, A,
+    "Would you like to use WATERFALL?" YES by the cursor, the text, then the ride, which
+    ends on the water above. Returns (climbed, what happened).
+
+    pret field_control_avatar.c GetInteractedWaterScript: EventScript_UseWaterfall needs
+    FLAG_BADGE08_GET and IsPlayerSurfingNorth() (movement direction north, surfing);
+    data/scripts/field_move_scripts.inc: checkpartymove MOVE_WATERFALL, MSGBOX_YESNO,
+    Text_MonUsedWaterfall, FLDEFF_USE_WATERFALL."""
+    from server import menu_state as ms
+
+    start = _field_snapshot()
+    if start is None or (start.x, start.y - 1) != tuple(fall):
+        where = f"({start.x},{start.y})" if start is not None else "an unknown tile"
+        return False, f"the waterfall at {tuple(fall)} was not climbed: the walk ended at {where}, not below it"
+    if start.facing != "UP":
+        queued = await take_action(ActionRequest(
+            buttons=["UP"], hold_frames=TURN_ONLY_HOLD_FRAMES, release_frames=TURN_ONLY_HOLD_FRAMES, source=source,
+        ))
+        await _await_sequence(queued.get("sequence_id"), _sequence_frames(1))
+        await _await_game(_player_can_walk, MACRO_MENU_FRAMES)
+    await _macro_press(["A"], source)
+    asked, texts = await _talk_until(lambda: _mem(ms.task_running, ms.TASK_FIELD_YES_NO))
+    if not asked:
+        await _close_dialogue(source)
+        said = _quote(texts) or "nothing was said"
+        return False, f"A at the waterfall {tuple(fall)} did not offer WATERFALL ({said})"
+    why = await _answer_yes(source)
+    if why:
+        await _close_dialogue(source)
+        return False, f"the WATERFALL question: {why}"
+
+    def above() -> bool:
+        snap = _field_snapshot()
+        return snap is not None and snap.y < fall[1] and _player_can_walk()
+
+    for _ in range(STRENGTH_PRESSES):
+        await _await_game(lambda: above() or _box_waits_for_a(), WATERFALL_RIDE_FRAMES)
+        if above():
+            break
+        if _box_waits_for_a():
+            await _macro_press(["A"], source)  # "<MON> used WATERFALL."
+    if not await _await_game(above, WATERFALL_RIDE_FRAMES):
+        return False, f"answered YES to WATERFALL at {tuple(fall)} but did not get up it{_screen_note()}"
+    return True, f"climbed the waterfall at {tuple(fall)} to {_position_text(_field_snapshot())}"
+
+
+async def _obstacle_step(step: Dict[str, Any], tile, source: str) -> Tuple[bool, str]:
+    """One step of a plan that the walk stops for (game_tools.push_plan's "push"): push the
+    boulder on `tile` (map coordinates), clear the rock or tree there ("kind": "clear": face
+    it, then the field move, _clear_obstacle), or climb the waterfall there ("kind":
+    "waterfall", _climb_waterfall). Returns (done, what happened)."""
+    from server.field_control import DIRECTION_DELTAS
+
+    if step.get("kind") == "waterfall":
+        return await _climb_waterfall(tile, source)
+    if step.get("kind") != "clear":
+        return await _push_boulder(tile, step["button"], source)
+    dx, dy = DIRECTION_DELTAS[step["button"]]
+    snap = _field_snapshot()
+    if snap is None or (snap.x + dx, snap.y + dy) != tuple(tile):
+        where = f"({snap.x},{snap.y})" if snap is not None else "an unknown tile"
+        return False, f"the rock at {tuple(tile)} was not cleared: the walk ended at {where}, not beside it"
+    if snap.facing != step["button"]:
+        await _macro_press([step["button"]], source)  # the rock is an object: this only turns
+    used = await _clear_obstacle(tile, source)
+    if used is None:
+        return False, f"the rock at {tuple(tile)} was not cleared{_screen_note()}"
+    if _mem(lambda r: r.is_in_battle()):
+        return False, (
+            f"used {used} at {tuple(tile)}, and a wild POKéMON came out of the rock (pret "
+            "RockSmashWildEncounter): finish the battle, then call again"
+        )
+    return True, f"used {used} at {tuple(tile)}"
 
 
 @app.post("/mcp/go_to_exit")
@@ -5747,7 +5861,7 @@ async def mcp_go_to_exit(request: dict):
                     break
                 px, py = plan.get("coord_offset") or (0, 0)
                 tile = (boulder_push["boulder"][0] + px, boulder_push["boulder"][1] + py)
-                moved, said = await _push_boulder(tile, boulder_push["button"], "go_to_exit")
+                moved, said = await _obstacle_step(boulder_push, tile, "go_to_exit")
                 if not moved:
                     push_trouble = said
                     snap = _field_snapshot()
@@ -5836,6 +5950,31 @@ async def mcp_go_to_exit(request: dict):
                     snap = await _await_exit(plan, before, WARP_FRAMES)
                     if _went_through(plan, before, snap):
                         break
+                # Standing on the stairs the player came in by: a warp that fires on the
+                # step onto it (pret TryStartWarpEventScript, run for a step that ends on
+                # it) never fires for standing there or pressing on it. Step off, step back
+                # on. Seen in a test: go_to_exit("VICTORY ROAD B2F") on VICTORY ROAD B1F's
+                # ladder (5,26), just come up it, walked nothing and did not leave.
+                if not buttons and not _went_through(plan, before, snap):
+                    from server.field_control import DIRECTION_DELTAS
+                    from utils.state_formatter import ROM_TO_PORYMAP_MAP
+
+                    back = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
+                    raw = game_tools._raw_map_json(ROM_TO_PORYMAP_MAP.get(_location_name(), ""))
+                    warps = {(int(w.get("x", -1)) - ox, int(w.get("y", -1)) - oy) for w in raw.get("warp_events") or []}
+                    for button, (dx, dy) in DIRECTION_DELTAS.items():
+                        nx, ny = local[0] + dx, local[1] + dy
+                        if not (0 <= ny < len(grid) and 0 <= nx < len(grid[ny])) or grid[ny][nx] not in (".", "~"):
+                            continue
+                        if (nx, ny) in warps:
+                            continue
+                        pushes_tried.append(f"{button} and back")
+                        await take_action(ActionRequest(
+                            buttons=[button, back[button]], source="go_to_exit", check_movement=True,
+                        ))
+                        snap = await _await_exit(plan, before, WARP_FRAMES)
+                        if _went_through(plan, before, snap):
+                            break
 
         if not _went_through(plan, before, snap):
             # The map can change after the wait above gave up (a slow fade); look again
@@ -13259,7 +13398,13 @@ async def mcp_navigate_to(request: dict):
             surf_steps = int(request.get("_surfed", 0))
             if surf_steps < SURF_MAX_STEPS:
                 surfed = await _start_surf(tile, "navigate_to")
-                landed = None if surfed else await _await_landing(was_surfing)
+                # A walk that landed and walked on through a warp (the target's stairs) is
+                # over: planning again on the new map answered "No path found". Seen in a
+                # test: navigate_to(19, 12) on VICTORY ROAD B2F crossed the water, took the
+                # stairs at (19,12) and said "No path found from (17, 16) to (19, 12)".
+                now = _field_snapshot()
+                moved_map = now is not None and before is not None and now.map_id != before.map_id
+                landed = None if surfed or moved_map else await _await_landing(was_surfing)
                 ox, oy = result.get("coord_offset") or (0, 0)
                 if surfed or (landed is not None and (landed[0] - ox, landed[1] - oy) != (x, y)):
                     note = (
@@ -13299,7 +13444,7 @@ async def mcp_navigate_to(request: dict):
                     f"navigate_to({x}, {y}) again goes on."
                 ))
             tile = (boulder_push["boulder"][0] + ox, boulder_push["boulder"][1] + oy)
-            moved, said = await _push_boulder(tile, boulder_push["button"], "navigate_to")
+            moved, said = await _obstacle_step(boulder_push, tile, "navigate_to")
             if not moved:
                 return told(_refusal(f"Did not reach ({x},{y}): {said}. Now at {_position_text(_field_snapshot())}."))
             again = await mcp_navigate_to({**request, "_pushed": pushed_before + 1})
