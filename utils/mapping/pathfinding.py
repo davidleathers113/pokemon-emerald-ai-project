@@ -2062,6 +2062,12 @@ class Pathfinder:
         played at (40,25) and the street was open.
         """
         best = None
+        # The walk to a scene tile keeps off every other scene tile: the game stops it on
+        # the first one it steps on (pret field_control_avatar.c TryStartCoordEventScript),
+        # and the caller judges the stop by last_scene (app._stopped_in_scene). Among
+        # equally short walks one through (40,26) to (40,25) could otherwise be kept, its
+        # scene starting a tile before last_scene.
+        scene_tiles = {tuple(t) for scene in map_data.get("scenes") or [] for t in scene.get("tiles") or []}
         for scene in map_data.get("scenes") or []:
             clears = {tuple(t) for t in scene.get("clears") or []}
             if not clears:
@@ -2069,7 +2075,7 @@ class Pathfinder:
             for tile in {tuple(t) for t in scene.get("tiles") or []} - {start}:
                 if tile in blocked:
                     continue
-                to_scene = self._astar(start, tile, blocked, map_data, max_distance)
+                to_scene = self._astar(start, tile, blocked | (scene_tiles - {tile, start}), map_data, max_distance)
                 if not isinstance(to_scene, list):
                     continue
                 # The walker's elevation on the scene tile is that tile's own (_astar

@@ -166,6 +166,88 @@ def test_go_to_exit_house3_from_the_ninja_boy_through_the_scene():
     assert r["success"] is True and _location(s) == "MOSSDEEP CITY HOUSE3", (r, _location(s))
 
 
+def _step_in_front(s, buttons):
+    """Move the person nearest the player (their current, previous and initial coords)
+    onto the tile of the walk's first press in the direction the player already faces,
+    so the walk about to start bumps into them as the ninja boy did: a press that turns
+    the player first is judged a turn, not a block. pret struct ObjectEvent: +0x0C
+    initialCoords, +0x10 currentCoords, +0x14 previousCoords (s16 x, y, map coords +
+    MAP_OFFSET)."""
+    from server.field_control import (
+        DIRECTION_DELTAS,
+        G_OBJECT_EVENTS,
+        MAP_OFFSET,
+        OBJECT_EVENT_COUNT,
+        OBJECT_EVENT_SIZE,
+        _player_object_base,
+    )
+
+    reader = s.srv.env.memory_reader
+    player = _player_object_base(reader)
+    px, py = reader.read_coordinates()
+    x, y = px, py
+    facing = s.snapshot().facing
+    for button in buttons:
+        dx, dy = DIRECTION_DELTAS.get(button, (0, 0))
+        x, y = x + dx, y + dy
+        if button == facing:
+            break
+        facing = button
+    people = []
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        if base != player and reader._read_u8(base) & 1:
+            ox, oy = reader._read_s16(base + 0x10) - MAP_OFFSET, reader._read_s16(base + 0x12) - MAP_OFFSET
+            people.append((abs(ox - px) + abs(oy - py), base))
+    base = min(people)[1]
+    memory = s.srv.env.core.memory
+    for offset in (0x0C, 0x10, 0x14):
+        memory.u16[base + offset] = x + MAP_OFFSET
+        memory.u16[base + offset + 2] = y + MAP_OFFSET
+    # Frozen (ObjectEvent +0x01 bit 0) they stay on that tile: wandering on, they could
+    # stand where a turning press leads, which is judged a turn, not a block, and the
+    # walk loses a step for a reason this test is not about. The scene's releaseall
+    # (pret UnfreezeObjectEvents) lets them go.
+    memory.u8[base + 1] = memory.u8[base + 1] | 1
+    reader._invalidate_mem_cache()
+    return x, y
+
+
+def test_a_person_in_the_way_before_the_scene_is_not_taken_for_it():
+    """Seen in suite runs under load (2 of ~30): the ninja boy wandered into the first
+    walks from (25,21); each was BLOCKED by him, and go_to_exit counted every stopped walk
+    on a plan through the scene as the scene, so two blocks used up SCENE_REPLANS and the
+    real scene at (40,25) then ended the call: "Did not leave the map ... STOPPED at
+    (40,25) ... On the way: a scene played at (40, 25); a scene played at (40, 25)". Here a
+    person is put in front of the first two walks, as they start."""
+    s = server()
+    _at_the_street(s)
+    for _ in range(2):
+        s.call("mcp_navigate_to", {"x": 25, "y": 21, "variance": "none", "reason": "test"})
+        snap = s.snapshot()
+        if (snap.x, snap.y) == (25, 21):
+            break
+    take_action = s.srv.take_action
+    placed = []
+
+    async def walk_into_someone(request, *args, **kwargs):
+        if getattr(request, "source", None) == "go_to_exit" and len(placed) < 2:
+            with s.srv.memory_lock:
+                placed.append(_step_in_front(s, list(request.buttons)))
+        return await take_action(request, *args, **kwargs)
+
+    s.srv.take_action = walk_into_someone
+    try:
+        r = s.call("mcp_go_to_exit", {"exit": "MOSSDEEP CITY HOUSE3", "reasoning": "test"})
+    finally:
+        s.srv.take_action = take_action
+    print("   ", placed, r.get("summary") or r)
+    assert r["success"] is True and _location(s) == "MOSSDEEP CITY HOUSE3", (r, _location(s))
+    # The walk round the person may reach the scene on another of its tiles (SCENE_TILES).
+    scenes = [t for t in r.get("on_the_way", []) if t.startswith("a scene played at")]
+    assert len(scenes) == 1, r
+
+
 def _run_all(only=""):
     import test_movement_feedback as harness
 

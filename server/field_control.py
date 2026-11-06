@@ -208,6 +208,73 @@ def npc_at(reader, x: int, y: int) -> bool:
     return (x, y) in npc_positions(reader)
 
 
+# gBackupMapLayout is the map with MAP_OFFSET tiles of border round it: pret
+# include/fieldmap.h, InitBackupMapLayoutData makes it MAP_OFFSET_W tiles wider and
+# MAP_OFFSET_H tiles taller than the map.
+MAP_OFFSET_W = MAP_OFFSET * 2 + 1
+MAP_OFFSET_H = MAP_OFFSET * 2
+
+
+def _object_on(reader, x: int, y: int) -> bool:
+    """pret src/event_object_movement.c DoesObjectCollideWithObjectAt: an active object
+    other than the player on (x, y) as its currentCoords or its previousCoords (+0x14),
+    so a person stepping off the tile still blocks it until their step ends."""
+    player_base = _player_object_base(reader)
+    for i in range(OBJECT_EVENT_COUNT):
+        base = G_OBJECT_EVENTS + i * OBJECT_EVENT_SIZE
+        if base == player_base or not reader._read_u8(base) & 0x1:
+            continue
+        for coords in (0x10, 0x14):
+            if (reader._read_s16(base + coords) - MAP_OFFSET, reader._read_s16(base + coords + 2) - MAP_OFFSET) == (x, y):
+                return True
+    return False
+
+
+def _tile_lets_player_in(reader, x: int, y: int) -> bool:
+    """The map itself lets the player step onto (x, y): inside the map, no collision
+    bits, not a directionally impassable metatile, and no elevation mismatch, the checks
+    pret GetCollisionAtCoords (src/event_object_movement.c) makes before it looks for
+    objects. False when the map grid can't be read."""
+    if not reader._map_buffer_addr and not reader._find_map_buffer_addresses():
+        return False
+    if not reader._map_width or not reader._map_height:
+        return False
+    width, height = reader._map_width - MAP_OFFSET_W, reader._map_height - MAP_OFFSET_H
+    if not (0 <= x < width and 0 <= y < height):
+        return False  # off the edge with no connection the step would have taken
+    tiles = reader.read_map_metatiles(x + MAP_OFFSET, y + MAP_OFFSET, 1, 1)
+    if not tiles or not tiles[0]:
+        return False
+    _, behavior, collision, elevation = tiles[0][0]
+    if collision or "IMPASSABLE" in getattr(behavior, "name", ""):
+        return False
+    # pret IsElevationMismatchAt: no mismatch when the player is at ELEVATION_TRANSITION
+    # (0) or the tile is ELEVATION_TRANSITION or ELEVATION_MULTI_LEVEL (15).
+    mine = _current_elevation(reader, _player_object_base(reader))
+    return mine == 0 or elevation in (0, 15) or elevation == mine
+
+
+PERSON_ON_TILE = "is occupied by someone"
+PERSON_MOVED_ON = "was taken by someone who has moved on"
+
+
+def person_blocked_step(reader, x: int, y: int) -> str | None:
+    """Why a person, not the map, stopped a step onto (x, y), or None for the map:
+    PERSON_ON_TILE while they are still on it, PERSON_MOVED_ON when the tile itself lets
+    the player in (the caller rules out a rotating gate's arm, which also stands on floor).
+
+    The press is judged once the bump is over, and pret syncs previousCoords when an
+    object's step ends, so a person wandering off can be gone from both coords by then.
+    Seen in test_scene_walls (MOSSDEEP CITY): a person who stopped the walk at (27,20)
+    stood at (27,19) when the press was judged, and the walk said "(27,20) is not
+    walkable" of an open street tile."""
+    if _object_on(reader, x, y):
+        return PERSON_ON_TILE
+    if _tile_lets_player_in(reader, x, y):
+        return PERSON_MOVED_ON
+    return None
+
+
 # pret include/global.h struct SaveBlock1 +0xC70 objectEventTemplates[64]; struct
 # ObjectEventTemplate (24 bytes): +0 localId, +1 graphicsId, +4 s16 x, +6 s16 y.
 SAVE_BLOCK1_OBJECT_EVENT_TEMPLATES = 0xC70

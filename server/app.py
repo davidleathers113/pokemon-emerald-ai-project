@@ -1192,10 +1192,11 @@ def _judge_move(check: Dict[str, Any], after) -> None:
     global last_blocked_press
     from server.field_control import (
         BLOCKED,
+        PERSON_ON_TILE,
         blocked_target,
         interruption_cause,
         judge_direction_press,
-        npc_at,
+        person_blocked_step,
     )
 
     button, before, seq_id = check["button"], check["before"], check["seq_id"]
@@ -1213,9 +1214,11 @@ def _judge_move(check: Dict[str, Any], after) -> None:
     if verdict == BLOCKED:
         tx, ty = blocked_target(button, before)
         with memory_lock:
-            occupied = npc_at(env.memory_reader, tx, ty)
-            gate = not occupied and _gate_blocked(button, (tx, ty))
-        what = "is occupied by someone" if occupied else "is not walkable"
+            person = person_blocked_step(env.memory_reader, tx, ty)
+            gate = person != PERSON_ON_TILE and _gate_blocked(button, (tx, ty))
+        # A gate's arm stands on floor too: that is the gate, not someone who walked off.
+        occupied = None if gate else person
+        what = occupied or "is not walkable"
         if gate:
             # pret CheckForRotatingGatePuzzleCollision: the tile is floor; "not walkable"
             # would send the model looking for another way round a tile it can stand on.
@@ -1256,6 +1259,7 @@ def _judge_move(check: Dict[str, Any], after) -> None:
         # the walk ended where it did (e.g. a wild battle started on the last step).
         if report is not None:
             report["note"] = interruption_cause(after)
+            report["stopped_at"] = (after.x, after.y)
     else:
         message = (
             f"STOPPED at ({after.x},{after.y}) on {location}: {interruption_cause(after)}. "
@@ -1264,6 +1268,9 @@ def _judge_move(check: Dict[str, Any], after) -> None:
         if report is not None:
             report["interrupted"] = message
             report["skipped"] = skipped
+            # Where the game took the player over: a scene that moves the player may
+            # leave them elsewhere by the time the walk's caller looks (_stopped_in_scene).
+            report["stopped_at"] = (after.x, after.y)
         logger.warning(f"⏹️ {message} (before={before}, after={after})")
 
 
@@ -5373,6 +5380,25 @@ GATE_REPLANS = 3
 SCENE_REPLANS = 2
 
 
+def _stopped_in_scene(plan: dict[str, Any], report: dict[str, Any] | None) -> bool:
+    """The walk of a plan through a story scene (plan["scene"], the scene tile it walks
+    onto) was stopped by that scene: the game took the player over on that tile.
+
+    pret src/overworld.c DoCB1_Overworld: the step onto a coord event's tile runs its
+    script (field_control_avatar.c TryStartCoordEventScript, script.c
+    ScriptContext_SetupScript) and locks the field controls in the same frame, so the
+    walk stops exactly there. Any other stop (a person in the way, a wall) is not the
+    scene. Seen in suite runs under load (test_scene_walls, from (25,21) in MOSSDEEP
+    CITY): the ninja boy wandered into the first two walks, each BLOCKED was counted as
+    "a scene played at (40, 25)", and with SCENE_REPLANS spent the real scene then ended
+    go_to_exit with "Did not leave the map ... STOPPED at (40,25)"."""
+    if not plan.get("scene") or not report or report.get("blocked") or not report.get("stopped_at"):
+        return False
+    ox, oy = plan.get("coord_offset") or (0, 0)
+    x, y = report["stopped_at"]
+    return (x - ox, y - oy) == tuple(plan["scene"])
+
+
 async def _start_surf(tile, source: str) -> Optional[str]:
     """If the walk was stopped at the shore by water Surf can start onto (game_tools.
     surf_start_tile) and the party can Surf (game_tools.can_surf), Surf: face the water,
@@ -5872,7 +5898,7 @@ async def mcp_go_to_exit(request: dict):
             # The way went through a story scene that takes the people in the way off
             # (game_tools.scene_clears): the game stopped the walk there. Let the scene
             # play, then plan again from where it left the player.
-            if plan.get("scene") and not walk_clean and scenes < SCENE_REPLANS:
+            if _stopped_in_scene(plan, report) and scenes < SCENE_REPLANS:
                 scenes += 1
                 await _settle_after_interruption()
                 snap = _field_snapshot()
@@ -13675,10 +13701,7 @@ async def mcp_navigate_to(request: dict):
             # (game_tools.scene_clears): the game stopped the walk there. Let it play,
             # then walk on from where it left the player.
             scenes_before = int(request.get("_scenes", 0))
-            stopped = report is not None and not (
-                report.get("done") and not report.get("blocked") and not report.get("interrupted")
-            )
-            if result.get("scene") and stopped and scenes_before < SCENE_REPLANS:
+            if _stopped_in_scene(result, report) and scenes_before < SCENE_REPLANS:
                 await _settle_after_interruption()
                 if _player_can_walk() and not _mem(lambda r: r.is_in_battle()):
                     again = await mcp_navigate_to({**request, "_scenes": scenes_before + 1})
