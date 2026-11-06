@@ -9722,6 +9722,11 @@ async def _rematch_loop(request: Dict[str, Any]) -> Dict[str, Any]:
             return _refusal(f"Did not get to {map_name}: {went.get('error') or went.get('summary')}",
                             stopped_because="unexpected")
         notes.append(f"went to {map_name}")
+    # The party rule before the clock starts, as train does (_train): seen under load
+    # (a test at ~20 fps), the Exp. Share's TAKE and GIVE menus took the whole 1-minute
+    # limit and the loop never walked a step. max_minutes is for the rematches.
+    if not _mem(lambda r: r.is_in_battle()):
+        await _train_lead(trainee_pid, trainee_name, lowest, notes)
 
     started = time.monotonic()
     deadline = started + minutes * 60
@@ -9736,7 +9741,7 @@ async def _rematch_loop(request: Dict[str, Any]) -> Dict[str, Any]:
     skipped: set = set()  # trainers a talk didn't start a battle with, this call
     blocked_exits: set = set()  # ways out go_to_exit couldn't take (_rematch_reenter)
     heals = quiet_reentries = texts_read = 0
-    new_lead = True
+    new_lead = False  # led just above; the party rule runs again after each battle
     while stop is None:
         if _mem(lambda r: r.is_in_battle()):
             if lowest:
