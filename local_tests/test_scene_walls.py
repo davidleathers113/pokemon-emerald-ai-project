@@ -248,6 +248,57 @@ def test_a_person_in_the_way_before_the_scene_is_not_taken_for_it():
     assert len(scenes) == 1, r
 
 
+def test_settle_waits_out_a_long_silent_scene():
+    """_settle_after_interruption waits while a scene holds the player with no text box
+    (field controls locked, status BUSY) until the controls unlock. It used to hand back
+    after ~2160 frames (six dialogue reads of up to 360 frames each, then waits that ended
+    at once on BUSY) with the player still held.
+
+    No fixture holds a silent scene that long (MOSSDEEP CITY's Magma scene, the one the
+    walks here play, is ~430 frames), so this one is stretched in RAM: sLockFieldControls
+    (pret src/script.c, field_control.S_LOCK_FIELD_CONTROLS) set with no script running,
+    which nothing in the game clears, and cleared again HOLD frames later, past the old
+    hand-back and inside SCENE_SETTLE_FRAMES."""
+    import asyncio
+    import threading
+
+    from server.field_control import DIALOGUE_BUSY, S_LOCK_FIELD_CONTROLS
+
+    hold = 2700
+    s = server()
+    srv = s.srv
+    _at_the_street(s)
+    # getattr: the same test also runs against the pre-change server (no such cap).
+    assert hold < getattr(srv, "SCENE_SETTLE_FRAMES", hold + 1)
+    memory, reader = srv.env.core.memory, srv.env.memory_reader
+
+    def set_lock(value):
+        with srv.memory_lock:
+            memory.u8[S_LOCK_FIELD_CONTROLS] = value
+            reader._invalidate_mem_cache()
+
+    set_lock(1)
+    assert srv._field_status() == DIALOGUE_BUSY and not srv._player_can_walk()
+    locked_at = srv._frames_run
+    released = threading.Event()
+
+    def release_later():
+        while srv._frames_run - locked_at < hold:
+            time.sleep(0.005)
+        set_lock(0)
+        released.set()
+
+    threading.Thread(target=release_later, daemon=True).start()
+    try:
+        asyncio.run(srv._settle_after_interruption())
+        waited = srv._frames_run - locked_at
+        print(f"    settle returned after {waited} frames, released={released.is_set()}")
+        assert released.is_set() and srv._player_can_walk(), (waited, srv._field_snapshot())
+    finally:
+        released.wait(timeout=60)
+        set_lock(0)
+
+
 def _run_all(only=""):
     import test_movement_feedback as harness
 

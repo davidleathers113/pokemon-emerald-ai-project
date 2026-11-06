@@ -9965,6 +9965,11 @@ WALK_SCENE_WAITS = 3
 # _walk_along: go_to_exit calls that stopped short on a map, retried after a beat (a
 # person walking their beat may have stepped into the way), before the walk gives up.
 WALK_BLOCKED_RETRIES = 2
+# _settle_after_interruption: game frames a scene may hold the player with no text box
+# (field controls locked, status BUSY: people walking, a delay, a fade) before the settle
+# gives up and hands back. MOSSDEEP CITY's Magma scene, seen in a trace, holds them ~430
+# frames; the cap is for a lock that never lifts, not for any scene's length.
+SCENE_SETTLE_FRAMES = 4 * MACRO_TEXT_FRAMES
 
 
 async def _settle_after_interruption() -> None:
@@ -9974,24 +9979,33 @@ async def _settle_after_interruption() -> None:
     Seen live in FORTREE CITY GYM: a trainer spotting the player ("!", the walk up, their
     line) stopped talk_to's walk, and the walks it tried next pressed through the scene;
     the press after such a scene was also lost. Nothing is pressed into a battle or a
-    YES/NO here."""
-    from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+    YES/NO here.
 
-    reads = waits = 0
-    while not _player_can_walk() and not _mem(lambda r: r.is_in_battle()):
+    A silent stretch (BUSY) is waited out by game frames until the controls unlock, a
+    battle starts or a box opens, up to SCENE_SETTLE_FRAMES in all. It was read as
+    dialogue (at most six reads of up to 360 frames each) and the frame waits after them
+    ended at once, since their check also took BUSY as the end: a scene silent for more
+    than ~2160 frames was handed back with the player still held."""
+    from server.field_control import DIALOGUE_CHOICE, DIALOGUE_PLAIN
+
+    def battle() -> bool:
+        return bool(_mem(lambda r: r.is_in_battle()))
+
+    budget = _FrameBudget(SCENE_SETTLE_FRAMES)
+    reads = 0
+    while not _player_can_walk() and not battle():
         status = _field_status()
-        if status in (DIALOGUE_PLAIN, DIALOGUE_BUSY) and reads < 6:
+        if status == DIALOGUE_PLAIN and reads < 6:
             reads += 1
             await _read_dialogue()
             continue
-        if waits >= WALK_SCENE_WAITS:
+        if status in (DIALOGUE_PLAIN, DIALOGUE_CHOICE) or budget.spent():
+            # Text six reads did not get through, a YES/NO or menu (the caller's to
+            # answer), or a scene that never let go.
             return
-        waits += 1
         await _await_game(
-            lambda: _mem(lambda r: r.is_in_battle())
-            or _player_can_walk()
-            or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY),
-            MACRO_TEXT_FRAMES,
+            lambda: battle() or _player_can_walk() or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE),
+            max(1, budget.frames - budget.run),
         )
 
 
