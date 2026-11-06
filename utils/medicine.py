@@ -4,7 +4,7 @@ Used by server/app.py (use_item, train's healing) and by the battle view's item 
 (pokemon_env/memory_reader.py _battle_item_hint). Outside pokemon_env, whose package
 import loads the emulator, so the server can import it at load time.
 """
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # pret include/constants/items.h ids, the HP each restores (src/data/items.h holdEffectParam;
 # MEDICINE_FULL = all of it), the status1 bits it cures, whether it revives, and its Poké
@@ -33,6 +33,64 @@ MEDICINE: Dict[int, Tuple[int, int, bool, int]] = {
     28: (80, 0, False, 350),                         # LEMONADE
     29: (100, 0, False, 500),                        # MOOMOO MILK
 }
+
+
+# PP items (pret include/constants/items.h ids; src/data/pokemon/item_effects.h): the PP
+# each restores (MEDICINE_FULL = all of it) and whether it restores one move, picked in the
+# party menu's "Restore which move?" list (ITEM4_HEAL_PP_ONE, ItemUseCB_PPRecovery), or
+# every move. Seen live (2026-11-05, Elite Four): use_item("ETHER", "MANECTRIC",
+# move="THUNDER") restored SPARK, the first move in that list.
+PP_RESTORE: Dict[int, Tuple[int, bool]] = {
+    34: (10, True),               # ETHER
+    35: (MEDICINE_FULL, True),    # MAX ETHER
+    36: (10, False),              # ELIXIR
+    37: (MEDICINE_FULL, False),   # MAX ELIXIR
+}
+# PP UP and PP MAX raise one move's max PP, picked in the same list (ItemUseCB_PPUp): the
+# number of PP Ups each applies (pret pokemon.c ExecuteTableBasedItemEffect: ITEM4_PP_UP
+# adds one, ITEM5_PP_MAX sets three).
+PP_BOOST: Dict[int, int] = {69: 1, 71: 3}  # PP UP, PP MAX
+MAX_PP_UPS = 3
+
+
+def pp_item_picks_a_move(item_id: int) -> bool:
+    """The party menu asks which move: ETHER, MAX ETHER, PP UP, PP MAX."""
+    return item_id in PP_BOOST or (item_id in PP_RESTORE and PP_RESTORE[item_id][1])
+
+
+def pp_ups(pp_bonuses: int, index: int) -> int:
+    """PP Ups applied to move slot `index` (pret gPPUpGetMask: two bits per move)."""
+    return (pp_bonuses >> (2 * index)) & 3
+
+
+def max_pp(base_pp: int, pp_bonuses: int, index: int) -> int:
+    """pret pokemon.c CalculatePPWithBonus: base PP plus a fifth of it per PP Up."""
+    return base_pp + base_pp * 20 * pp_ups(pp_bonuses, index) // 100
+
+
+def pp_item_refusal(item_id: int, moves: List[Tuple[str, int, int, int]], index: Optional[int]) -> Optional[str]:
+    """Why this PP item would do nothing (pret TryUsePPItem: "It won't have any effect.",
+    nothing spent), else None. `moves` holds (name, PP, max PP, PP Ups) per move slot;
+    `index` is the slot picked for an item that takes one."""
+    if not pp_item_picks_a_move(item_id):
+        if all(pp >= top for _, pp, top, _ in moves):
+            return "every move has full PP"
+        return None
+    name, pp, top, ups = moves[index]
+    if item_id in PP_BOOST:
+        # ITEM4_PP_UP needs under 3 PP Ups and more than 4 max PP; ITEM5_PP_MAX, at least 5.
+        if ups >= MAX_PP_UPS or top < 5:
+            return f"{name}'s PP can't be raised any further ({ups} PP Ups, {top} max PP)"
+        return None
+    if pp >= top:
+        return f"{name} has full PP ({pp}/{top})"
+    return None
+
+
+def most_pp_missing(moves: List[Tuple[str, int, int, int]]) -> Optional[int]:
+    """The move slot with the most PP missing (the first of a tie), else None."""
+    missing = [(top - pp, -i) for i, (_, pp, top, _) in enumerate(moves) if top > pp]
+    return -max(missing)[1] if missing else None
 
 
 def medicine_for(mon, bag: Dict[int, int]) -> Optional[int]:

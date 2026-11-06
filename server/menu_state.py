@@ -81,6 +81,10 @@ TASK_BAG_INPUT = 0x081ABD28             # Task_BagMenu_HandleInput (the item lis
 TASK_BAG_CONTEXT = (0x081ACC04, 0x081ACC78)  # Task_ItemContext_SingleRow / _MultipleRows
 TASK_PARTY_CHOOSE = 0x081B1370          # Task_HandleChooseMonInput
 TASK_PARTY_SELECTION = 0x081B3730       # Task_HandleSelectionMenuInput (SHIFT/SUMMARY/CANCEL)
+# The party menu's move list for a PP item ("Restore which move?", pret party_menu.c
+# ItemUseCB_PPRecovery / ItemUseCB_PPUp → ShowMoveSelectWindow): the four moves in slot
+# order, the sMenu cursor on the first; A uses the item on the move under the cursor.
+TASK_PARTY_WHICH_MOVE = 0x081B6AB4      # Task_HandleWhichMoveInput
 TASK_CAUGHT_DEX_PAGE = 0x080C0088       # Task_HandleCaughtMonPageInput (waits for A/B)
 
 # ---------------------------------------------------------------------------

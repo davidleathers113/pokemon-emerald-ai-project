@@ -464,7 +464,7 @@ def format_tool_call_brief(name: str, args: Any) -> str:
     if name == "use_move":
         return f"use_move \"{args.get('move', '')}\""
     if name == "buy_item":
-        return f"buy_item \"{args.get('item', '')}\" x{args.get('count', 1)}"
+        return f"buy_item \"{args.get('item', '')}\" x{args.get('count', args.get('quantity', 1))}"
     if name == "teach_move":
         forget = f" forget {args['forget']}" if args.get("forget") else ""
         return f"teach_move \"{args.get('item', '')}\" to {args.get('pokemon', '')}{forget}"

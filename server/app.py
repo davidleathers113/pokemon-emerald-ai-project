@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.anticheat import AntiCheatTracker
 from utils.json_utils import normalize_replan_edits
 from utils.llm_provider_ui import infer_llm_provider_family
-from utils.medicine import MEDICINE, STATUS_ANY, medicine_for as _medicine_for
+from utils.medicine import MEDICINE, PP_RESTORE, STATUS_ANY, medicine_for as _medicine_for
 
 # Set up logging - reduced verbosity for multiprocess mode
 logging.basicConfig(level=logging.WARNING)
@@ -6808,6 +6808,28 @@ def _refusal(message: str, **extra) -> Dict[str, Any]:
     return result
 
 
+# Taken by every tool, never doing anything there: why the model called it (PokeAgent
+# _REASONING_ARG_KEYS), and the battle it decided on (PokeAgent adds seen_battle to battle
+# calls, _battle_moved_on reads it).
+CALL_NOTE_ARGS = ("reasoning", "reason", "seen_battle")
+# The arguments buy_item and use_item act on ("quantity" is "count" by another name).
+BUY_ITEM_ARGS = ("item", "count", "quantity")
+USE_ITEM_ARGS = ("item", "pokemon", "move")
+
+
+def _unknown_arguments(request: dict, tool: str, accepted: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    """A refusal naming the arguments `tool` does not take and the ones it does, or None.
+
+    Seen live (2026-11-05, Elite Four): buy_item(quantity=4) bought one and use_item's move
+    was ignored; the model and operators pass mixed names, and an argument read by no one
+    is a silent wrong result, so nothing is done instead."""
+    unknown = [key for key in request if key not in accepted and key not in CALL_NOTE_ARGS]
+    if not unknown:
+        return None
+    names = ", ".join(repr(key) for key in unknown)
+    return _refusal(f"{tool} doesn't take {names}; nothing was done. It takes: {', '.join(accepted)}.")
+
+
 def _trapped_refusal(view: Optional[Dict[str, Any]], action: str) -> Optional[Dict[str, Any]]:
     """The refusal for `action` ("run" or "switch") while the battle view's trap
     (menu_state.battler_trap) makes it impossible, or None.
@@ -6875,11 +6897,13 @@ def _install_route_flag_reader() -> None:
 _install_route_flag_reader()
 
 
-async def _macro_press(buttons: List[str], source: str) -> None:
+async def _macro_press(buttons: List[str], source: str) -> Optional[Dict[str, Any]]:
+    """Queue the presses and wait for them (_await_sequence). Returns the sequence's report,
+    which the game loop keeps filling in: "done" is False when the wait ran out first."""
     if not buttons:
-        return
+        return None
     queued = await take_action(ActionRequest(buttons=list(buttons), source=source))
-    await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(buttons)))
+    return await _await_sequence(queued.get("sequence_id"), _sequence_frames(len(buttons)))
 
 
 async def _await_game(check, frames: int):
@@ -11847,8 +11871,6 @@ def _note_wild_battles(guidance: Dict[str, Any]) -> str:
 
 # Items one use_item pass may spend on one Pokémon (Potions on a big HP bar add up).
 MEDICINE_MAX_USES_PER_MON = 6
-# Presses through the bag's medicine texts ("X's HP was restored by N points.").
-MEDICINE_TEXT_PRESSES = 8
 
 
 def _bag_counts() -> Dict[int, int]:
@@ -11918,16 +11940,107 @@ async def _choose_use_in_bag(item_id: int, source: str, pocket: Optional[int] = 
     return None
 
 
-async def _use_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
-    """START → BAG → ITEMS → the item → USE → party slot `index`, through its text and
-    out of the menus. None when the item was used, else why not.
+# Game frames for an item's party-menu turn once the Pokémon (and move) is chosen: the HP
+# bar fills a point a frame (pret party_menu.c PartyMenuModifyHP; a MAX REVIVE on a big
+# Pokémon is 400+), then its text waits for A and the menu fades out.
+ITEM_USE_FRAMES = 2400
 
-    The same screens teach_move walks (Task_ItemContext_* for USE, then the party
-    chooser); a medicine that would do nothing says "It won't have any effect." and
-    leaves the chooser open, which is reported, not retried.
+
+async def _press_taken(buttons: List[str], source: str) -> bool:
+    """Press, and wait until the game loop has run every press. False when they were still
+    queued after the wait: those are dropped, so none lands later on another screen.
+
+    Reported live (2026-11-05, Elite Four): use_item said an item "would have no effect"
+    and it went through seconds later. The server log put those later presses on another
+    client (the /play page), but the path exists: there is one button queue, _macro_press
+    stops waiting after its frame budget (or GAME_STALL_S without a frame) while its
+    presses can still be queued behind others, and what a macro reads then is the screen
+    from before its press (test_use_item: a backlog ahead of the A on the Pokémon).
     """
+    report = await _macro_press(buttons, source)
+    if report is None:
+        return True
+    if not report.get("done"):
+        await _await_game(lambda: report.get("done"), _sequence_frames(len(buttons)))
+    if not report.get("done"):
+        _drop_rest_of_sequence(report["seq_id"])
+        return False
+    return not report.get("skipped")
+
+
+async def _choose_mon_for_item(slot: int, move_index: Optional[int], source: str) -> Optional[str]:
+    """In the party menu an item's USE opened: A on menu slot `slot`, then, for a PP item
+    that restores or raises one move, A on that move in the "Restore which move?" list
+    (pret party_menu.c ItemUseCB_PPRecovery / ItemUseCB_PPUp → ShowMoveSelectWindow: the
+    moves in slot order, the cursor on the first; Task_HandleWhichMoveInput uses the item
+    on the move under the cursor). None once the choice is taken, else why not."""
     from server import menu_state as ms
 
+    if not await _step_cursor(ms.party_menu_slot, slot, source):
+        return f"Could not put the party cursor on slot {slot + 1}."
+    if not await _press_taken(["A"], source):
+        return "Nothing was used: the A on the Pokémon was still queued behind other presses, so it was dropped."
+    if move_index is None:
+        return None
+    if not await _await_game(lambda: _mem(ms.task_running, ms.TASK_PARTY_WHICH_MOVE), MACRO_MENU_FRAMES):
+        return "Chose the Pokémon but its move list did not open."
+    if not await _step_cursor(lambda r: ms.read_menu_cursor(r).cursor, move_index, source):
+        return f"Could not put the move list's cursor on move {move_index + 1}."
+    if not await _press_taken(["A"], source):
+        return "Nothing was used: the A on the move was still queued behind other presses, so it was dropped."
+    return None
+
+
+async def _through_item_texts(closed: Callable[[], bool], source: str) -> bool:
+    """After the choice: A through the item's texts ("X's HP was restored by N points.",
+    "It won't have any effect."), each only once the text waits for it, until closed():
+    the party menu gone, as pret closes it after either outcome (Task_ClosePartyMenuAfterText:
+    back to the bag, or to the battle once the item was used there). Never decided from a
+    screen the presses have not reached (_press_taken). True once closed."""
+    from server import menu_state as ms
+
+    budget = _FrameBudget(ITEM_USE_FRAMES)
+    while not closed():
+        if budget.spent():
+            return False
+        if _mem(ms.text_waiting_for_button) and not await _press_taken(["A"], source):
+            return False
+        await _await_game(lambda: closed() or _mem(ms.text_waiting_for_button), MACRO_MENU_FRAMES)
+    return True
+
+
+def _item_effect(item_id: int, before, after) -> bool:
+    """The item changed this Pokémon in party RAM: HP or status for medicine, a move's PP or
+    max PP for a PP item; any other item, by its count alone."""
+    from utils.medicine import PP_BOOST, PP_RESTORE
+
+    if before is None or after is None:
+        return False
+    if item_id in MEDICINE:
+        return after.current_hp != before.current_hp or int(after.status) != int(before.status)
+    if item_id in PP_RESTORE or item_id in PP_BOOST:
+        return list(after.move_pp) != list(before.move_pp) or after.pp_bonuses != before.pp_bonuses
+    return True
+
+
+def _not_used_text(item_id: int, before, slot: int, closed: bool) -> str:
+    who = f"{before.species_name.upper()} ({_hp_status_text(before)})" if before is not None else f"slot {slot + 1}"
+    if not closed:
+        return f"The {_item_name(item_id)} was not used on {who}: the party menu did not finish."
+    return f"The {_item_name(item_id)} was not used on {who}: the game says it would have no effect."
+
+
+async def _use_from_bag(index: int, item_id: int, source: str, move_index: Optional[int] = None) -> Optional[str]:
+    """START → BAG → ITEMS → the item → USE → party slot `index` (→ move `move_index` for
+    a PP item that takes one), through its text and out of the menus. None when the item
+    was used, else why not.
+
+    The same screens teach_move walks (Task_ItemContext_* for USE, then the party
+    chooser). Whether it was used is read from the game once the party menu has closed
+    back to the bag (pret CB2_ShowPartyMenuForItemUse: CB2_ReturnToBagMenu, used or not):
+    one fewer in the bag and the Pokémon changed in party RAM. "It won't have any effect."
+    spends nothing, which is reported, not retried.
+    """
     before = _party_mon(index)
     before_count = _bag_counts().get(item_id, 0)
 
@@ -11937,34 +12050,18 @@ async def _use_from_bag(index: int, item_id: int, source: str) -> Optional[str]:
     error = await _choose_use_in_bag(item_id, source)
     if error:
         return error
-    # USE on a medicine opens the party chooser.
+    # USE on a medicine or PP item opens the party chooser.
     if not await _await_game(lambda: _mem(_party_ready), MACRO_MENU_FRAMES * 2):
         return await leave(f"Chose USE on the {_item_name(item_id)} but the party screen did not open.")
-    if not await _step_cursor(ms.party_menu_slot, index, source):
-        return await leave(f"Could not put the party cursor on slot {index + 1}.")
-    await _macro_press(["A"], source)
-
-    def spent() -> bool:
-        return _bag_counts().get(item_id, 0) < before_count
-
-    # The HP bar fills, "X's HP was restored by N points." prints, and A goes back to the
-    # bag; or "It won't have any effect." and A goes back to the chooser, nothing spent.
-    pressed = False
-    for _ in range(MEDICINE_TEXT_PRESSES):
-        if await _await_game(lambda: _mem(_bag_ready), MACRO_MENU_FRAMES):
-            break
-        if pressed and _mem(_party_ready) and not spent():
-            break  # back at the chooser after the no-effect text: A here would choose again
-        await _macro_press(["A"], source)
-        pressed = True
-    used = spent()
+    error = await _choose_mon_for_item(index, move_index, source)
+    finished = not error and await _through_item_texts(lambda: _mem(_bag_ready), source)
     closed = await _close_field_menus(source)
     shut = "" if closed else " Could not close every menu: look at the screen."
-    if not used:
-        # (Not the screen's text: by now the text window holds leftover bytes.)
-        who = f"{before.species_name.upper()} ({_hp_status_text(before)})" if before is not None else f"slot {index + 1}"
-        return f"The {_item_name(item_id)} was not used on {who}: it would have no effect." + shut
-    return shut or None
+    # Read once the menus are closed: a choice the game took late has played out by now.
+    used = _bag_counts().get(item_id, 0) < before_count and _item_effect(item_id, before, _party_mon(index))
+    if used:
+        return shut or None
+    return (error or _not_used_text(item_id, before, index, finished)) + shut
 
 
 def _medicine_line(name: str, item_id: int, before, after) -> str:
@@ -12146,11 +12243,93 @@ def _medicine_refusal(mon, item_id: int) -> Optional[str]:
     return None
 
 
+def _is_pp_item(item_id: int) -> bool:
+    from utils.medicine import PP_BOOST, PP_RESTORE
+
+    return item_id in PP_RESTORE or item_id in PP_BOOST
+
+
+def _named(value) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _move_rows(mon) -> List[Tuple[str, int, int, int]]:
+    """(move, PP, max PP, PP Ups) for each move a party Pokémon knows, in slot order: the
+    order of the party menu's move list (pret ShowMoveSelectWindow)."""
+    from pokemon_env.enums import Move
+    from utils.medicine import max_pp, pp_ups
+
+    rows = []
+    for i, (move, pp) in enumerate(zip(mon.moves or [], mon.move_pp or [], strict=False)):
+        if not move or move == "NONE":
+            break  # moves fill the slots from the first (pret MoveDeleterForgetMove shifts the rest up)
+        base = _mem(lambda r, m=move: r._rom_battle_move(Move[m].value)["pp"])
+        rows.append((move.replace("_", " "), int(pp), max_pp(base, mon.pp_bonuses, i), pp_ups(mon.pp_bonuses, i)))
+    return rows
+
+
+def _moves_text(rows: List[Tuple[str, int, int, int]]) -> str:
+    return ", ".join(f"{move} {pp}/{top} PP" for move, pp, top, _ in rows)
+
+
+def _pp_item_plan(mon, item_id: int, wanted_move) -> Tuple[Optional[int], str, Optional[str]]:
+    """For a PP item on this Pokémon: (the move slot to pick in the party menu's move list,
+    None for an ELIXIR, which restores every move; a note on the pick; why it can't be
+    used, else None). With no move named, an ETHER goes on the move missing the most PP;
+    a PP UP needs one named, as what it raises is for good."""
+    from server import menu_state as ms
+    from utils.medicine import PP_BOOST, most_pp_missing, pp_item_picks_a_move, pp_item_refusal
+
+    rows = _move_rows(mon)
+    name, item = mon.species_name.upper(), _item_name(item_id)
+    index = None
+    if _named(wanted_move):
+        key = ms.name_key(wanted_move)
+        index = next((i for i, row in enumerate(rows) if ms.name_key(row[0]) == key), None)
+        if index is None:
+            return None, "", f"{name} doesn't know {str(wanted_move).strip()}; nothing was used. Its moves: {_moves_text(rows)}."
+    note = ""
+    if not pp_item_picks_a_move(item_id):
+        if index is not None:
+            note = f" (an {item} restores every move, not only {rows[index][0]})"
+        index = None
+    elif index is None:
+        if item_id in PP_BOOST:
+            return None, "", f"move is required for a {item} (the move whose max PP it raises). {name}'s moves: {_moves_text(rows)}."
+        index = most_pp_missing(rows)
+        if index is None:
+            return None, "", f"Not used: every move of {name} has full PP ({_moves_text(rows)})."
+        note = f" (no move named: {rows[index][0]} was missing the most PP)"
+    useless = pp_item_refusal(item_id, rows, index)
+    if useless:
+        return None, "", f"Not used: {useless}. {name}'s moves: {_moves_text(rows)}."
+    return index, note, None
+
+
+def _move_for_no_pp_item(item_id: int) -> str:
+    return (
+        f"move is for ETHER, MAX ETHER, ELIXIR, MAX ELIXIR, PP UP and PP MAX; a {_item_name(item_id)} takes none. "
+        "Nothing was used."
+    )
+
+
+def _item_line(name: str, item_id: int, before, after) -> str:
+    """'SUPER POTION on AZUMARILL (32→82 HP)', 'ETHER on MANECTRIC (THUNDER 7→10 PP)'."""
+    if not _is_pp_item(item_id):
+        return _medicine_line(name, item_id, before, after)
+    changes = [
+        f"{old[0]} {old[1]}→{new[1]} PP" if old[2] == new[2] else f"{old[0]} {old[1]}/{old[2]}→{new[1]}/{new[2]} PP"
+        for old, new in zip(_move_rows(before), _move_rows(after), strict=False)
+        if old[1:3] != new[1:3]
+    ]
+    return f"{_item_name(item_id)} on {name} ({', '.join(changes) or 'no PP changed'})"
+
+
 async def _use_item_in_battle(request: dict) -> Dict[str, Any]:
     """use_item during a battle: FIGHT/BAG/POKEMON/RUN → BAG → ITEMS → the medicine → USE
     → the Pokémon, as the turn of the Pokémon choosing now (in a double battle, that
     battler's turn; its partner still chooses its own), then the turn is played out as
-    use_move's is. Only medicine (MEDICINE) is used here.
+    use_move's is. Only medicine (MEDICINE) and PP items (PP_RESTORE) are used here.
 
     Seen live (TATE & LIZA, 2026-11-05): 3 REVIVEs and 5 SUPER POTIONs stayed in the bag
     while the party fell; use_item worked outside battle only. pret item_use.c
@@ -12185,21 +12364,40 @@ async def _use_item_in_battle(request: dict) -> Dict[str, Any]:
     name = mon.species_name.upper()
     personality = _mem(ms.party_personalities)[index]
     counts = _bag_counts()
-    medicine = ", ".join(f"{_item_name(i)} x{n}" for i, n in counts.items() if i in MEDICINE and n > 0) or "none"
+
+    def usable(item_id: int) -> bool:
+        # pret item_use.c: ItemUseInBattle_Medicine and ItemUseInBattle_PPRecovery take the
+        # party menu; a PP UP has no battle use.
+        return item_id in MEDICINE or item_id in PP_RESTORE
+
+    medicine = ", ".join(f"{_item_name(i)} x{n}" for i, n in counts.items() if usable(i) and n > 0) or "none"
     if wanted_item:
         key = ms.name_key(wanted_item)
         item_id = next((i for i, n in counts.items() if n > 0 and ms.name_key(_item_name(i)) == key), None)
         if item_id is None:
             return _refusal(f"There is no {wanted_item} in the ITEMS pocket. Medicine in the bag: {medicine}.")
-        if item_id not in MEDICINE:
-            return _refusal(f"In a battle use_item uses medicine only; {_item_name(item_id)} is not. Medicine in the bag: {medicine}.")
+        if not usable(item_id):
+            return _refusal(
+                f"In a battle use_item uses medicine and PP items only; {_item_name(item_id)} is not one. "
+                f"Medicine in the bag: {medicine}."
+            )
+    elif _named(request.get("move")):
+        return _refusal(f"Name the PP item for {request.get('move')}, e.g. use_item(\"ETHER\", \"{name}\", move=...). Medicine in the bag: {medicine}.")
     else:
         item_id = _medicine_for(mon, counts)
         if item_id is None:
             return _refusal(f"{name} ({_hp_status_text(mon)}) needs nothing the bag has. Medicine in the bag: {medicine}.")
-    useless = _medicine_refusal(mon, item_id)
-    if useless:
-        return _refusal(f"Not used: {useless}. Medicine in the bag: {medicine}.")
+    move_index, note = None, ""
+    if item_id in PP_RESTORE:
+        move_index, note, useless = _pp_item_plan(mon, item_id, request.get("move"))
+        if useless:
+            return _refusal(useless)
+    elif _named(request.get("move")):
+        return _refusal(_move_for_no_pp_item(item_id))
+    else:
+        useless = _medicine_refusal(mon, item_id)
+        if useless:
+            return _refusal(f"Not used: {useless}. Medicine in the bag: {medicine}.")
     chooser = str(view["player"]["name"]).upper() if view.get("player") else "your Pokémon"
     chosen_for = _battle_key()
     view, refusal = await _ready_for_battle_action("use_item", source)
@@ -12248,33 +12446,32 @@ async def _use_item_in_battle(request: dict) -> Dict[str, Any]:
         shown = _mem(ms.party_personalities)
         if personality not in shown:
             return await give_up(f"{name} is not listed in the party menu.")
-        if not await _step_cursor(ms.party_menu_slot, shown.index(personality), source):
-            return await give_up(f"Could not put the party cursor on {name}.")
-        await _macro_press(["A"], source)
-
-        def spent() -> bool:
-            return _bag_counts().get(item_id, 0) < before_count
 
         def back_in_battle() -> bool:
             return bool(_mem(ms.callback2_is, ms.CB2_BATTLE_MAIN))
 
         # The HP bar fills and "X's HP was restored by N points." prints, then the menu
         # closes to the battle; or "It won't have any effect." and back to the bag.
-        pressed = False
-        for _ in range(MEDICINE_TEXT_PRESSES):
-            if await _await_game(lambda: back_in_battle() or _mem(_bag_ready), MACRO_MENU_FRAMES):
-                break
-            if pressed and _mem(_party_ready) and not spent():
-                break  # back at the chooser: A here would choose again
-            if _mem(ms.text_waiting_for_button):
-                await _macro_press(["A"], source)
-                pressed = True
-    if not spent():
-        return await give_up(f"The {item} was not used on {name} ({_hp_status_text(mon)}): the game says it would have no effect.")
-    with memory_lock:
-        reader = env.memory_reader
-        after = dict(zip(ms.party_personalities(reader), reader.read_party_pokemon() or [])).get(personality, mon)
-    line = _medicine_line(name, item_id, mon, after)
+        error = await _choose_mon_for_item(shown.index(personality), move_index, source)
+        finished = not error and await _through_item_texts(lambda: back_in_battle() or _mem(_bag_ready), source)
+
+    def outcome() -> Tuple[bool, Any]:
+        """(used, the Pokémon now): one fewer in the bag and the Pokémon changed in RAM."""
+        with memory_lock:
+            reader = env.memory_reader
+            now = dict(zip(ms.party_personalities(reader), reader.read_party_pokemon() or [])).get(personality)
+        return _bag_counts().get(item_id, 0) < before_count and _item_effect(item_id, mon, now), now
+
+    used, after = outcome()
+    if not used:
+        back = await _back_to_battle_menu(source)
+        # Read again once the menus are closed: a choice the game took late has played out.
+        used, after = outcome()
+        if not used:
+            why = error or _not_used_text(item_id, mon, index, finished)
+            tail = " Back at the battle menu; nothing was used." if back else " Could not get back to the battle menu: look at the screen."
+            return _refusal(why + tail)
+    line = _item_line(name, item_id, mon, after) + note
     played = await _play_out_battle(source)
     logger.info(f"💊 use_item in battle: {line}; {played['end']} {_turn_text(played['texts'])}")
     return {
@@ -12287,8 +12484,9 @@ async def _use_item_in_battle(request: dict) -> Dict[str, Any]:
 
 @app.post("/mcp/use_item")
 async def mcp_use_item(request: dict = None):
-    """MCP Tool: outside battle, use an item from the bag: a medicine on a party Pokémon,
-    or a field item that takes none (ESCAPE ROPE, the repels: _use_field_item).
+    """MCP Tool: outside battle, use an item from the bag: a medicine or PP item on a party
+    Pokémon (and its move: _pp_item_plan), or a field item that takes none (ESCAPE ROPE,
+    the repels: _use_field_item).
 
     emerald-new (2026-11-04), David's "Potions + Jagged Pass": "Stopped: the team is weak
     (AZUMARILL 32/82 HP)", and the heal walk went below Jagged Pass's one-way ledges, a
@@ -12302,10 +12500,15 @@ async def mcp_use_item(request: dict = None):
 
     source = "use_item"
     request = request or {}
+    unknown = _unknown_arguments(request, "use_item", USE_ITEM_ARGS)
+    if unknown:
+        return unknown
     if game_type == "emerald" and _mem(lambda r: r.is_in_battle()):
         return await _use_item_in_battle(request)
     wanted_item, wanted_mon = str(request.get("item") or "").strip(), request.get("pokemon")
     field_item = _field_item(wanted_item)
+    if field_item is not None and _named(request.get("move")):
+        return _refusal(_move_for_no_pp_item(field_item))
     if field_item is not None:
         refused = _field_refusal(source)
         if refused:
@@ -12337,17 +12540,32 @@ async def mcp_use_item(request: dict = None):
         item_id = next((i for i, n in counts.items() if n > 0 and ms.name_key(_item_name(i)) == key), None)
         if item_id is None:
             return _refusal(f"There is no {wanted_item} in the ITEMS pocket. Medicine in the bag: {medicine}.")
+    elif _named(request.get("move")):
+        return _refusal(f"Name the PP item for {request.get('move')}, e.g. use_item(\"ETHER\", \"{name}\", move=...). Medicine in the bag: {medicine}.")
     else:
         item_id = _medicine_for(mon, counts)
         if item_id is None:
             needs = "nothing" if mon.current_hp == mon.max_hp and not int(mon.status) & STATUS_ANY else "something the bag has none of"
             return _refusal(f"{name} ({_hp_status_text(mon)}) needs {needs}. Medicine in the bag: {medicine}.")
+    move_index, note = None, ""
+    if _is_pp_item(item_id):
+        move_index, note, useless = _pp_item_plan(mon, item_id, request.get("move"))
+        if useless:
+            return _refusal(useless)
+    elif _named(request.get("move")):
+        return _refusal(_move_for_no_pp_item(item_id))
+    elif item_id in MEDICINE:
+        # Refused before the bag opens, as in battle. Seen live (2026-11-05, DRAKE's room):
+        # a HYPER POTION on a fainted MANECTRIC walked the bag to "it would have no effect".
+        useless = _medicine_refusal(mon, item_id)
+        if useless:
+            return _refusal(f"Not used: {useless}. Medicine in the bag: {medicine}.")
     with _turbo():
-        error = await _use_from_bag(index, item_id, source)
+        error = await _use_from_bag(index, item_id, source, move_index)
     if error:
         return _refusal(f"{error}{_screen_note()}")
     after = _party_mon(index) or mon
-    line = _medicine_line(name, item_id, mon, after)
+    line = _item_line(name, item_id, mon, after) + note
     return {"success": True, "status": "USED", "summary": f"Used {line}; {_left_text([item_id])}."}
 
 
@@ -12762,13 +12980,22 @@ async def mcp_buy_item(request: dict = None):
 
         source = "buy_item"
         request = request or {}
+        unknown = _unknown_arguments(request, "buy_item", BUY_ITEM_ARGS)
+        if unknown:
+            return unknown
+        # Seen live (2026-11-05): buy_item(item="FULL RESTORE", quantity=4) bought one, as
+        # "quantity" was not read; the model and operators use either name.
+        given = {key: request[key] for key in ("count", "quantity") if request.get(key) is not None}
+        if len(given) == 2 and str(given["count"]) != str(given["quantity"]):
+            return _refusal(f"count ({given['count']}) and quantity ({given['quantity']}) differ: give one. Nothing was bought.")
         wanted = str(request.get("item") or "").strip()
         if not wanted:
             return _refusal("item is required, e.g. buy_item('POTION', 3) or buy_item('POKE BALL', 5).")
+        raw_count = next(iter(given.values()), 1)
         try:
-            count = int(request.get("count", 1))
+            count = int(raw_count)
         except (TypeError, ValueError):
-            return _refusal(f"count must be a number from 1 to 99, not {request.get('count')!r}.")
+            return _refusal(f"count must be a number from 1 to 99, not {raw_count!r}.")
         if not 1 <= count <= 99:
             return _refusal(f"count must be from 1 to 99, not {count}.")
         refused = _field_refusal(source)

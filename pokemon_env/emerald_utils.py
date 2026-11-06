@@ -640,6 +640,7 @@ def parse_pokemon(data):
         is_egg=bool(box['substructs'][3]['isEgg']),
         ability_num=int(box['substructs'][3]['abilityNum']),
         held_item=int(box['substructs'][0]['heldItem']),
+        pp_bonuses=int(box['substructs'][0]['ppBonuses']),
     )
 
 

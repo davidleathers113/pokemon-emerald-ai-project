@@ -818,16 +818,19 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
         "description": (
             "Use an item from the bag, in one call. Medicine (Potion, Super Potion, "
             "Antidote, Revive...) goes on a party Pokemon: leave item empty to use the "
-            "cheapest one that heals it. In a battle only medicine, as the turn of the "
-            "Pokemon choosing now (the battle section's ITEMS line suggests one), e.g. REVIVE "
-            "on a fainted one. Outside battle, ESCAPE ROPE (caves and dungeons only) and "
-            "REPEL / SUPER REPEL / MAX REPEL take no Pokemon."
+            "cheapest one that heals it. ETHER / MAX ETHER restore one move's PP (`move`; "
+            "left out, the move missing the most PP), ELIXIR / MAX ELIXIR every move's; "
+            "PP UP / PP MAX raise `move`'s max PP. In a battle only medicine and PP items, as "
+            "the turn of the Pokemon choosing now (the battle section's ITEMS line suggests "
+            "one), e.g. REVIVE on a fainted one. Outside battle, ESCAPE ROPE (caves and "
+            "dungeons only) and REPEL / SUPER REPEL / MAX REPEL take no Pokemon."
         ),
         "parameters": {
             "type_": "OBJECT",
             "properties": {
                 "item": {"type_": "STRING", "description": "The item's name, e.g. 'SUPER POTION' or 'ESCAPE ROPE'. Optional for medicine."},
-                "pokemon": {"type_": "STRING", "description": "For medicine: party Pokemon name or slot 1-6, e.g. 'AZUMARILL'."},
+                "pokemon": {"type_": "STRING", "description": "For medicine and PP items: party Pokemon name or slot 1-6, e.g. 'AZUMARILL'."},
+                "move": {"type_": "STRING", "description": "For ETHER, MAX ETHER, PP UP, PP MAX: the move, e.g. 'THUNDER'."},
                 "reasoning": {"type_": "STRING", "description": "One short sentence: why use it."},
             },
             "required": ["reasoning"],

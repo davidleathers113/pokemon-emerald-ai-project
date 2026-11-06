@@ -32,7 +32,7 @@ checked out at 59e79d5 (use_move with the view's best move, the target cursor's 
                                          MANECTRIC fainted, LUNATONE left. FIGHT/BAG/POKEMON/RUN
                                          for BRELOOM.
 A loaded save carries only each battler's last move (gLastMoves), so "used" here is
-CLAYDOL's EARTHQUAKE and XATU's last move. No RAM writes.
+CLAYDOL's EARTHQUAKE and XATU's last move. No RAM writes but the ETHER test's (its docstring).
 
   docker run --rm --entrypoint /opt/venv/bin/python -v "$PWD":/app \
       -v ~/continual-harness/Emerald-GBAdvance:/app/Emerald-GBAdvance:ro -w /app \
@@ -245,6 +245,39 @@ def test_use_item_in_battle_revives_a_fainted_one():
     party = _party(s)
     assert party["AZUMARILL"].current_hp > 0 and _bag(s, REVIVE) == before - 1, party["AZUMARILL"]
     assert all(party[n].current_hp == 0 for n in ("TROPIUS", "BLAZIKEN", "MANECTRIC")), party
+
+
+def test_use_item_in_battle_restores_the_named_moves_pp():
+    """An ETHER in battle opens the battle's party menu and the same "Restore which move?"
+    list as outside it (pret item_use.c ItemUseInBattle_PPRecovery, party_menu.c
+    ItemUseCB_PPRecovery); the move named is the one restored. Seen live outside battle
+    (2026-11-05): the ETHER meant for THUNDER went on the first move. RAM: an ETHER in the
+    bag; AZUMARILL's first and last moves down to 1 PP, so the first in the list needs it
+    too. The save holds an ETHER already."""
+    from pokemon_env.enums import Move
+    from test_party_rule import _put_in_bag
+    from test_use_item import ETHER, _set_pp
+
+    s = _load(CALM_MIND)
+    with s.srv.memory_lock:
+        party = s.srv.env.memory_reader.read_party_pokemon()
+    slot = next(i for i, p in enumerate(party) if p.species_name.upper() == "AZUMARILL")
+    pp = list(party[slot].move_pp)
+    last = len([m for m in party[slot].moves if m and m != "NONE"]) - 1
+    pp[0] = pp[last] = 1
+    _set_pp(s, slot, pp)
+    _put_in_bag(s, ETHER, 1)
+    ethers = _bag(s, ETHER)
+    move = party[slot].moves[last].replace("_", " ")
+    with s.srv.memory_lock:  # max PP: the ROM's base PP (this team has no PP Ups)
+        base = s.srv.env.memory_reader._rom_battle_move(Move[party[slot].moves[last]].value)["pp"]
+    restored = min(1 + 10, base)  # an ETHER restores 10, up to max PP
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "AZUMARILL", "move": move, "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] and r["summary"].startswith(f"Used ETHER on AZUMARILL ({move} 1→{restored} PP) as AZUMARILL's turn;"), r
+    now = list(_party(s)["AZUMARILL"].move_pp)
+    assert now[0] == 1 and now[last] == restored, now
+    assert _bag(s, ETHER) == ethers - 1
 
 
 def test_use_item_in_battle_refuses_what_would_do_nothing():

@@ -13,6 +13,11 @@ Field items that take no Pokémon (Escape Rope, the Repels): test_magma_hideout_
 (MAGMA HIDEOUT 1F (5,21), an ESCAPE ROPE in the bag; see test_strength.py), and the
 Chimney save (allowEscaping FALSE) with the item put in the bag.
 
+PP items, the arguments, and the outcome read from the game: test_league_lobby.state
+(live, 2026-11-05, before the Elite Four; see test_macros.py): MANECTRIC first, its SPARK,
+THUNDER WAVE, BITE and THUNDER at full PP (20, 20, 25, 10); ETHER x1, PP MAX x1, REVIVE x10,
+HYPER POTION x8 in the bag. RAM writes: move PP (_set_pp), HP, more ETHERs.
+
   docker run --rm --entrypoint /opt/venv/bin/python -v ~/continual-harness:/app -w /app \
       emerald-harness:local local_tests/test_use_item.py
 """
@@ -24,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_movement_feedback import server
 from test_party_rule import CHIMNEY, PARTY, _party, _put_in_bag, _write
+from test_rematch import SUBSTRUCT_PLACES
 
 POTION, ANTIDOTE, HYPER_POTION, SUPER_POTION, REVIVE = 13, 14, 21, 22, 24
 STATUS1_POISON = 0x08  # struct Pokemon +0x50 status
@@ -93,13 +99,15 @@ def test_use_item_cures_a_status_and_refuses_what_would_do_nothing():
     print("   ", r.get("summary") or r)
     assert r["success"] and r["summary"].startswith("Used ANTIDOTE on NUMEL (POISON→OK)"), r
     assert int(_party(s)[i].status) == 0
-    # A Potion on a Pokémon at full HP: the game says it won't have any effect.
+    # A Potion on a Pokémon at full HP: the game would say it won't have any effect. It is
+    # refused before the bag opens now, as in battle (_medicine_refusal); this used to
+    # expect the bag walked to the game's no-effect text ("was not used on BRELOOM").
     breloom = _index(s, "BRELOOM")
     assert _party(s)[breloom].current_hp == _party(s)[breloom].max_hp
     before = _counts(s)
     r = s.call("mcp_use_item", {"item": "POTION", "pokemon": "BRELOOM", "reasoning": "test"})
     print("   ", r.get("error") or r)
-    assert r["success"] is False and "was not used on BRELOOM" in r["error"], r
+    assert r["success"] is False and "BRELOOM" in r["error"] and "needs nothing a POTION does" in r["error"], r
     assert _counts(s)[POTION] == before[POTION]
     assert s.srv._player_can_walk()
     r = s.call("mcp_use_item", {"pokemon": "BRELOOM", "reasoning": "test"})
@@ -191,6 +199,174 @@ def test_medicine_still_needs_a_pokemon():
     assert r["success"] is False and "pokemon is required" in r["error"], r
     r = s.call("mcp_use_item", {"reasoning": "test"})
     assert r["success"] is False and "pokemon is required" in r["error"], r
+
+
+# -- PP items, the arguments, and the outcome read from the game ------------------------
+
+LEAGUE_LOBBY = Path(__file__).resolve().parent / "test_league_lobby.state"
+ETHER, PP_MAX = 34, 71  # pret include/constants/items.h
+
+
+def _set_pp(s, slot, pp):
+    """RAM: a party Pokémon's move PP. The Attacks substruct (u16 moves[4], u8 pp[4]) is
+    XOR'd with personality ^ otId and the box checksum (+0x1C) is the u16 sum of the 48
+    decrypted bytes (pret CalculateBoxMonChecksum), so both are redone (test_rematch._full_pp)."""
+    base = PARTY + 100 * slot
+    with s.srv.memory_lock:
+        reader = s.srv.env.memory_reader
+        personality = reader._read_u32(base)
+        key = personality ^ reader._read_u32(base + 4)
+        words = [reader._read_u32(base + 0x20 + 4 * i) ^ key for i in range(12)]
+    at = 3 * SUBSTRUCT_PLACES[personality % 24][1]
+    attacks = b"".join(w.to_bytes(4, "little") for w in words[at:at + 3])[:8] + bytes(pp)
+    words[at:at + 3] = [int.from_bytes(attacks[4 * i:4 * i + 4], "little") for i in range(3)]
+    checksum = sum((w & 0xFFFF) + (w >> 16) for w in words) & 0xFFFF
+    for i, word in enumerate(words):
+        _write(s, 32, base + 0x20 + 4 * i, word ^ key)
+    _write(s, 16, base + 0x1C, checksum)
+
+
+def _pp(s, slot):
+    return list(_party(s)[slot].move_pp)
+
+
+def test_an_ether_restores_the_move_it_is_told():
+    """Seen live (2026-11-05, Elite Four): use_item("ETHER", "MANECTRIC", move="THUNDER")
+    restored SPARK 19→20 and left THUNDER at 7: the move was never read, and A on the party
+    menu's "Restore which move?" list (pret ItemUseCB_PPRecovery) took its first move.
+    RAM: SPARK 19 and THUNDER 7 PP, as live."""
+    s = server()
+    s.load(LEAGUE_LOBBY, wild_encounters=False)
+    i = _index(s, "MANECTRIC")
+    _set_pp(s, i, [19, 20, 25, 7])
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "MANECTRIC", "move": "THUNDER", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"], r
+    assert _pp(s, i) == [19, 20, 25, 10], _pp(s, i)
+    assert r["summary"] == "Used ETHER on MANECTRIC (THUNDER 7→10 PP); 0 ETHERs left.", r
+    assert _counts(s).get(ETHER, 0) == 0
+    assert s.srv._player_can_walk()
+
+
+def test_an_ether_with_no_move_goes_on_the_one_missing_the_most_pp():
+    """No move named: the one missing the most PP, and the summary says so. A move the
+    Pokémon doesn't know is refused, naming its moves; so is an ETHER nothing needs."""
+    s = server()
+    s.load(LEAGUE_LOBBY, wild_encounters=False)
+    _put_in_bag(s, ETHER, 1)  # the save holds one: two
+    i = _index(s, "MANECTRIC")
+    _set_pp(s, i, [19, 20, 25, 7])
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "MANECTRIC", "move": "SURF", "reasoning": "test"})
+    print("   ", r.get("error") or r)
+    assert r["success"] is False and "MANECTRIC doesn't know SURF" in r["error"], r
+    assert "SPARK 19/20 PP, THUNDER WAVE 20/20 PP, BITE 25/25 PP, THUNDER 7/10 PP" in r["error"], r
+    assert _counts(s)[ETHER] == 2 and s.srv._player_can_walk()
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "MANECTRIC", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] and "THUNDER 7→10 PP" in r["summary"] and "THUNDER was missing the most PP" in r["summary"], r
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "MANECTRIC", "reasoning": "test"})
+    assert r["success"] and "SPARK 19→20 PP" in r["summary"], r
+    assert _pp(s, i) == [20, 20, 25, 10], _pp(s, i)
+    _put_in_bag(s, ETHER, 1)
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "MANECTRIC", "reasoning": "test"})
+    assert r["success"] is False and "every move of MANECTRIC has full PP" in r["error"], r
+    assert _counts(s)[ETHER] == 1 and s.srv._player_can_walk()
+
+
+def test_pp_max_raises_the_named_move():
+    """PP MAX takes the same move list (pret ItemUseCB_PPUp) and is for good: it needs a
+    move named. pret ITEM5_PP_MAX: three PP Ups, THUNDER 10 → 16 max PP, the 6 added to
+    its PP too."""
+    s = server()
+    s.load(LEAGUE_LOBBY, wild_encounters=False)
+    i = _index(s, "MANECTRIC")
+    r = s.call("mcp_use_item", {"item": "PP MAX", "pokemon": "MANECTRIC", "reasoning": "test"})
+    assert r["success"] is False and "move is required for a PP MAX" in r["error"], r
+    r = s.call("mcp_use_item", {"item": "PP MAX", "pokemon": "MANECTRIC", "move": "thunder", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] and "THUNDER 10/10→16/16 PP" in r["summary"], r
+    mon = _party(s)[i]
+    assert list(mon.move_pp) == [20, 20, 25, 16] and (mon.pp_bonuses >> 6) & 3 == 3, (mon.move_pp, mon.pp_bonuses)
+    assert _counts(s).get(PP_MAX, 0) == 0 and s.srv._player_can_walk()
+
+
+def test_arguments_use_item_does_not_take_are_refused():
+    """Seen live (2026-11-05): an argument nobody read was a silent wrong result (the
+    ETHER's move). Refused now, naming the ones it takes, with nothing used; so is a move
+    for an item that takes none."""
+    s = server()
+    s.load(LEAGUE_LOBBY, wild_encounters=False)
+    i = _index(s, "MANECTRIC")
+    _set_pp(s, i, [19, 20, 25, 7])
+    r = s.call("mcp_use_item", {"item": "ETHER", "pokemon": "MANECTRIC", "moves": "THUNDER", "reasoning": "test"})
+    print("   ", r.get("error") or r)
+    assert r["success"] is False and "doesn't take 'moves'" in r["error"] and "It takes: item, pokemon, move." in r["error"], r
+    r = s.call("mcp_use_item", {"item": "HYPER POTION", "pokemon": "MANECTRIC", "move": "THUNDER", "reasoning": "test"})
+    assert r["success"] is False and "a HYPER POTION takes none" in r["error"], r
+    assert _counts(s)[ETHER] == 1 and _pp(s, i) == [19, 20, 25, 7] and s.srv._player_can_walk()
+
+
+def test_medicine_on_a_fainted_pokemon_is_refused_or_used_as_the_game_says():
+    """Seen live (2026-11-05, DRAKE's room): the REVIVE for a fainted MANECTRIC failed, and
+    the HYPER POTION after it walked the bag to "it would have no effect" (pret
+    ItemUseCB_Medicine: no HP item revives). It is refused before the bag opens now, as in
+    battle; a REVIVE, then the HYPER POTION, work. RAM: MANECTRIC 0 HP."""
+    s = server()
+    s.load(LEAGUE_LOBBY, wild_encounters=False)
+    i = _index(s, "MANECTRIC")
+    top = _party(s)[i].max_hp
+    _write(s, 16, PARTY + i * 100 + 0x56, 0)
+    before = _counts(s)
+    r = s.call("mcp_use_item", {"item": "HYPER POTION", "pokemon": "MANECTRIC", "reasoning": "test"})
+    print("   ", r.get("error") or r)
+    assert r["success"] is False and "MANECTRIC has fainted: only a REVIVE or MAX REVIVE" in r["error"], r
+    assert _counts(s) == before and s.srv._player_can_walk()
+    r = s.call("mcp_use_item", {"item": "REVIVE", "pokemon": "MANECTRIC", "reasoning": "test"})
+    print("   ", r.get("summary") or r)
+    assert r["success"] and r["summary"].startswith(f"Used REVIVE on MANECTRIC (0→{top // 2} HP)"), r
+    r = s.call("mcp_use_item", {"item": "HYPER POTION", "pokemon": "MANECTRIC", "reasoning": "test"})
+    assert r["success"] and r["summary"].startswith(f"Used HYPER POTION on MANECTRIC ({top // 2}→{top} HP)"), r
+    after = _counts(s)
+    assert after[REVIVE] == before[REVIVE] - 1 and after[HYPER_POTION] == before[HYPER_POTION] - 1, (before, after)
+    assert _party(s)[i].current_hp == top and s.srv._player_can_walk()
+
+
+def test_the_outcome_is_the_games_when_the_choice_waits_in_the_queue():
+    """The server has one button queue; another client's presses ahead of use_item's hold
+    the A on the Pokémon past _macro_press's wait (_sequence_frames). use_item then read
+    the party chooser still open and nothing spent, answered "it would have no effect",
+    and the REVIVE went through once the queue got to that A. Whatever happens, the answer
+    must be the game's: one fewer REVIVE and the Pokémon back up, or neither. The backlog
+    here is a WAIT queued from "manual" (the /play page's source) just before that A. RAM:
+    MANECTRIC 0 HP."""
+    from server import app
+
+    real = app.take_action
+    for backlog in (app._sequence_frames(1) + 300, 2 * app._sequence_frames(1) + 3 * app.MACRO_MENU_FRAMES):
+        s = server()
+        s.load(LEAGUE_LOBBY, wild_encounters=False)
+        i = _index(s, "MANECTRIC")
+        _write(s, 16, PARTY + i * 100 + 0x56, 0)
+        revives = _counts(s)[REVIVE]
+        queued = []
+
+        async def take_action(request, backlog=backlog, queued=queued):
+            if not queued and request.buttons == ["A"] and request.source == "use_item" and app._mem(app._party_ready):
+                queued.append(await real(app.ActionRequest(buttons=["WAIT"], release_frames=backlog, source="manual")))
+            return await real(request)
+
+        app.take_action = take_action
+        try:
+            r = s.call("mcp_use_item", {"item": "REVIVE", "pokemon": "MANECTRIC", "reasoning": "test"})
+        finally:
+            app.take_action = real
+        print("   ", backlog, "frames:", r.get("summary") or r)
+        assert queued, "the backlog was never queued"
+        s.wait_idle()
+        used = _counts(s)[REVIVE] == revives - 1
+        assert r["success"] == used, (r, _counts(s)[REVIVE], revives)
+        assert (_party(s)[i].current_hp > 0) == used, _party(s)[i].current_hp
+        assert s.srv._player_can_walk()
 
 
 def _run_all():

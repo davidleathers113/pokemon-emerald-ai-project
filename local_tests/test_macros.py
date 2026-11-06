@@ -581,6 +581,26 @@ def test_buy_refuses_outside_a_mart():
     assert r["success"] is False and "no shop clerk here" in r["error"], r
 
 
+def test_buy_takes_quantity_and_refuses_arguments_it_does_not_take():
+    """Seen live (2026-11-05, POKEMON LEAGUE 1F): buy_item(item="FULL RESTORE", quantity=4)
+    bought one; "count" worked. "quantity" counts too; an argument buy_item doesn't take
+    is refused with nothing bought, naming the ones it does."""
+    s = server()
+    s.load(MART)
+    r = s.call("mcp_buy_item", {"item": "Potion", "quantity": 3, "reasoning": "test"})
+    print("   ", r)
+    assert r["success"] is True and "Potion in bag 0 -> 3" in r["summary"], r
+    assert _bag_count(s, "Potion") == 3 and _money(s) == 2784 - 3 * 300
+    r = s.call("mcp_buy_item", {"item": "Potion", "amount": 2, "reasoning": "test"})
+    print("   ", r)
+    assert r["success"] is False and "doesn't take 'amount'" in r["error"], r
+    assert "It takes: item, count, quantity." in r["error"], r
+    r = s.call("mcp_buy_item", {"item": "Potion", "count": 2, "quantity": 3})
+    assert r["success"] is False and "differ" in r["error"], r
+    assert _bag_count(s, "Potion") == 3 and _money(s) == 2784 - 3 * 300
+    assert s.srv._player_can_walk()
+
+
 def _bag(s):
     inventory = _read(s, lambda r: r.read_full_inventory())
     totals = {}

@@ -25,6 +25,9 @@ class PokemonData:
     ability: Optional[str] = None
     # The item id it holds (pret struct PokemonSubstruct0 heldItem; 0 = nothing).
     held_item: int = 0
+    # PP Ups per move, two bits each (pret struct PokemonSubstruct0 ppBonuses): the max PP
+    # an Ether restores to (utils/medicine.max_pp).
+    pp_bonuses: int = 0
 
     @property
     def is_asleep(self) -> bool:
