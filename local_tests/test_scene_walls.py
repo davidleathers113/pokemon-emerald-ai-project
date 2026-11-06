@@ -299,6 +299,63 @@ def test_settle_waits_out_a_long_silent_scene():
         set_lock(0)
 
 
+def test_a_multi_map_walk_waits_out_a_long_silent_scene_between_maps():
+    """go_to waits, between maps, while a scene holds the player with no text box, and
+    then walks on. _walk_along used to hand back after ~2160 frames with "something has
+    the player's attention" (six dialogue reads, then waits that ended at once on BUSY).
+
+    The silent scene is held in RAM as in test_settle_waits_out_a_long_silent_scene:
+    sLockFieldControls set as the first map's go_to_exit returns (the player just out of
+    the Pokémon Center onto MOSSDEEP CITY), cleared `hold` frames later."""
+    import threading
+
+    from server.field_control import S_LOCK_FIELD_CONTROLS
+
+    hold = 2700
+    s = server()
+    srv = s.srv
+    _at_the_street(s)
+    r = s.call("mcp_go_to_exit", {"exit": "MOSSDEEP CITY POKEMON CENTER 1F", "reasoning": "test"})
+    assert _location(s) == "MOSSDEEP CITY POKEMON CENTER 1F", r
+    memory, reader = srv.env.core.memory, srv.env.memory_reader
+
+    def set_lock(value):
+        with srv.memory_lock:
+            memory.u8[S_LOCK_FIELD_CONTROLS] = value
+            reader._invalidate_mem_cache()
+
+    released = threading.Event()
+    held = {}
+
+    def release_later(locked_at):
+        while srv._frames_run - locked_at < hold:
+            time.sleep(0.005)
+        set_lock(0)
+        released.set()
+
+    go_to_exit = srv.mcp_go_to_exit
+
+    async def then_hold(request):
+        result = await go_to_exit(request)
+        if not held and _location(s) == "MOSSDEEP CITY":
+            set_lock(1)
+            held["at"] = srv._frames_run
+            threading.Thread(target=release_later, args=(held["at"],), daemon=True).start()
+        return result
+
+    srv.mcp_go_to_exit = then_hold
+    try:
+        r = s.call("mcp_go_to", {"place": "Mossdeep City Mart", "reasoning": "test"})
+    finally:
+        srv.mcp_go_to_exit = go_to_exit
+        if held:
+            released.wait(timeout=60)
+        set_lock(0)
+    print("   ", held, r.get("summary") or r)
+    assert held and released.is_set(), (held, r)
+    assert r.get("success") is True and _location(s) == "MOSSDEEP CITY MART", (r, _location(s))
+
+
 def _run_all(only=""):
     import test_movement_feedback as harness
 

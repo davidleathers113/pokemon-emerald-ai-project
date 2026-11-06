@@ -9960,16 +9960,34 @@ def _gym_gate_on_tile(x: int, y: int, doing: str, near: int) -> Optional[Dict[st
 
 HEAL_TRIP_MAX_MAPS = 10
 # _walk_along: scripted scenes (a trainer spotting the player) waited out, each up to
-# MACRO_TEXT_FRAMES, before the walk reports that something has the player's attention.
+# SCENE_SETTLE_FRAMES, before the walk reports that something has the player's attention.
 WALK_SCENE_WAITS = 3
 # _walk_along: go_to_exit calls that stopped short on a map, retried after a beat (a
 # person walking their beat may have stepped into the way), before the walk gives up.
 WALK_BLOCKED_RETRIES = 2
-# _settle_after_interruption: game frames a scene may hold the player with no text box
-# (field controls locked, status BUSY: people walking, a delay, a fade) before the settle
-# gives up and hands back. MOSSDEEP CITY's Magma scene, seen in a trace, holds them ~430
+# _await_silent_scene: game frames a scene may hold the player with no text box (field
+# controls locked, status BUSY: people walking, a delay, a fade) before the caller gives
+# up and hands back. MOSSDEEP CITY's Magma scene, seen in a trace, holds them ~430
 # frames; the cap is for a lock that never lifts, not for any scene's length.
 SCENE_SETTLE_FRAMES = 4 * MACRO_TEXT_FRAMES
+
+
+async def _await_silent_scene(frames: float) -> bool:
+    """Wait, by game frames, while a scene holds the player with no text box, until the
+    player can walk, a battle starts, or a box (text to read, a YES/NO or menu) opens.
+    True when one of those came, False when `frames` ran out first.
+
+    BUSY itself is not an end: _settle_after_interruption and _walk_along both waited
+    with checks that took it as one, so their waits returned at once while a silent
+    scene still held the player (see their notes)."""
+    from server.field_control import DIALOGUE_CHOICE, DIALOGUE_PLAIN
+
+    return bool(await _await_game(
+        lambda: _mem(lambda r: r.is_in_battle())
+        or _player_can_walk()
+        or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE),
+        max(1, frames),
+    ))
 
 
 async def _settle_after_interruption() -> None:
@@ -10003,10 +10021,7 @@ async def _settle_after_interruption() -> None:
             # Text six reads did not get through, a YES/NO or menu (the caller's to
             # answer), or a scene that never let go.
             return
-        await _await_game(
-            lambda: battle() or _player_can_walk() or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_CHOICE),
-            max(1, budget.frames - budget.run),
-        )
+        await _await_silent_scene(budget.frames - budget.run)
 
 
 async def _walk_to_pokemon_center(source: str) -> Tuple[List[str], Optional[str]]:
@@ -10047,7 +10062,7 @@ async def _walk_along(
     collects what each go_to_exit did besides walking (Surf, Rock Smash), by map.
     """
     from server import game_tools
-    from server.field_control import DIALOGUE_BUSY, DIALOGUE_PLAIN
+    from server.field_control import DIALOGUE_CHOICE, DIALOGUE_PLAIN
     from utils.state_formatter import ROM_TO_PORYMAP_MAP
 
     entered: List[str] = []
@@ -10069,7 +10084,7 @@ async def _walk_along(
             return entered, None
         if not _player_can_walk():
             status = _field_status()
-            if status in (DIALOGUE_PLAIN, DIALOGUE_BUSY) and reads < 6:
+            if status == DIALOGUE_PLAIN and reads < 6:
                 reads += 1
                 await _read_dialogue()
                 continue
@@ -10078,15 +10093,20 @@ async def _walk_along(
             # battle starts by itself ~2 s later. Seen live (Breeder Isaac, ROUTE 117):
             # the walk gave up at once with "something has the player's attention", and
             # the model fought him with a BRELOOM it had been on its way to heal.
-            if waits < WALK_SCENE_WAITS:
+            # A silent stretch (BUSY) is waited out by game frames: it was read as
+            # dialogue, and the waits after the reads took BUSY as their end, so a scene
+            # silent for ~2160 frames ended the walk with the player still held. A YES/NO
+            # or text the reads did not get through is the model's.
+            if status not in (DIALOGUE_PLAIN, DIALOGUE_CHOICE) and waits < WALK_SCENE_WAITS:
                 waits += 1
-                settled = await _await_game(
-                    lambda: _mem(lambda r: r.is_in_battle())
-                    or _player_can_walk()
-                    or _field_status() in (DIALOGUE_PLAIN, DIALOGUE_BUSY),
-                    MACRO_TEXT_FRAMES,
-                )
-                if settled:
+                if await _await_silent_scene(SCENE_SETTLE_FRAMES):
+                    continue
+            # The map-name popup is a window too, so on a map just entered a held player
+            # reads as CHOICE until it goes (pret map_name_popup.c: 120 frames on screen
+            # and its slides). A real YES/NO stays: the walk stops for it then.
+            if status == DIALOGUE_CHOICE and waits < WALK_SCENE_WAITS:
+                waits += 1
+                if await _await_game(lambda: _field_status() != DIALOGUE_CHOICE, MACRO_MENU_FRAMES):
                     continue
             return entered, f"something has the player's attention on the way{_screen_note()}"
         snap = _field_snapshot()
