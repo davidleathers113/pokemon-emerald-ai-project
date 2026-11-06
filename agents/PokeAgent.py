@@ -474,6 +474,25 @@ def format_tool_call_brief(name: str, args: Any) -> str:
     return f"{name} {_clip(json.dumps(rest, ensure_ascii=False, default=str), HISTORY_ARGS_MAX_CHARS)}"
 
 
+def _macro_hold_refusal(response) -> Optional[Dict[str, Any]]:
+    """The tool result for a call the server's macro hold refused (409 with a "macro"
+    status, server/app.py MacroHoldMiddleware), else None.
+
+    raise_for_status turned it into "409 Client Error: Conflict for url: …", which tells
+    the model neither what is running nor that trying again later works; the server's
+    own message says both.
+    """
+    if response.status_code != 409:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or not isinstance(body.get("macro"), dict) or not body.get("error"):
+        return None
+    return {"success": False, "error": body["error"], "summary": body.get("summary") or body["error"], "macro": body["macro"]}
+
+
 class MCPToolAdapter:
     """Adapter to call MCP server tools via HTTP."""
 
@@ -531,6 +550,10 @@ class MCPToolAdapter:
 
             timeout = tool_timeout_s(tool_name, arguments)
             response = requests.post(url, json=arguments, timeout=timeout)
+            refused = _macro_hold_refusal(response)
+            if refused is not None:
+                logger.warning(f"⏸️ Tool {tool_name} refused: {refused['error']}")
+                return refused
             response.raise_for_status()
 
             result = response.json()

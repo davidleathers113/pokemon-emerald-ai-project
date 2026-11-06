@@ -249,6 +249,47 @@ def test_force_presses_through_a_macro_hold():
     assert status["running"] and status["tool"] == "go_to" and status["forced"] == 1, status
 
 
+def test_the_agent_reads_a_macro_hold_refusal_as_its_tool_result():
+    """The agent's own call (agents/PokeAgent.py MCPToolAdapter.call_tool) refused by the
+    hold while someone else's go_to runs: the model gets the server's message and the
+    macro status, not raise_for_status's "409 Client Error: Conflict for url". Any other
+    non-2xx answer keeps today's result."""
+    import importlib
+    from unittest import mock
+
+    import httpx
+
+    pa = importlib.import_module("agents.PokeAgent")  # the module, not the re-exported class
+    s = server()
+    s.load(ROUTE101, wild_encounters=False)
+    adapter = pa.MCPToolAdapter("http://play")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with _client(s) as client:
+            def post(url, json=None, timeout=None):  # requests.post, through this loop's client
+                return asyncio.run_coroutine_threadsafe(client.post(url, json=json), loop).result()
+
+            walk = asyncio.create_task(client.post("/mcp/go_to", json=WALK))
+            try:
+                await _until_macro_presses(s)
+                with mock.patch.object(pa.requests, "post", post):
+                    return await asyncio.to_thread(adapter.call_tool, "press_buttons", {"buttons": ["A"], "reasoning": "test"})
+            finally:
+                await walk
+
+    result = asyncio.run(scenario())
+    print("   ", result)
+    assert result["success"] is False, result
+    assert result["error"].startswith("a macro (go_to) is running; try again when it ends."), result
+    assert result["macro"]["running"] and result["macro"]["tool"] == "go_to", result
+
+    other = httpx.Response(500, json={"detail": "boom"}, request=httpx.Request("POST", "http://play/mcp/press_buttons"))
+    with mock.patch.object(pa.requests, "post", lambda url, json=None, timeout=None: other):
+        result = adapter.call_tool("press_buttons", {"buttons": ["A"]})
+    assert result["success"] is False and "500 Internal Server Error" in result["error"], result
+
+
 def _run_all():
     import test_movement_feedback as harness
 
